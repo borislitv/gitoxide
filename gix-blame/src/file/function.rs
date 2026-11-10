@@ -16,10 +16,30 @@ fn poll(check: &mut Check<'_>, stage: Stage, processed: usize) -> Result {
     check(Checkpoint { stage, processed }).map_err(|err| err.raise())
 }
 
+fn retain_entries(entries: &Vec<BlameEntry>, check: &mut Check<'_>) -> Result {
+    gix_diff::blob::control::retain_vec(entries, check).map_err(|e| e.raise())?;
+    for chunk in entries.chunks(32) {
+        for entry in chunk {
+            if let Some(path) = &entry.source_file_name {
+                poll(
+                    check,
+                    Stage::Retain {
+                        address: path.as_ptr() as usize,
+                    },
+                    0,
+                )?;
+            }
+        }
+        poll(check, Stage::Attribution, chunk.len())?;
+    }
+    Ok(())
+}
+
 /// A controlled result pinned to all its conservative per-job capacity charges.
 /// Output cannot be detached from its admission owner.
 pub struct AdmittedOutcome {
     outcome: Outcome,
+    native_trace: Option<Vec<crate::native::NativeOrigin>>,
     _allocations: gix_diff::blob::control::Allocations,
 }
 
@@ -27,6 +47,10 @@ impl AdmittedOutcome {
     /// Borrow output while its backing-capacity charges remain live.
     pub fn outcome(&self) -> &Outcome {
         &self.outcome
+    }
+    /// Native origin groups, available only from the opt-in traced entrypoint.
+    pub fn native_trace(&self) -> Option<&[crate::native::NativeOrigin]> {
+        self.native_trace.as_deref()
     }
 
     /// Release output's nested ownership in checked batches before an executor
@@ -40,6 +64,9 @@ impl AdmittedOutcome {
         self.outcome.blob.clear();
         // Free even the now-empty Vec backings before releasing their charges.
         drop(std::mem::take(&mut self.outcome));
+        if let Some(mut trace) = self.native_trace.take() {
+            gix_diff::blob::control::clear_with(&mut trace, check);
+        }
         self._allocations.clear_with_control(check);
     }
 }
@@ -52,7 +79,8 @@ impl Drop for AdmittedOutcome {
 
 /// Production entrypoint with explicit per-job allocation ownership. The
 /// provider must implement bounded, controlled header and object reads. Charges
-/// are conservative cumulative backing growth, not logical cache weights.
+/// follow conservative live backing capacity, not logical cache weights or a
+/// cumulative commit/allocation count. Output keeps its own charges alive.
 #[expect(clippy::too_many_arguments)]
 pub fn file_with_allocations(
     odb: impl gix_object::Find + gix_object::FindHeader,
@@ -65,8 +93,7 @@ pub fn file_with_allocations(
     allocator: std::sync::Arc<dyn gix_diff::blob::control::Allocator>,
     check: &mut Check<'_>,
 ) -> Result<AdmittedOutcome> {
-    let mut allocations = gix_diff::blob::control::Allocations::new(allocator).map_err(|e| e.raise())?;
-    let result = file_with_control(
+    file_admitted(
         odb,
         start,
         cache,
@@ -74,17 +101,145 @@ pub fn file_with_allocations(
         file_path,
         options,
         tuning,
-        &mut |event| {
-            check(event)?;
-            if event.stage == Stage::Allocate {
-                allocations.admit(event.processed)?;
+        allocator,
+        check,
+        false,
+    )
+}
+
+/// Like [`file_with_allocations`], with admitted native origin provenance.
+/// Requires immutable whole-file Myers blame, no cutoff, and default whole-file
+/// rename detection without line move/copy heuristics. Other profiles fail before work.
+#[expect(clippy::too_many_arguments)]
+pub fn file_with_allocations_and_trace(
+    odb: impl gix_object::Find + gix_object::FindHeader,
+    start: Start,
+    cache: Option<gix_commitgraph::Graph>,
+    resource_cache: &mut gix_diff::blob::Platform,
+    file_path: &BStr,
+    options: Options,
+    tuning: crate::Tuning,
+    allocator: std::sync::Arc<dyn gix_diff::blob::control::Allocator>,
+    check: &mut Check<'_>,
+) -> Result<AdmittedOutcome> {
+    let renames = options
+        .rewrites
+        .is_some_and(|r| r.copies.is_none() && r.percentage == Some(0.5) && r.limit == 1000 && !r.track_empty);
+    if !matches!(start, Start::Commit(_))
+        || !matches!(options.ranges, crate::BlameRanges::WholeFile)
+        || options.since.is_some()
+        || options.diff_algorithm != gix_diff::blob::Algorithm::Myers
+        || !renames
+    {
+        return Err(message("native origin trace requires the immutable whole-file Myers/root rename profile").into());
+    }
+    file_admitted(
+        odb,
+        start,
+        cache,
+        resource_cache,
+        file_path,
+        options,
+        tuning,
+        allocator,
+        check,
+        true,
+    )
+}
+
+#[expect(clippy::too_many_arguments)]
+fn file_admitted(
+    odb: impl gix_object::Find + gix_object::FindHeader,
+    start: Start,
+    cache: Option<gix_commitgraph::Graph>,
+    resource_cache: &mut gix_diff::blob::Platform,
+    file_path: &BStr,
+    options: Options,
+    tuning: crate::Tuning,
+    allocator: std::sync::Arc<dyn gix_diff::blob::control::Allocator>,
+    check: &mut Check<'_>,
+    trace: bool,
+) -> Result<AdmittedOutcome> {
+    let mut allocations = gix_diff::blob::control::Allocations::new(allocator).map_err(|e| e.raise())?;
+    let trace_rewrites = options.rewrites;
+    let mut controlled = |event: Checkpoint| {
+        match event.stage {
+            Stage::Backing { old, new } => return allocations.allocated(old, new, event.processed),
+            Stage::RetainBegin => return allocations.begin_retention(),
+            Stage::Retain { address } => {
+                allocations.retain(address);
+                return Ok(());
             }
-            Ok(())
-        },
+            Stage::RetainEnd => return allocations.end_retention(check),
+            _ => {}
+        }
+        check(event)?;
+        if event.stage == Stage::Allocate {
+            allocations.admit(event.processed)?;
+        }
+        Ok(())
+    };
+    let result = file_with_control(
+        &odb,
+        start,
+        cache,
+        resource_cache,
+        file_path,
+        options,
+        tuning,
+        &mut controlled,
     );
+    let result = result.and_then(|mut outcome| {
+        let native_trace = if trace {
+            match build_native_trace(
+                &odb,
+                &outcome,
+                resource_cache,
+                file_path,
+                trace_rewrites,
+                &mut controlled,
+            ) {
+                Ok(rows) => Some(rows),
+                Err(error) => {
+                    gix_diff::blob::control::clear_with(&mut outcome.entries, &mut controlled);
+                    if let Some(path) = outcome.blame_path.as_mut() {
+                        gix_diff::blob::control::clear_with(path, &mut controlled);
+                    }
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
+        Ok((outcome, native_trace))
+    });
+    resource_cache.clear_controlled_raw(&mut controlled);
+    let result = result.and_then(|(mut outcome, mut native_trace)| {
+        let retained = (|| {
+            poll(&mut controlled, Stage::RetainBegin, 0)?;
+            retain_outcome(&outcome, &mut controlled)?;
+            if let Some(rows) = &native_trace {
+                retain_native_trace(rows, &mut controlled)?;
+            }
+            poll(&mut controlled, Stage::RetainEnd, 0)?;
+            poll(&mut controlled, Stage::Output, outcome.entries.len())
+        })();
+        if let Err(error) = retained {
+            gix_diff::blob::control::clear_with(&mut outcome.entries, &mut controlled);
+            if let Some(path) = outcome.blame_path.as_mut() {
+                gix_diff::blob::control::clear_with(path, &mut controlled);
+            }
+            if let Some(rows) = native_trace.as_mut() {
+                gix_diff::blob::control::clear_with(rows, &mut controlled);
+            }
+            return Err(error);
+        }
+        Ok((outcome, native_trace))
+    });
     match result {
-        Ok(outcome) => Ok(AdmittedOutcome {
+        Ok((outcome, native_trace)) => Ok(AdmittedOutcome {
             outcome,
+            native_trace,
             _allocations: allocations,
         }),
         Err(error) => {
@@ -92,6 +247,148 @@ pub fn file_with_allocations(
             Err(error)
         }
     }
+}
+
+fn retain_outcome(outcome: &Outcome, check: &mut Check<'_>) -> Result {
+    retain_entries(&outcome.entries, check)?;
+    gix_diff::blob::control::retain_vec(&outcome.blob, check).map_err(|e| e.raise())?;
+    if let Some(paths) = &outcome.blame_path {
+        gix_diff::blob::control::retain_vec(paths, check).map_err(|e| e.raise())?;
+        for path in paths {
+            poll(
+                check,
+                Stage::Retain {
+                    address: path.source_file_path.as_ptr() as usize,
+                },
+                0,
+            )?;
+            if let Some(previous) = &path.previous_source_file_path {
+                poll(
+                    check,
+                    Stage::Retain {
+                        address: previous.as_ptr() as usize,
+                    },
+                    0,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn retain_native_trace(rows: &Vec<crate::native::NativeOrigin>, check: &mut Check<'_>) -> Result {
+    gix_diff::blob::control::retain_vec(rows, check).map_err(|e| e.raise())?;
+    for chunk in rows.chunks(32) {
+        for row in chunk {
+            poll(
+                check,
+                Stage::Retain {
+                    address: row.source_file_name.as_ptr() as usize,
+                },
+                0,
+            )?;
+            if let Some(previous) = &row.previous {
+                poll(
+                    check,
+                    Stage::Retain {
+                        address: previous.source_file_name.as_ptr() as usize,
+                    },
+                    0,
+                )?;
+            }
+        }
+        poll(check, Stage::Output, chunk.len())?;
+    }
+    Ok(())
+}
+
+fn build_native_trace(
+    odb: &(impl gix_object::Find + gix_object::FindHeader),
+    outcome: &Outcome,
+    platform: &mut gix_diff::blob::Platform,
+    file_path: &BStr,
+    rewrites: Option<gix_diff::Rewrites>,
+    check: &mut Check<'_>,
+) -> Result<Vec<crate::native::NativeOrigin>> {
+    let shared = std::cell::RefCell::new(check);
+    let objects = super::bounded::Objects {
+        inner: odb,
+        check: &shared,
+    };
+    let mut forward = |e| (**shared.borrow_mut())(e);
+    let check: &mut Check<'_> = &mut forward;
+    let mut rows = VecOwner::new(Vec::new(), &shared);
+    poll(check, Stage::OriginTrace, 0)?;
+    for (index, entry) in outcome.entries.iter().enumerate() {
+        let path = entry
+            .source_file_name
+            .as_ref()
+            .map_or(file_path, |path| BStr::new(path.as_slice()));
+        let previous = native_previous(&objects, entry.commit_id, path, platform, rewrites, check)?;
+        let source_end = entry
+            .start_in_source_file
+            .checked_add(entry.len.get())
+            .ok_or_else(|| message("source range overflow").raise())?;
+        let final_end = entry
+            .start_in_blamed_file
+            .checked_add(entry.len.get())
+            .ok_or_else(|| message("final range overflow").raise())?;
+        let row = crate::native::NativeOrigin {
+            commit_id: entry.commit_id,
+            source_file_name: try_copy_bytes(path, check)?.into(),
+            previous,
+            boundary: false,
+            source_range: entry.start_in_source_file..source_end,
+            final_range: entry.start_in_blamed_file..final_end,
+            group_id: u32::try_from(index).map_err(|_| message("native group identity overflow").raise())?,
+            group_count: entry.len.get(),
+        };
+        gix_diff::blob::control::try_push(&mut rows, row, check).map_err(|e| e.raise())?;
+        poll(check, Stage::OriginTrace, rows.len())?;
+        // The previous-origin resolver's scratch has been destroyed. Preserve
+        // complete output and trace owners while refunding only dead scratch.
+        poll(check, Stage::RetainBegin, 0)?;
+        retain_outcome(outcome, check)?;
+        retain_native_trace(&rows, check)?;
+        platform.retain_controlled_backings(check).map_err(|e| e.raise())?;
+        poll(check, Stage::RetainEnd, 0)?;
+    }
+    Ok(rows.take())
+}
+
+fn native_previous(
+    odb: &(impl gix_object::Find + gix_object::FindHeader),
+    commit_id: ObjectId,
+    path: &BStr,
+    platform: &mut gix_diff::blob::Platform,
+    rewrites: Option<gix_diff::Rewrites>,
+    check: &mut Check<'_>,
+) -> Result<Option<crate::native::PreviousOrigin>> {
+    let (mut buf, mut lhs, mut rhs) = (Vec::new(), Vec::new(), Vec::new());
+    let commit = find_commit(None, odb, &commit_id, &mut buf)?;
+    let parents = collect_parents(commit, odb, None, &mut lhs, check, true)?;
+    let mut stats = Statistics::default();
+    let mut state = gix_diff::tree::State::default();
+    // Git discovers all parent origins before diffing and sets previous to the
+    // first eligible origin in parent order, even if no line matches that parent.
+    // This replays the same controlled origin finder, not a first-parent guess.
+    for (parent, _) in parents {
+        let found = tree_diff_at_file_path(
+            odb, path, commit_id, parent, None, &mut stats, &mut state, platform, &mut buf, &mut lhs, &mut rhs,
+            rewrites, check, true,
+        )?;
+        let source_file_name = match found {
+            Some(TreeDiffChange::Modification { .. }) => try_copy_bytes(path, check)?.into(),
+            Some(TreeDiffChange::Rewrite { source_location, .. }) => source_location,
+            None => return Err(message("a completed native origin still has an unchanged parent").into()),
+            _ => continue,
+        };
+        return Ok(Some(crate::native::PreviousOrigin {
+            commit_id: parent,
+            source_file_name,
+        }));
+    }
+    Ok(None)
 }
 
 fn try_copy_bytes(data: &[u8], check: &mut Check<'_>) -> Result<Vec<u8>> {
@@ -301,7 +598,7 @@ fn file_impl(
         )
         .map_err(|e| e.raise())?;
         return Ok(Outcome {
-            entries: try_coalesce_blame_entries(out.take(), check)?,
+            entries: try_coalesce_blame_entries(out.take(), file_path, check)?,
             blob: blamed_file_blob,
             statistics: stats,
             blame_path: None,
@@ -316,8 +613,10 @@ fn file_impl(
     }
 
     let mut diff_state = gix_diff::tree::State::default();
-    let mut previous_entry: Option<(ObjectId, ObjectId)> = None;
-    let mut blame_path = VecOwner::new(Vec::new(), &shared);
+    // Concurrent/deferred origins can visit different paths in the same commit.
+    // A first-parent blob is reusable only for the complete origin identity.
+    let mut previous_entry: Option<(ObjectId, ObjectId, BString)> = None;
+    let mut blame_path = VecOwner::new(Vec::<BlamePathEntry>::new(), &shared);
 
     // Object IDs identify raw immutable bytes, not a path-dependent worktree or
     // text-conversion result. Only the raw object pipeline can reuse by ID.
@@ -345,6 +644,81 @@ fn file_impl(
     let bounded_resource_cache = prepared.is_some() || tuning.bounded_resource_cache;
     let index_changes = tuning.index_changes;
     'outer: while let Some(suspect) = queue.pop_value() {
+        if raw {
+            // No prior iteration's temporary owner is alive here. Enumerate the
+            // complete persistent root set; never infer ownership from progress.
+            diff_state.release_traversal_queue();
+            poll(check, Stage::RetainBegin, 0)?;
+            for buffer in [
+                &buf,
+                &buf2,
+                &buf3,
+                &blamed_file_blob,
+                &diff_state.buf1,
+                &diff_state.buf2,
+            ] {
+                gix_diff::blob::control::retain_vec(buffer, check).map_err(|e| e.raise())?;
+            }
+            queue.retain_backing(check)?;
+            if let Some((_, _, path)) = &previous_entry {
+                poll(
+                    check,
+                    Stage::Retain {
+                        address: path.as_ptr() as usize,
+                    },
+                    0,
+                )?;
+            }
+            resource_cache
+                .retain_controlled_backings(check)
+                .map_err(|e| e.raise())?;
+            if let Some(input) = prepared.as_ref() {
+                input.retain_backings(check).map_err(|e| e.raise())?;
+            }
+            gix_diff::blob::control::retain_vec(&hunks_to_blame, check).map_err(|e| e.raise())?;
+            for hunk in hunks_to_blame.iter() {
+                if hunk.suspects.spilled() {
+                    poll(
+                        check,
+                        Stage::Retain {
+                            address: hunk.suspects.as_ptr() as usize,
+                        },
+                        0,
+                    )?;
+                }
+                if let Some(path) = &hunk.source_file_name {
+                    poll(
+                        check,
+                        Stage::Retain {
+                            address: path.as_ptr() as usize,
+                        },
+                        0,
+                    )?;
+                }
+            }
+            retain_entries(&out, check)?;
+            gix_diff::blob::control::retain_vec(&blame_path, check).map_err(|e| e.raise())?;
+            for path in blame_path.iter() {
+                poll(
+                    check,
+                    Stage::Retain {
+                        address: path.source_file_path.as_ptr() as usize,
+                    },
+                    0,
+                )?;
+                if let Some(previous) = &path.previous_source_file_path {
+                    poll(
+                        check,
+                        Stage::Retain {
+                            address: previous.as_ptr() as usize,
+                        },
+                        0,
+                    )?;
+                }
+            }
+            poll(check, Stage::RetainEnd, 0)?;
+            poll(check, Stage::Commit, stats.commits_traversed)?;
+        }
         poll(check, Stage::Graph, stats.commits_traversed)?;
         // Each revision sets both resources again. The NxM diff cache must not
         // retain every historical fulltext for the entire blame traversal.
@@ -383,60 +757,132 @@ fn file_impl(
         )?
         .into();
 
-        let commit = find_commit(cache.as_ref(), &odb, &suspect, &mut buf)?;
-        let commit_time = commit.commit_time()?;
-
-        if let Some(since) = options.since
-            && commit_time < since.seconds
-        {
-            if try_unblamed_to_out_is_done(&mut hunks_to_blame, &mut out, suspect, check)? {
-                break 'outer;
+        let mut deferred = VecOwner::new(Vec::new(), &shared);
+        let mut selected = VecOwner::new(Vec::new(), &shared);
+        let mut another_origin = false;
+        for hunk in hunks_to_blame.take_iter() {
+            let same = hunk.has_suspect(&suspect)
+                && gix_diff::blob::control::try_cmp_bytes(
+                    hunk.source_file_name
+                        .as_ref()
+                        .map_or(file_path.as_ref(), |p| p.as_slice()),
+                    &current_file_path,
+                    check,
+                )
+                .map_err(|e| e.raise())?
+                .is_eq();
+            if same {
+                gix_diff::blob::control::try_push(&mut selected, hunk, check).map_err(|e| e.raise())?;
+            } else {
+                another_origin |= hunk.has_suspect(&suspect);
+                gix_diff::blob::control::try_push(&mut deferred, hunk, check).map_err(|e| e.raise())?;
+            }
+        }
+        *hunks_to_blame = selected.take();
+        'origin: {
+            let commit = find_commit(cache.as_ref(), &odb, &suspect, &mut buf)?;
+            let commit_time = commit.commit_time()?;
+            if another_origin {
+                queue.insert(commit_time, suspect, check)?;
             }
 
-            continue;
-        }
-
-        let parent_ids: ParentIds = collect_parents(commit, &odb, cache.as_ref(), &mut buf2, check, raw)?;
-
-        if parent_ids.is_empty() {
-            if queue.is_empty() {
-                // I’m not entirely sure if this is correct yet. `suspect`, at this point, is the
-                // `id` of the last `item` that was yielded by `queue`, so it makes sense to assign
-                // the remaining lines to it, even though we don’t explicitly check whether that is
-                // true here. We could perhaps use diff-tree-to-tree to compare `suspect` against
-                // an empty tree to validate this assumption.
+            if let Some(since) = options.since
+                && commit_time < since.seconds
+            {
                 if try_unblamed_to_out_is_done(&mut hunks_to_blame, &mut out, suspect, check)? {
-                    if options.debug_track_path {
-                        let entry = previous_entry
-                            .take()
-                            .filter(|(id, _)| *id == suspect)
-                            .map(|(_, entry)| entry);
+                    break 'origin;
+                }
 
-                        let blame_path_entry = BlamePathEntry {
-                            source_file_path: try_copy_bytes(&current_file_path, check)?.into(),
-                            previous_source_file_path: None,
-                            commit_id: suspect,
-                            blob_id: entry.unwrap_or(gix_hash::Kind::shortest().null()),
-                            previous_blob_id: gix_hash::Kind::shortest().null(),
-                            parent_index: 0,
-                        };
-                        gix_diff::blob::control::try_push(&mut blame_path, blame_path_entry, check)
-                            .map_err(|e| e.raise())?;
+                break 'origin;
+            }
+
+            let mut entry = match previous_entry.take() {
+                Some((id, entry, path))
+                    if id == suspect
+                        && gix_diff::blob::control::try_cmp_bytes(&path, &current_file_path, check)
+                            .map_err(|e| e.raise())?
+                            .is_eq() =>
+                {
+                    Some(entry)
+                }
+                _ => None,
+            };
+            let parent_ids: ParentIds = collect_parents(commit, &odb, cache.as_ref(), &mut buf2, check, raw)?;
+
+            if parent_ids.is_empty() {
+                {
+                    // I’m not entirely sure if this is correct yet. `suspect`, at this point, is the
+                    // `id` of the last `item` that was yielded by `queue`, so it makes sense to assign
+                    // the remaining lines to it, even though we don’t explicitly check whether that is
+                    // true here. We could perhaps use diff-tree-to-tree to compare `suspect` against
+                    // an empty tree to validate this assumption.
+                    if try_unblamed_to_out_is_done(&mut hunks_to_blame, &mut out, suspect, check)? {
+                        if options.debug_track_path {
+                            let blame_path_entry = BlamePathEntry {
+                                source_file_path: try_copy_bytes(&current_file_path, check)?.into(),
+                                previous_source_file_path: None,
+                                commit_id: suspect,
+                                blob_id: entry.unwrap_or(gix_hash::Kind::shortest().null()),
+                                previous_blob_id: gix_hash::Kind::shortest().null(),
+                                parent_index: 0,
+                            };
+                            gix_diff::blob::control::try_push(&mut blame_path, blame_path_entry, check)
+                                .map_err(|e| e.raise())?;
+                        }
+
+                        break 'origin;
                     }
+                }
+                // There is more, keep looking.
+                break 'origin;
+            }
 
-                    break 'outer;
+            if entry.is_none() {
+                entry = find_path_entry_in_commit(
+                    &odb,
+                    &suspect,
+                    current_file_path.as_ref(),
+                    cache.as_ref(),
+                    &mut buf,
+                    &mut buf2,
+                    &mut stats,
+                    check,
+                )?;
+            }
+
+            let Some(entry_id) = entry else {
+                break 'origin;
+            };
+
+            // This block asserts that, for every `UnblamedHunk`, all lines in the *Blamed File* are
+            // identical to the corresponding lines in the *Source File*.
+            #[cfg(debug_assertions)]
+            {
+                let source_blob = odb.find_blob(&entry_id, &mut buf)?.data;
+                let owned = super::bounded::ByteOwner {
+                    data: gix_diff::blob::byte_input::ByteInput::try_new(source_blob, &blamed_file_blob, check)
+                        .map_err(|err| err.raise())?,
+                    shared: &shared,
+                };
+                let input = owned.data.as_input();
+
+                for hunk in hunks_to_blame.iter() {
+                    if let Some(range_in_suspect) = hunk.get_range(&suspect) {
+                        let range_in_blamed_file = hunk.range_in_blamed_file.clone();
+
+                        let source = &input.before[range_in_suspect.start as usize..range_in_suspect.end as usize];
+                        let blamed =
+                            &input.after[range_in_blamed_file.start as usize..range_in_blamed_file.end as usize];
+                        assert_eq!(source.len(), blamed.len());
+                        for (n, (source, blamed)) in source.chunks(1024).zip(blamed.chunks(1024)).enumerate() {
+                            assert_eq!(source, blamed);
+                            poll(check, Stage::Equal, n * 1024 + source.len())?;
+                        }
+                    }
                 }
             }
-            // There is more, keep looking.
-            continue;
-        }
 
-        let mut entry = previous_entry
-            .take()
-            .filter(|(id, _)| *id == suspect)
-            .map(|(_, entry)| entry);
-        if entry.is_none() {
-            entry = find_path_entry_in_commit(
+            let current_mode = find_path_entry_and_mode_in_commit(
                 &odb,
                 &suspect,
                 current_file_path.as_ref(),
@@ -445,179 +891,230 @@ fn file_impl(
                 &mut buf2,
                 &mut stats,
                 check,
-            )?;
-        }
-
-        let Some(entry_id) = entry else {
-            continue;
-        };
-
-        // This block asserts that, for every `UnblamedHunk`, all lines in the *Blamed File* are
-        // identical to the corresponding lines in the *Source File*.
-        #[cfg(debug_assertions)]
-        {
-            let source_blob = odb.find_blob(&entry_id, &mut buf)?.data;
-            let owned = super::bounded::ByteOwner {
-                data: gix_diff::blob::byte_input::ByteInput::try_new(source_blob, &blamed_file_blob, check)
-                    .map_err(|err| err.raise())?,
-                shared: &shared,
-            };
-            let input = owned.data.as_input();
-
-            for hunk in hunks_to_blame.iter() {
-                if let Some(range_in_suspect) = hunk.get_range(&suspect) {
-                    let range_in_blamed_file = hunk.range_in_blamed_file.clone();
-
-                    let source = &input.before[range_in_suspect.start as usize..range_in_suspect.end as usize];
-                    let blamed = &input.after[range_in_blamed_file.start as usize..range_in_blamed_file.end as usize];
-                    assert_eq!(source.len(), blamed.len());
-                    for (n, (source, blamed)) in source.chunks(1024).zip(blamed.chunks(1024)).enumerate() {
-                        assert_eq!(source, blamed);
-                        poll(check, Stage::Equal, n * 1024 + source.len())?;
+            )?
+            .map(|(_, mode)| mode);
+            for (pid, (parent_id, parent_commit_time)) in parent_ids.iter().enumerate() {
+                poll(check, Stage::Graph, pid)?;
+                if let Some((parent_entry_id, parent_mode)) = find_path_entry_and_mode_in_commit(
+                    &odb,
+                    parent_id,
+                    current_file_path.as_ref(),
+                    cache.as_ref(),
+                    &mut buf,
+                    &mut buf2,
+                    &mut stats,
+                    check,
+                )? {
+                    let no_change_in_entry = entry_id == parent_entry_id
+                        && current_mode.is_some_and(|mode| {
+                            mode.is_link() == parent_mode.is_link() && mode.is_blob() == parent_mode.is_blob()
+                        });
+                    if pid == 0 {
+                        previous_entry = Some((
+                            *parent_id,
+                            parent_entry_id,
+                            try_copy_bytes(&current_file_path, check)?.into(),
+                        ));
+                    }
+                    if no_change_in_entry {
+                        try_pass_blame_from_to(suspect, *parent_id, &mut hunks_to_blame, check)?;
+                        queue.insert(*parent_commit_time, *parent_id, check)?;
+                        break 'origin;
                     }
                 }
             }
-        }
 
-        for (pid, (parent_id, parent_commit_time)) in parent_ids.iter().enumerate() {
-            poll(check, Stage::Graph, pid)?;
-            if let Some(parent_entry_id) = find_path_entry_in_commit(
-                &odb,
-                parent_id,
-                current_file_path.as_ref(),
-                cache.as_ref(),
-                &mut buf,
-                &mut buf2,
-                &mut stats,
-                check,
-            )? {
-                let no_change_in_entry = entry_id == parent_entry_id;
-                if pid == 0 {
-                    previous_entry = Some((*parent_id, parent_entry_id));
-                }
-                if no_change_in_entry {
-                    try_pass_blame_from_to(suspect, *parent_id, &mut hunks_to_blame, check)?;
+            let more_than_one_parent = parent_ids.len() > 1;
+            let mut modifications = VecOwner::new(Vec::new(), &shared);
+            for (index, (parent_id, parent_commit_time)) in parent_ids.iter().enumerate() {
+                poll(check, Stage::Graph, index)?;
+                let changes_for_file_path = tree_diff_at_file_path(
+                    &odb,
+                    current_file_path.as_ref(),
+                    suspect,
+                    *parent_id,
+                    cache.as_ref(),
+                    &mut stats,
+                    &mut diff_state,
+                    resource_cache,
+                    &mut buf,
+                    &mut buf2,
+                    &mut buf3,
+                    options.rewrites,
+                    check,
+                    raw,
+                )?;
+                if let Some(TreeDiffChange::Rewrite {
+                    source_location,
+                    source_id,
+                    ..
+                }) = &changes_for_file_path
+                    && *source_id == entry_id
+                {
+                    for hunk in hunks_to_blame.iter_mut() {
+                        hunk.pass_blame(suspect, *parent_id);
+                        hunk.source_file_name = Some(try_copy_bytes(source_location, check)?.into());
+                    }
                     queue.insert(*parent_commit_time, *parent_id, check)?;
-                    continue 'outer;
+                    break 'origin;
                 }
+                gix_diff::blob::control::try_push(&mut modifications, changes_for_file_path, check)
+                    .map_err(|e| e.raise())?;
             }
-        }
-
-        let more_than_one_parent = parent_ids.len() > 1;
-        for (index, (parent_id, parent_commit_time)) in parent_ids.iter().enumerate() {
-            poll(check, Stage::Graph, index)?;
-            queue.insert(*parent_commit_time, *parent_id, check)?;
-            let changes_for_file_path = tree_diff_at_file_path(
-                &odb,
-                current_file_path.as_ref(),
-                suspect,
-                *parent_id,
-                cache.as_ref(),
-                &mut stats,
-                &mut diff_state,
-                resource_cache,
-                &mut buf,
-                &mut buf2,
-                &mut buf3,
-                options.rewrites,
-                check,
-                raw,
-            )?;
-            let Some(modification) = changes_for_file_path else {
-                if more_than_one_parent {
-                    // None of the changes affected the file we’re currently blaming.
-                    // Copy blame to parent.
-                    for unblamed_hunk in hunks_to_blame.iter_mut() {
-                        super::admit_hunk(unblamed_hunk, check).map_err(|e| e.raise())?;
-                        if unblamed_hunk.suspects.len() >= 128 {
-                            return Err(gix_diff::blob::control::Cancelled.raise());
-                        }
-                        if unblamed_hunk.suspects.len() == unblamed_hunk.suspects.capacity() {
-                            gix_diff::blob::control::admit_bytes(
-                                (unblamed_hunk.suspects.len() + 1)
-                                    * std::mem::size_of::<(ObjectId, std::ops::Range<u32>)>(),
-                                check,
-                            )
-                            .map_err(|e| e.raise())?;
-                            unblamed_hunk
-                                .suspects
-                                .try_reserve_exact(1)
-                                .map_err(|_| message("suspect allocation failed").raise())?;
-                        }
-                        unblamed_hunk.clone_blame(suspect, *parent_id);
-                        poll(check, Stage::Attribution, index)?;
-                    }
-                } else {
-                    try_pass_blame_from_to(suspect, *parent_id, &mut hunks_to_blame, check)?;
-                }
-                continue;
-            };
-
-            match modification {
-                TreeDiffChange::Addition { id } => {
+            for (index, ((parent_id, parent_commit_time), changes_for_file_path)) in
+                parent_ids.iter().zip(modifications.take_iter()).enumerate()
+            {
+                poll(check, Stage::Graph, index)?;
+                queue.insert(*parent_commit_time, *parent_id, check)?;
+                let Some(modification) = changes_for_file_path else {
                     if more_than_one_parent {
-                        // Do nothing under the assumption that this always (or almost always)
-                        // implies that the file comes from a different parent, compared to which
-                        // it was modified, not added.
-                    } else if try_unblamed_to_out_is_done(&mut hunks_to_blame, &mut out, suspect, check)? {
-                        if options.debug_track_path {
-                            let blame_path_entry = BlamePathEntry {
-                                source_file_path: try_copy_bytes(&current_file_path, check)?.into(),
-                                previous_source_file_path: None,
-                                commit_id: suspect,
-                                blob_id: id,
-                                previous_blob_id: gix_hash::Kind::shortest().null(),
-                                parent_index: index,
-                            };
-                            gix_diff::blob::control::try_push(&mut blame_path, blame_path_entry, check)
+                        // None of the changes affected the file we’re currently blaming.
+                        // Copy blame to parent.
+                        for unblamed_hunk in hunks_to_blame.iter_mut() {
+                            super::admit_hunk(unblamed_hunk, check).map_err(|e| e.raise())?;
+                            if unblamed_hunk.suspects.len() >= 128 {
+                                return Err(gix_diff::blob::control::Cancelled.raise());
+                            }
+                            if unblamed_hunk.suspects.len() == unblamed_hunk.suspects.capacity() {
+                                gix_diff::blob::control::admit_bytes(
+                                    (unblamed_hunk.suspects.len() + 1)
+                                        * std::mem::size_of::<(ObjectId, std::ops::Range<u32>)>(),
+                                    check,
+                                )
                                 .map_err(|e| e.raise())?;
+                                unblamed_hunk
+                                    .suspects
+                                    .try_reserve_exact(1)
+                                    .map_err(|_| message("suspect allocation failed").raise())?;
+                                super::bounded::allocated_smallvec(0, &unblamed_hunk.suspects, check)
+                                    .map_err(|e| e.raise())?;
+                            }
+                            unblamed_hunk.clone_blame(suspect, *parent_id);
+                            poll(check, Stage::Attribution, index)?;
                         }
-
-                        break 'outer;
+                    } else {
+                        try_pass_blame_from_to(suspect, *parent_id, &mut hunks_to_blame, check)?;
                     }
-                }
-                TreeDiffChange::Deletion => {
-                    unreachable!("We already found file_path in suspect^{{tree}}, so it can't be deleted")
-                }
-                TreeDiffChange::Modification { previous_id, id } => {
-                    let changes = blob_changes(
-                        &odb,
-                        resource_cache,
+                    continue;
+                };
+
+                match modification {
+                    TreeDiffChange::Addition { id } => {
+                        if more_than_one_parent {
+                            // Do nothing under the assumption that this always (or almost always)
+                            // implies that the file comes from a different parent, compared to which
+                            // it was modified, not added.
+                        } else if try_unblamed_to_out_is_done(&mut hunks_to_blame, &mut out, suspect, check)? {
+                            if options.debug_track_path {
+                                let blame_path_entry = BlamePathEntry {
+                                    source_file_path: try_copy_bytes(&current_file_path, check)?.into(),
+                                    previous_source_file_path: None,
+                                    commit_id: suspect,
+                                    blob_id: id,
+                                    previous_blob_id: gix_hash::Kind::shortest().null(),
+                                    parent_index: index,
+                                };
+                                gix_diff::blob::control::try_push(&mut blame_path, blame_path_entry, check)
+                                    .map_err(|e| e.raise())?;
+                            }
+
+                            break 'origin;
+                        }
+                    }
+                    TreeDiffChange::Deletion => {
+                        unreachable!("We already found file_path in suspect^{{tree}}, so it can't be deleted")
+                    }
+                    TreeDiffChange::Modification { previous_id, id } => {
+                        let changes = blob_changes(
+                            &odb,
+                            resource_cache,
+                            id,
+                            previous_id,
+                            file_path,
+                            file_path,
+                            options.diff_algorithm,
+                            &mut stats,
+                            &mut prepared,
+                            check,
+                            raw,
+                        )?;
+                        *hunks_to_blame = attribute_changes(
+                            hunks_to_blame.take(),
+                            changes,
+                            suspect,
+                            *parent_id,
+                            index_changes,
+                            check,
+                        )?;
+                        if options.debug_track_path {
+                            let mut has_blame_been_passed = false;
+                            for hunk in hunks_to_blame.iter() {
+                                poll(check, Stage::Attribution, 1)?;
+                                if hunk.has_suspect(parent_id) {
+                                    has_blame_been_passed = true;
+                                    break;
+                                }
+                            }
+
+                            if has_blame_been_passed {
+                                let blame_path_entry = BlamePathEntry {
+                                    source_file_path: try_copy_bytes(&current_file_path, check)?.into(),
+                                    previous_source_file_path: Some(try_copy_bytes(&current_file_path, check)?.into()),
+                                    commit_id: suspect,
+                                    blob_id: id,
+                                    previous_blob_id: previous_id,
+                                    parent_index: index,
+                                };
+                                gix_diff::blob::control::try_push(&mut blame_path, blame_path_entry, check)
+                                    .map_err(|e| e.raise())?;
+                            }
+                        }
+                    }
+                    TreeDiffChange::Rewrite {
+                        source_location,
+                        source_id,
                         id,
-                        previous_id,
-                        file_path,
-                        file_path,
-                        options.diff_algorithm,
-                        &mut stats,
-                        &mut prepared,
-                        check,
-                        raw,
-                    )?;
-                    *hunks_to_blame = attribute_changes(
-                        hunks_to_blame.take(),
-                        changes,
-                        suspect,
-                        *parent_id,
-                        index_changes,
-                        check,
-                    )?;
-                    if options.debug_track_path {
+                    } => {
+                        let changes = blob_changes(
+                            &odb,
+                            resource_cache,
+                            id,
+                            source_id,
+                            file_path,
+                            source_location.as_ref(),
+                            options.diff_algorithm,
+                            &mut stats,
+                            &mut prepared,
+                            check,
+                            raw,
+                        )?;
+                        *hunks_to_blame = attribute_changes(
+                            hunks_to_blame.take(),
+                            changes,
+                            suspect,
+                            *parent_id,
+                            index_changes,
+                            check,
+                        )?;
+
                         let mut has_blame_been_passed = false;
-                        for hunk in hunks_to_blame.iter() {
-                            poll(check, Stage::Attribution, 1)?;
+
+                        for hunk in hunks_to_blame.iter_mut() {
+                            poll(check, Stage::Attribution, 0)?;
                             if hunk.has_suspect(parent_id) {
+                                hunk.source_file_name = Some(try_copy_bytes(&source_location, check)?.into());
+
                                 has_blame_been_passed = true;
-                                break;
                             }
                         }
 
-                        if has_blame_been_passed {
+                        if has_blame_been_passed && options.debug_track_path {
                             let blame_path_entry = BlamePathEntry {
                                 source_file_path: try_copy_bytes(&current_file_path, check)?.into(),
-                                previous_source_file_path: Some(try_copy_bytes(&current_file_path, check)?.into()),
+                                previous_source_file_path: Some(try_copy_bytes(&source_location, check)?.into()),
                                 commit_id: suspect,
                                 blob_id: id,
-                                previous_blob_id: previous_id,
+                                previous_blob_id: source_id,
                                 parent_index: index,
                             };
                             gix_diff::blob::control::try_push(&mut blame_path, blame_path_entry, check)
@@ -625,79 +1122,32 @@ fn file_impl(
                         }
                     }
                 }
-                TreeDiffChange::Rewrite {
-                    source_location,
-                    source_id,
-                    id,
-                } => {
-                    let changes = blob_changes(
-                        &odb,
-                        resource_cache,
-                        id,
-                        source_id,
-                        file_path,
-                        source_location.as_ref(),
-                        options.diff_algorithm,
-                        &mut stats,
-                        &mut prepared,
-                        check,
-                        raw,
-                    )?;
-                    *hunks_to_blame = attribute_changes(
-                        hunks_to_blame.take(),
-                        changes,
-                        suspect,
-                        *parent_id,
-                        index_changes,
-                        check,
-                    )?;
+            }
 
-                    let mut has_blame_been_passed = false;
-
-                    for hunk in hunks_to_blame.iter_mut() {
-                        poll(check, Stage::Attribution, 0)?;
-                        if hunk.has_suspect(parent_id) {
-                            hunk.source_file_name = Some(try_copy_bytes(&source_location, check)?.into());
-
-                            has_blame_been_passed = true;
-                        }
-                    }
-
-                    if has_blame_been_passed && options.debug_track_path {
-                        let blame_path_entry = BlamePathEntry {
-                            source_file_path: try_copy_bytes(&current_file_path, check)?.into(),
-                            previous_source_file_path: Some(try_copy_bytes(&source_location, check)?.into()),
-                            commit_id: suspect,
-                            blob_id: id,
-                            previous_blob_id: source_id,
-                            parent_index: index,
-                        };
-                        gix_diff::blob::control::try_push(&mut blame_path, blame_path_entry, check)
-                            .map_err(|e| e.raise())?;
-                    }
+            let mut pending = VecOwner::new(Vec::new(), &shared);
+            for mut unblamed_hunk in hunks_to_blame.take_iter() {
+                poll(check, Stage::Attribution, pending.len())?;
+                super::admit_hunk(&unblamed_hunk, check).map_err(|e| e.raise())?;
+                if unblamed_hunk.suspects.len() == 1
+                    && let Some(entry) =
+                        BlameEntry::try_from_unblamed_hunk(&unblamed_hunk, suspect, check).map_err(|e| e.raise())?
+                {
+                    // At this point, we have copied blame for every hunk to a parent. Hunks
+                    // that have only `suspect` left in `suspects` have not passed blame to any
+                    // parent, and so they can be converted to a `BlameEntry` and moved to
+                    // `out`.
+                    gix_diff::blob::control::try_push(&mut out, entry, check).map_err(|e| e.raise())?;
+                    continue;
                 }
+                unblamed_hunk.remove_blame(suspect);
+                gix_diff::blob::control::try_push(&mut pending, unblamed_hunk, check).map_err(|e| e.raise())?;
             }
+            *hunks_to_blame = pending.take();
         }
-
-        let mut pending = VecOwner::new(Vec::new(), &shared);
-        for mut unblamed_hunk in hunks_to_blame.take_iter() {
-            poll(check, Stage::Attribution, pending.len())?;
-            super::admit_hunk(&unblamed_hunk, check).map_err(|e| e.raise())?;
-            if unblamed_hunk.suspects.len() == 1
-                && let Some(entry) =
-                    BlameEntry::try_from_unblamed_hunk(&unblamed_hunk, suspect, check).map_err(|e| e.raise())?
-            {
-                // At this point, we have copied blame for every hunk to a parent. Hunks
-                // that have only `suspect` left in `suspects` have not passed blame to any
-                // parent, and so they can be converted to a `BlameEntry` and moved to
-                // `out`.
-                gix_diff::blob::control::try_push(&mut out, entry, check).map_err(|e| e.raise())?;
-                continue;
-            }
-            unblamed_hunk.remove_blame(suspect);
-            gix_diff::blob::control::try_push(&mut pending, unblamed_hunk, check).map_err(|e| e.raise())?;
+        gix_diff::blob::control::try_reserve(&mut hunks_to_blame, deferred.len(), check).map_err(|e| e.raise())?;
+        for hunk in deferred.take_iter() {
+            hunks_to_blame.push(hunk);
         }
-        *hunks_to_blame = pending.take();
     }
 
     debug_assert_eq!(
@@ -715,7 +1165,7 @@ fn file_impl(
     )
     .map_err(|e| e.raise())?;
     Ok(Outcome {
-        entries: try_coalesce_blame_entries(out.take(), check)?,
+        entries: try_coalesce_blame_entries(out.take(), file_path, check)?,
         blob: blamed_file_blob,
         statistics: stats,
         blame_path: options.debug_track_path.then(|| blame_path.take()),
@@ -769,7 +1219,11 @@ fn try_unblamed_to_out_is_done(
 ///
 /// [1]: https://github.com/git/git/commit/c2ebaa27d63bfb7c50cbbdaba90aee4efdd45d0a
 /// [2]: https://github.com/git/git/commit/6dbf0c7bebd1c71c44d786ebac0f2b3f226a0131
-fn try_coalesce_blame_entries(lines_blamed: Vec<BlameEntry>, check: &mut Check<'_>) -> Result<Vec<BlameEntry>> {
+fn try_coalesce_blame_entries(
+    lines_blamed: Vec<BlameEntry>,
+    file_path: &BStr,
+    check: &mut Check<'_>,
+) -> Result<Vec<BlameEntry>> {
     let shared = std::cell::RefCell::new(check);
     let mut forward = |e| (**shared.borrow_mut())(e);
     let check: &mut Check<'_> = &mut forward;
@@ -779,6 +1233,19 @@ fn try_coalesce_blame_entries(lines_blamed: Vec<BlameEntry>, check: &mut Check<'
         poll(check, Stage::Output, acc.len())?;
         if let Some(previous) = acc.last_mut()
             && previous.commit_id == entry.commit_id
+            && gix_diff::blob::control::try_cmp_bytes(
+                previous
+                    .source_file_name
+                    .as_ref()
+                    .map_or(file_path.as_ref(), |p| p.as_slice()),
+                entry
+                    .source_file_name
+                    .as_ref()
+                    .map_or(file_path.as_ref(), |p| p.as_slice()),
+                check,
+            )
+            .map_err(|e| e.raise())?
+            .is_eq()
             && previous.range_in_blamed_file().end == entry.range_in_blamed_file().start
             && previous.range_in_source_file().end == entry.range_in_source_file().start
         {
@@ -815,6 +1282,12 @@ impl From<gix_diff::tree::recorder::Change> for TreeDiffChange {
         match value {
             Change::Addition { oid, .. } => Self::Addition { id: oid },
             Change::Deletion { .. } => Self::Deletion,
+            Change::Modification {
+                previous_entry_mode,
+                entry_mode,
+                oid,
+                ..
+            } if previous_entry_mode.is_link() != entry_mode.is_link() => Self::Addition { id: oid },
             Change::Modification { previous_oid, oid, .. } => Self::Modification {
                 previous_id: previous_oid,
                 id: oid,
@@ -830,7 +1303,19 @@ impl From<gix_diff::tree_with_rewrites::Change> for TreeDiffChange {
         match value {
             Change::Addition { id, .. } => Self::Addition { id },
             Change::Deletion { .. } => Self::Deletion,
+            Change::Modification {
+                previous_entry_mode,
+                entry_mode,
+                id,
+                ..
+            } if previous_entry_mode.is_link() != entry_mode.is_link() => Self::Addition { id },
             Change::Modification { previous_id, id, .. } => Self::Modification { previous_id, id },
+            Change::Rewrite {
+                source_entry_mode,
+                entry_mode,
+                id,
+                ..
+            } if source_entry_mode.is_link() != entry_mode.is_link() => Self::Addition { id },
             Change::Rewrite {
                 source_location,
                 source_id,
@@ -970,7 +1455,19 @@ fn tree_diff_controlled_at_file_path(
                 found = Some(match change {
                     ChangeRef::Addition { id, .. } => TreeDiffChange::Addition { id },
                     ChangeRef::Deletion { .. } => TreeDiffChange::Deletion,
+                    ChangeRef::Modification {
+                        previous_entry_mode,
+                        entry_mode,
+                        id,
+                        ..
+                    } if previous_entry_mode.is_link() != entry_mode.is_link() => TreeDiffChange::Addition { id },
                     ChangeRef::Modification { previous_id, id, .. } => TreeDiffChange::Modification { previous_id, id },
+                    ChangeRef::Rewrite {
+                        source_entry_mode,
+                        entry_mode,
+                        id,
+                        ..
+                    } if source_entry_mode.is_link() != entry_mode.is_link() => TreeDiffChange::Addition { id },
                     ChangeRef::Rewrite {
                         source_location,
                         source_id,
@@ -1199,6 +1696,18 @@ fn blob_changes(
         )?;
     }
 
+    if raw {
+        let (old_data, new_data) = resource_cache.controlled_raw_buffers()?;
+        return match prepared {
+            Some(prepared) => {
+                let (input, limits) = prepared
+                    .try_prepare(previous_oid, old_data, oid, new_data, check)
+                    .map_err(|err| err.raise())?;
+                try_changes_from_input(input, limits, diff_algorithm, stats, check)
+            }
+            None => try_blob_changes_from_data(old_data, new_data, diff_algorithm, stats, check),
+        };
+    }
     let outcome = resource_cache.prepare_diff()?;
 
     let old_data = outcome.old.data.as_slice().unwrap_or_default();
@@ -1344,6 +1853,20 @@ fn find_path_entry_in_commit(
     stats: &mut Statistics,
     check: &mut Check<'_>,
 ) -> Result<Option<ObjectId>> {
+    Ok(find_path_entry_and_mode_in_commit(odb, commit, file_path, cache, buf, buf2, stats, check)?.map(|(id, _)| id))
+}
+
+#[expect(clippy::too_many_arguments)]
+fn find_path_entry_and_mode_in_commit(
+    odb: &impl gix_object::Find,
+    commit: &gix_hash::oid,
+    file_path: &BStr,
+    cache: Option<&gix_commitgraph::Graph>,
+    buf: &mut Vec<u8>,
+    buf2: &mut Vec<u8>,
+    stats: &mut Statistics,
+    check: &mut Check<'_>,
+) -> Result<Option<(ObjectId, gix_object::tree::EntryMode)>> {
     let mut tree_id = find_commit(cache, odb, commit, buf)
         .or_raise(|| message("Could not find existing iterator over a tree"))?
         .tree_id()
@@ -1369,7 +1892,7 @@ fn find_path_entry_in_commit(
             return Ok(None);
         };
         if parts.peek().is_none() {
-            return Ok(Some(id));
+            return Ok(mode.is_blob_or_symlink().then_some((id, mode)));
         }
         if !mode.is_tree() {
             return Ok(None);
@@ -1406,6 +1929,7 @@ fn collect_parents(
                 parent_ids
                     .try_reserve_exact(1)
                     .map_err(|_| message("parent allocation failed").raise())?;
+                super::bounded::allocated_smallvec(0, &parent_ids, check).map_err(|e| e.raise())?;
                 poll(check, Stage::Graph, parent_ids.len())?;
                 let parent = cache.commit_at(
                     parent_pos.or_raise(|| message("Failed to get parent from commitgraph during traversal"))?,
@@ -1423,6 +1947,7 @@ fn collect_parents(
                 parent_ids
                     .try_reserve_exact(1)
                     .map_err(|_| message("parent allocation failed").raise())?;
+                super::bounded::allocated_smallvec(0, &parent_ids, check).map_err(|e| e.raise())?;
                 poll(check, Stage::Graph, parent_ids.len())?;
                 let parent = odb.find_commit_iter(id.as_ref(), buf);
                 let parent_commit_time = if raw {
@@ -1542,6 +2067,8 @@ fn initial_state(
             let blamed_file_blob = match contents {
                 std::borrow::Cow::Owned(data) => {
                     gix_diff::blob::control::admit_bytes(data.capacity(), check).map_err(|e| e.raise())?;
+                    gix_diff::blob::control::allocated(0, data.as_ptr() as usize, data.capacity(), check)
+                        .map_err(|e| e.raise())?;
                     data
                 }
                 std::borrow::Cow::Borrowed(data) => try_copy_bytes(data, check)?,

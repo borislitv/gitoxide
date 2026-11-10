@@ -21,6 +21,10 @@ pub(crate) struct ByteIndex {
 }
 
 impl ByteIndex {
+    pub(crate) fn retain_backings(&self, check: &mut Check<'_>) -> Result<(), Cancelled> {
+        crate::control::retain_vec(&self.heads, check)?;
+        crate::control::retain_vec(&self.entries, check)
+    }
     pub(crate) fn clear(&mut self) {
         self.heads.clear();
         self.entries.clear();

@@ -324,6 +324,22 @@ impl<T> Index<Token> for Interner<T> {
 }
 
 impl Interner<Vec<u8>> {
+    /// Enumerate all controlled byte backing owners at a quiescent boundary.
+    /// Mixing in the generic hash table is not a controlled ownership contract.
+    pub fn retain_byte_backings(&self, check: &mut crate::control::Check<'_>) -> Result<(), crate::control::Cancelled> {
+        if !self.table.is_empty() {
+            return Err(crate::control::Cancelled);
+        }
+        crate::control::retain_vec(&self.tokens, check)?;
+        self.byte_index.retain_backings(check)?;
+        for chunk in self.tokens.chunks(32) {
+            for token in chunk {
+                crate::control::retain_vec(token, check)?;
+            }
+            crate::control::poll(check, crate::control::Stage::Index, chunk.len())?;
+        }
+        Ok(())
+    }
     /// Intern bytes with checks inside hashing, collision equality and ownership
     /// copies. Unlike `intern_ref`, no generic Hash/Eq/ToOwned callback is used.
     /// A cancelled insertion does not publish a new token. Existing generic

@@ -18,4 +18,7 @@ mod types;
 pub use types::{BlameEntry, BlamePathEntry, BlameRanges, Options, Outcome, Start, Statistics, Tuning};
 
 mod file;
-pub use file::function::{AdmittedOutcome, file, file_with_allocations, file_with_control, file_with_tuning};
+pub mod native;
+pub use file::function::{
+    AdmittedOutcome, file, file_with_allocations, file_with_allocations_and_trace, file_with_control, file_with_tuning,
+};

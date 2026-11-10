@@ -32,6 +32,9 @@ fn extend<T: Copy>(out: &mut Vec<T>, src: &[T], check: &mut Check<'_>) -> Result
 }
 
 const HISTORY_TOKEN_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+// Bound optional historical owners as well as logical byte weight. Current
+// required inputs retain their separate credit; this never truncates attribution.
+const HISTORY_TOKEN_BUDGET_COUNT: usize = 1024;
 const LINE_WEIGHT_OVERHEAD_BYTES: usize = 64;
 
 type PreparedView<'a> = (&'a InternedInput<Vec<u8>>, (usize, usize));
@@ -54,6 +57,14 @@ pub(super) struct PreparedInput {
 }
 
 impl PreparedInput {
+    pub(super) fn retain_backings(&self, check: &mut Check<'_>) -> Result<(), Cancelled> {
+        for data in [&self.input.before, &self.input.after] {
+            gix_diff::blob::control::retain_vec(data, check)?;
+        }
+        gix_diff::blob::control::retain_vec(&self.offsets, check)?;
+        gix_diff::blob::control::retain_vec(&self.spare_offsets, check)?;
+        self.input.interner.retain_byte_backings(check)
+    }
     pub(super) fn clear_with_control(&mut self, check: &mut Check<'_>) {
         self.input.before.clear();
         self.input.after.clear();
@@ -125,6 +136,8 @@ impl PreparedInput {
         }
         if self.parent_id != Some(suspect_id)
             || self.retained_bytes.saturating_sub(current_weight) > HISTORY_TOKEN_BUDGET_BYTES
+            || self.input.interner.num_tokens() as usize
+                > HISTORY_TOKEN_BUDGET_COUNT + self.input.before.len() + self.input.after.len()
         {
             self.resets += 1;
             self.clear_with_control(check);

@@ -36,6 +36,13 @@ impl Queue {
             self.0
                 .try_reserve_exact(capacity - self.0.len())
                 .map_err(|_| message("blame queue allocation failed").raise())?;
+            gix_diff::blob::control::allocated(
+                0,
+                self.0.as_slice().as_ptr() as usize,
+                self.0.capacity() * std::mem::size_of::<Entry>(),
+                check,
+            )
+            .map_err(|e| e.raise())?;
         }
         self.0.push(Entry(time, id));
         Ok(())
@@ -43,12 +50,34 @@ impl Queue {
     pub fn pop_value(&mut self) -> Option<gix_hash::ObjectId> {
         self.0.pop().map(|e| e.1)
     }
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+    pub fn retain_backing(&self, check: &mut Check<'_>) -> Result {
+        if self.0.capacity() != 0 {
+            check(Checkpoint {
+                stage: Stage::Retain {
+                    address: self.0.as_slice().as_ptr() as usize,
+                },
+                processed: 0,
+            })
+            .map_err(|e| e.raise())?;
+        }
+        Ok(())
     }
 }
 
 pub(crate) type Shared<'a, 'b> = RefCell<&'a mut Check<'b>>;
+
+pub(super) fn allocated_smallvec<A: smallvec::Array>(
+    old: usize,
+    data: &smallvec::SmallVec<A>,
+    check: &mut Check<'_>,
+) -> std::result::Result<(), gix_diff::blob::control::Cancelled> {
+    let (address, bytes) = if data.spilled() {
+        (data.as_ptr() as usize, data.capacity() * std::mem::size_of::<A::Item>())
+    } else {
+        (0, 0)
+    };
+    gix_diff::blob::control::allocated(old, address, bytes, check)
+}
 
 /// A Vec of request-owned allocation owners, with checked cleanup on every exit.
 pub(crate) struct VecOwner<'a, 'b, 'c, T> {

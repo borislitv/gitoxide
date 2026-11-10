@@ -44,6 +44,27 @@ pub enum Stage {
     RenameCandidate,
     /// Initializing or rehashing the byte-only numeric index.
     Index,
+    /// An admitted Vec relocation completed; addresses are opaque owner identities.
+    Backing {
+        /// Previous backing address, or zero for a new allocation.
+        old: usize,
+        /// Current backing address, or zero for inline storage.
+        new: usize,
+    },
+    /// Start an authoritative census at a quiescent ownership boundary.
+    RetainBegin,
+    /// A backing is still owned by a persistent root.
+    Retain {
+        /// Opaque backing owner identity; never dereferenced.
+        address: usize,
+    },
+    /// Complete the census; only absent, already-freed backings may be released.
+    RetainEnd,
+    /// Before a commit-processing step; processed counts previously visited commits.
+    /// This is independent of live-memory admission.
+    Commit,
+    /// Collecting admitted native origin provenance after complete attribution.
+    OriginTrace,
 }
 
 /// Progress after a bounded unit of inner work.
@@ -84,12 +105,14 @@ pub trait Allocator: Send + Sync {
     fn reserve(&self, bytes: usize) -> Result<Box<dyn Allocation>, Cancelled>;
 }
 
-/// Conservative request arena: growth charges are retained until all request
-/// scratch AND returned output have been freed. Reallocation is deliberately
-/// overcharged rather than releasing a charge while old backing may be pinned.
+/// Conservative backing registry. Completed relocations replace their old charge;
+/// quiescent, complete live-root censuses refund destroyed temporary owners.
+/// Never run a census while an unenumerated owner can still retain backing.
 /// This accounts backing capacity, not allocator metadata, RSS or scheduler time.
 pub struct Allocations {
-    leases: Vec<Box<dyn Allocation>>,
+    pending: Vec<Box<dyn Allocation>>,
+    backings: std::collections::HashMap<usize, (Box<dyn Allocation>, u64)>,
+    epoch: u64,
     metadata: Box<dyn Allocation>,
     allocator: std::sync::Arc<dyn Allocator>,
 }
@@ -98,44 +121,130 @@ impl Allocations {
     /// Call only after all charged backing owners were freed. Never let a stop
     /// error skip release; capacity-reservation destructors must be bounded.
     pub fn clear_with_control(&mut self, check: &mut Check<'_>) {
-        while !self.leases.is_empty() {
+        while !self.pending.is_empty() {
             for _ in 0..32 {
-                drop(self.leases.pop());
+                drop(self.pending.pop());
             }
-            let _ = poll(check, Stage::Cleanup, self.leases.len());
+            let _ = poll(check, Stage::Cleanup, self.pending.len());
         }
-        drop(std::mem::take(&mut self.leases));
+        drop(std::mem::take(&mut self.pending));
+        let mut count = 0;
+        for entry in std::mem::take(&mut self.backings) {
+            drop(entry);
+            count += 1;
+            if count % 32 == 0 {
+                let _ = poll(check, Stage::Cleanup, count);
+            }
+        }
         let _ = self.metadata.resize(0);
     }
     /// Create an empty arena. Store it after its charged output owner so Rust
     /// destroys the output before releasing the arena's charges.
     pub fn new(allocator: std::sync::Arc<dyn Allocator>) -> Result<Self, Cancelled> {
         Ok(Self {
-            leases: Vec::new(),
+            pending: Vec::new(),
+            backings: Default::default(),
+            epoch: 0,
             metadata: allocator.reserve(0)?,
             allocator,
         })
     }
 
     /// Admit one conservative capacity increase, retaining its charge. The
-    /// caller must emit an Allocate event for every controlled backing growth.
+    /// caller must emit an Allocate event for every controlled backing growth
+    /// and associate persistent backing with an allocated event.
     pub fn admit(&mut self, bytes: usize) -> Result<(), Cancelled> {
-        if self.leases.len() == self.leases.capacity() {
-            let target = self.leases.capacity().saturating_mul(2).max(32);
-            if target > 131072 {
-                return Err(Cancelled);
-            }
-            self.metadata
-                .resize(target * std::mem::size_of::<Box<dyn Allocation>>())?;
-            self.leases
-                .try_reserve_exact(target - self.leases.len())
-                .map_err(|_| Cancelled)?;
-            self.metadata
-                .resize(self.leases.capacity() * std::mem::size_of::<Box<dyn Allocation>>())?;
+        let live = self.pending.len() + self.backings.len();
+        if live >= 131072 {
+            return Err(Cancelled);
         }
-        self.leases.push(self.allocator.reserve(bytes)?);
+        let target = (live + 1).next_power_of_two().max(32);
+        // Admit both old and replacement metadata while either can be live.
+        self.metadata.resize(
+            (target * 4 + self.backings.capacity() * 2) * std::mem::size_of::<(usize, (Box<dyn Allocation>, u64))>()
+                + (target + self.pending.capacity()) * std::mem::size_of::<Box<dyn Allocation>>()
+                + 128,
+        )?;
+        self.pending.try_reserve_exact(1).map_err(|_| Cancelled)?;
+        self.backings.try_reserve(1).map_err(|_| Cancelled)?;
+        self.pending.push(self.allocator.reserve(bytes)?);
         Ok(())
     }
+
+    /// Associate a completed allocation with its backing, after relocation freed
+    /// the previous storage. No address is dereferenced or used as an object ID.
+    pub fn allocated(&mut self, old: usize, new: usize, bytes: usize) -> Result<(), Cancelled> {
+        let mut lease = self.pending.pop().ok_or(Cancelled)?;
+        if let Err(error) = lease.resize(bytes) {
+            self.pending.push(lease);
+            return Err(error);
+        }
+        if old != 0 {
+            self.backings.remove(&old);
+        }
+        if new != 0 && bytes != 0 {
+            self.backings.insert(new, (lease, self.epoch));
+        }
+        Ok(())
+    }
+
+    /// Begin only when all temporary owners from the preceding step were freed.
+    pub fn begin_retention(&mut self) -> Result<(), Cancelled> {
+        self.epoch = self.epoch.checked_add(1).ok_or(Cancelled)?;
+        Ok(())
+    }
+
+    /// Mark a backing still owned by the complete persistent-root set.
+    pub fn retain(&mut self, address: usize) {
+        if let Some((_, epoch)) = self.backings.get_mut(&address) {
+            *epoch = self.epoch;
+        }
+    }
+
+    /// Release only allocations absent from that authoritative root set. A stop
+    /// cannot interrupt release of dead charges or reset charges on live roots.
+    pub fn end_retention(&mut self, check: &mut Check<'_>) -> Result<(), Cancelled> {
+        let mut count = 0;
+        let mut stopped = false;
+        while !self.pending.is_empty() {
+            for _ in 0..32 {
+                drop(self.pending.pop());
+            }
+            stopped |= poll(check, Stage::Cleanup, self.pending.len()).is_err();
+        }
+        self.backings.retain(|_, (_, epoch)| {
+            count += 1;
+            if count % 32 == 0 {
+                stopped |= poll(check, Stage::Cleanup, count).is_err();
+            }
+            *epoch == self.epoch
+        });
+        self.metadata.resize(
+            self.backings.capacity() * 2 * std::mem::size_of::<(usize, (Box<dyn Allocation>, u64))>()
+                + self.pending.capacity() * std::mem::size_of::<Box<dyn Allocation>>()
+                + 128,
+        )?;
+        if stopped { Err(Cancelled) } else { Ok(()) }
+    }
+}
+
+/// Record an admitted relocation only after the old backing was freed.
+pub fn allocated(old: usize, new: usize, bytes: usize, check: &mut Check<'_>) -> Result<(), Cancelled> {
+    poll(check, Stage::Backing { old, new }, bytes)
+}
+
+/// Mark a Vec's backing without exposing mutable storage or discounting capacity.
+pub fn retain_vec<T>(data: &Vec<T>, check: &mut Check<'_>) -> Result<(), Cancelled> {
+    if data.capacity() != 0 && std::mem::size_of::<T>() != 0 {
+        poll(
+            check,
+            Stage::Retain {
+                address: data.as_ptr() as usize,
+            },
+            data.capacity() * std::mem::size_of::<T>(),
+        )?;
+    }
+    Ok(())
 }
 
 pub(crate) fn poll(check: &mut Check<'_>, stage: Stage, processed: usize) -> Result<(), Cancelled> {
@@ -187,7 +296,14 @@ pub fn try_reserve<T>(out: &mut Vec<T>, additional: usize, check: &mut Check<'_>
     let target = len.max(out.capacity().saturating_mul(2)).min(maximum);
     let bytes = target.checked_mul(std::mem::size_of::<T>()).ok_or(Cancelled)?;
     admit_bytes(bytes, check)?;
-    out.try_reserve_exact(target - out.len()).map_err(|_| Cancelled)
+    let old = if out.capacity() == 0 { 0 } else { out.as_ptr() as usize };
+    out.try_reserve_exact(target - out.len()).map_err(|_| Cancelled)?;
+    allocated(
+        old,
+        out.as_ptr() as usize,
+        out.capacity() * std::mem::size_of::<T>(),
+        check,
+    )
 }
 
 /// Push one fixed-size element, admitting geometric capacity growth first.

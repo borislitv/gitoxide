@@ -28,12 +28,48 @@ same arguments, followed by `Arc<dyn Allocator>` and `&mut check`. Its result is
   output backing before releasing charges, even if every cleanup check fails.
   Drop also cleans output and charges. No owned-output escape bypasses the owner.
 
-The conservative arena retains every growth charge through request scratch and
-output lifetimes, and separately admits its reservation-vector backing. It may
-reject a request earlier than an exact live-capacity implementation. It accounts
-backing capacities, not allocator/opaque reservation metadata, process RSS, or
-scheduler time. `Allocate` callbacks without an allocator are only admission
-notifications; they do not independently establish aggregate ownership.
+The conservative backing registry admits growth before allocation, reconciles
+actual capacity, and replaces an old charge only after relocation has freed its
+old backing. At quiescent iteration boundaries a complete persistent-root census
+keeps buffers, graph queues, the raw-path-keyed first-parent entry, prepared
+tokens, raw resources, hunks and output
+charged, and refunds destroyed temporary owners. Successful return retains only
+output and optional trace charges. Registry bookkeeping is admitted separately.
+It accounts backing capacities, not allocator/opaque reservation metadata,
+process RSS, or scheduler time. `Allocate` callbacks without an allocator are
+only admission notifications; they do not independently establish ownership.
+
+`Backing` and `Retain*` checkpoints are ownership protocol events; the admitted
+entrypoints consume them internally. A raw controlled callback must not treat
+them as additional cumulative work. `Commit` checkpoints are independent work
+boundaries: callers can enforce a cumulative work/deadline policy without
+retaining memory charges for destroyed historical allocations. Optional prepared
+history has both a 64 MiB logical-weight bound and a 1024-token historical bound
+in addition to current-pair token counts; eviction retokenizes complete current
+inputs and never truncates ancestry or attribution.
+
+## Opt-in native origin trace
+
+`file_with_allocations_and_trace` has the same arguments and admitted result as
+`file_with_allocations`. `AdmittedOutcome::native_trace()` returns `Some(&[NativeOrigin])`
+only for this opt-in entrypoint, including an empty slice for an empty file.
+Existing entrypoints return no trace and preserve their signatures.
+
+The supported profile is immutable commit, whole file, Myers, no date cutoff,
+and default whole-file rename detection without line move/copy heuristics.
+Unsupported profiles fail before provider or allocation work. The trace carries
+raw-byte source paths, commit IDs, zero-based source/final ranges, group identity
+and length, `previous` origin commit/path, and boundary status. Under this root
+profile roots are not boundaries. `previous` resolves eligible origins from the
+attributed commit's actual parents/path, not a guessed first parent. Origin
+discovery precedes partial attribution; compatible exact whole-file parents win
+first, and distinct paths in the same commit remain distinct origins.
+
+Trace backing is admitted and remains owned by `AdmittedOutcome`; cancellation
+or denial during trace construction returns no output and releases its owners.
+`OriginTrace` checkpoints permit an independent stop during provenance work.
+The trace is not a porcelain serializer: callers still own commit metadata,
+quoting, text formatting, serialization admission and source holds.
 
 ## Controlled work
 
@@ -79,7 +115,8 @@ not automatically charge arbitrary downstream allocations.
   runs use chunks of at most 1024. Nested owner/charge cleanup uses batches of 32.
 - Each admitted backing is limited to 256 MiB. Objects and initial contents are
   limited to 128 MiB; metadata records and paths to 64 KiB; parent/suspect lists
-  to 128; arena growth reservations to 131072. Recursive Histogram/Myers search
+  to 128; simultaneously live registry reservations to 131072, not total
+  historical growth events. Recursive Histogram/Myers search
   depth is limited to 256. Limit/admission failures return an error, never a
   partially successful controlled outcome.
 - Fixed-size/validated metadata parsing and allocator/deallocator syscalls have
@@ -111,9 +148,10 @@ Strict Clippy and the affected behavioral suites passed. These include all 32
 tuning combinations, request isolation, allocation denial/lifetime, provider
 no-growth conformance, long lines, raw-pipeline rejection, stable ties, controlled
 tree/rename/copy equivalence against original snapshots, and cleanup after stop.
-Five final-source mutations removing inner Hash, Equal, MiddleSnake, Output, or
-RenameCandidate checks failed their intended behavioral assertions while entry
-checks remained. Sources were restored byte-exactly. Additional controls qualify
+The earlier controlled-work qualification included five mutations removing inner
+Hash, Equal, MiddleSnake, Output, or RenameCandidate checks. They failed their
+intended behavioral assertions while entry checks remained, and sources were
+restored byte-exactly. Additional controls qualify
 adversarial recursion rejection and explicit charge release after output cleanup.
 
 The normal three-package command also checks the imara package provenance ledger.
@@ -121,3 +159,17 @@ The normal three-package command also checks the imara package provenance ledger
 modified upstream sources retain their origin and notices. This gate must pass
 alongside the behavioral suites. Passing vendor tests does not establish
 application graph/serializer integration or deployment latency by itself.
+
+Deep-history regressions traverse 160000 physical commits to the root with a
+no-growth provider: unchanged content under a 4 MiB live budget, and changing
+content with all tuning flags under a 64 MiB live budget. Separate work denial
+remains enforceable without historical memory charges. Synthetic native-oracle
+cases compare attribution, raw paths, previous origins and header groups for
+unrelated roots, convergent renames, octopus/crisscross merges, timestamp ties
+and reversals, type changes, CRLF, missing final LF and binary bytes. These are
+correctness/resource qualifications, not hosted latency or throughput claims.
+Trace/work mutations removing `previous`, the post-group provenance stop, or
+the independent commit work checkpoint fail their targeted regression assertions.
+The first-parent blob shortcut keys both commit and full raw path; its admitted
+path backing participates in every loop census. A five-commit deferred-origin
+regression rejects cross-path reuse in both debug and optimized builds.
