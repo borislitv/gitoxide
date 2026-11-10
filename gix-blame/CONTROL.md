@@ -25,8 +25,12 @@ deadline/source hold and treat optional checkpoint failures as optional.
 
 One lazily admitted reusable slot is bounded by `memo::UNIT_BYTES` (4 MiB). Its
 actual backing is retained in the complete loop census and physically destroyed
-before trace/final-output censuses release scratch charges. Decode returns the
-same owned `Change` vector as fresh diff/postprocessing; attribution is not
+before trace/final-output censuses release scratch charges. Its full initialized
+length is retained between edges; encoding overwrites only the complete unit's
+prefix, without clearing or zero-filling the whole slot again. Checksums,
+validation and publication use the exact encoded prefix, never stale or
+callback-modified tail bytes. Decode returns the same owned `Change` vector as
+fresh diff/postprocessing; attribution is not
 replaced by a timestamp, first-parent, or linear-history fast path. A hit
 invalidates the sequential prepared-input hint rather than importing token IDs.
 
@@ -58,9 +62,10 @@ validated hits, fresh computations, rejected units and complete units delivered
 to the store. Old entrypoints return zero memo statistics. Explicit `reuse=false`
 performs no memo callbacks but reports visits/computations for a baseline gate.
 These counters exclude separate rename discovery/origin-resolver diff work.
-The completed-mapping qualification uses Rust 1.99.1 and genuine ELF Git 2.56.0.
-The three-package suite passes 293 behavioral/provenance and five doc tests;
-all 20 native/memo cases also pass in optimized builds. Off/cold/warm fixtures
+The initial completed-mapping qualification, before the initialized-slot prefix
+optimization, used Rust 1.99.1 and genuine ELF Git 2.56.0. Its three-package suite
+passed 293 behavioral/provenance and five doc tests;
+all 20 native/memo cases also passed in optimized builds. Off/cold/warm fixtures
 compare complete owner/trace fields, and the eight-root gate observes eight
 visits/eight fresh computations with reuse off versus eight hits/no fresh
 computations when warm. Strict Clippy and changed-file formatting pass.

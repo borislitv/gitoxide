@@ -268,6 +268,7 @@ struct MemoryMemo {
     loads: usize,
     writes: usize,
     force_first: bool,
+    dirty_tail: bool,
     loaded: Option<Arc<std::sync::atomic::AtomicBool>>,
     observed_budget: Option<Arc<Mutex<(usize, usize)>>>,
 }
@@ -278,6 +279,11 @@ impl gix_blame::memo::MappingMemo for MemoryMemo {
         into: &mut [u8],
     ) -> Result<Option<usize>, gix_diff::blob::control::Cancelled> {
         self.loads += 1;
+        if self.dirty_tail {
+            // A callback may overwrite any initialized destination bytes, even
+            // on a miss. Only its reported complete prefix is an imported unit.
+            into.fill(0xa5);
+        }
         if let Some(job) = &self.observed_budget {
             assert!(
                 job.lock().unwrap().0 >= gix_blame::memo::UNIT_BYTES,
@@ -315,6 +321,296 @@ impl gix_blame::memo::MappingMemo for MemoryMemo {
             }
         }
         Ok(())
+    }
+}
+
+#[test]
+fn memo_slot_reuse_stays_within_a_bounded_preprocessing_work_budget() {
+    use gix_diff::blob::control::{BYTE_CHUNK, Cancelled, Stage};
+    let repo = Repo::new();
+    let root = repo.commit(&[(b"f", b"anchor\none\ntwo\nthree\n", "100644")], &[], 1);
+    let first = repo.commit(&[(b"f", b"anchor\none\n", "100644")], &[root], 2);
+    let second = repo.commit(&[(b"f", b"anchor\n", "100644")], &[first], 3);
+    let third = repo.commit(&[(b"f", b"anchor\nfour\nfive\nsix\nseven\n", "100644")], &[second], 4);
+    let tip = repo.commit(&[(b"f", b"anchor\nnew\n", "100644")], &[third], 5);
+    let native = repo.assert_blame(tip, b"f");
+    assert_eq!(native.len(), 2);
+    assert_eq!((native[0].commit, native[1].commit), (root, tip));
+    for tuning in [
+        gix_blame::Tuning::default(),
+        gix_blame::Tuning {
+            reuse_line_tokens: true,
+            retain_current_input_tokens: true,
+            reuse_unchanged_runs: true,
+            bounded_resource_cache: true,
+            index_changes: true,
+        },
+    ] {
+        let options = gix_blame::memo::MappingOptions {
+            reuse: true,
+            producer: [1; 32],
+            options: [2; 32],
+        };
+        let baseline_job = Arc::new(Mutex::new((0, 0)));
+        let baseline = repo
+            .memo_blame(
+                tip,
+                b"f",
+                tuning,
+                &mut MemoryMemo::default(),
+                gix_blame::memo::MappingOptions {
+                    reuse: false,
+                    ..options
+                },
+                baseline_job.clone(),
+                &mut |_| Ok(()),
+            )
+            .unwrap();
+        let mut memo = MemoryMemo {
+            dirty_tail: true,
+            ..Default::default()
+        };
+        for (run, expected_hits) in [0, 2, 4].into_iter().enumerate() {
+            if run == 1 {
+                assert_eq!(memo.entries.len(), 4);
+                // Leave a genuine partial workset, mixing real hits and misses.
+                memo.entries.drain(..2);
+            }
+            let job = Arc::new(Mutex::new((0, 0)));
+            memo.observed_budget = Some(job.clone());
+            // Public cooperative-work budget: count each nonzero preprocessing
+            // progress report as at most one byte-work quantum. This is not a
+            // CPU/byte measurement or an assertion about callback order. The
+            // fixed allowance permits one 4 MiB initialization plus these tiny
+            // edges, but not a full-slot refill for each cold/partial edge.
+            let mut remaining = 8usize * 1024 * 1024;
+            let owner = repo
+                .memo_blame(tip, b"f", tuning, &mut memo, options, job.clone(), &mut |event| {
+                    if event.stage == Stage::Preprocess {
+                        remaining = remaining
+                            .checked_sub(event.processed.min(BYTE_CHUNK))
+                            .ok_or(Cancelled)?;
+                    }
+                    Ok(())
+                })
+                .expect("bounded small-edge work must not repeatedly initialize a full wire slot");
+            assert_eq!(owner.outcome().blob, baseline.outcome().blob);
+            assert_eq!(owner.outcome().entries, baseline.outcome().entries);
+            assert_eq!(owner.native_trace(), baseline.native_trace());
+            let stats = owner.mapping_statistics();
+            assert_eq!(stats.edges_visited, 4);
+            assert_eq!(stats.hits, expected_hits);
+            assert_eq!(stats.computations, 4 - expected_hits);
+            assert_eq!(stats.completed, 4 - expected_hits);
+            assert_eq!(stats.rejected, 0);
+            drop(owner);
+            assert_eq!(job.lock().unwrap().0, 0);
+        }
+        drop(baseline);
+        assert_eq!(baseline_job.lock().unwrap().0, 0);
+    }
+}
+
+#[test]
+fn retained_memo_slot_stops_on_later_load_store_and_validation_errors() {
+    use gix_blame::memo::{MappingKey, MappingMemo};
+    use gix_diff::blob::control::{Cancelled, Stage};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Stopped {
+        inner: MemoryMemo,
+        loads: Arc<AtomicUsize>,
+        stop_store: bool,
+        stop_validation: bool,
+    }
+    impl MappingMemo for Stopped {
+        fn load(&mut self, key: &MappingKey, into: &mut [u8]) -> Result<Option<usize>, Cancelled> {
+            let loads = self.loads.fetch_add(1, Ordering::Relaxed) + 1;
+            if loads == 2 && !self.stop_store && !self.stop_validation {
+                into.fill(0xa5);
+                return Err(Cancelled);
+            }
+            self.inner.load(key, into)
+        }
+        fn completed(&mut self, key: &MappingKey, wire: &[u8]) -> Result<(), Cancelled> {
+            if self.loads.load(Ordering::Relaxed) == 2 && self.stop_store {
+                return Err(Cancelled);
+            }
+            self.inner.completed(key, wire)
+        }
+    }
+    let repo = Repo::new();
+    let root = repo.commit(&[(b"f", b"anchor\nold\n", "100644")], &[], 1);
+    let middle = repo.commit(&[(b"f", b"anchor\nmiddle\n", "100644")], &[root], 2);
+    let tip = repo.commit(&[(b"f", b"anchor\nnew\n", "100644")], &[middle], 3);
+    let options = gix_blame::memo::MappingOptions {
+        reuse: true,
+        producer: [1; 32],
+        options: [2; 32],
+    };
+    for (warm, stop_store, stop_validation) in [
+        (false, false, false),
+        (true, false, false),
+        (false, true, false),
+        (true, false, true),
+    ] {
+        let mut inner = MemoryMemo {
+            dirty_tail: true,
+            ..Default::default()
+        };
+        if warm {
+            let seed_job = Arc::new(Mutex::new((0, 0)));
+            let seed = repo
+                .memo_blame(
+                    tip,
+                    b"f",
+                    Default::default(),
+                    &mut inner,
+                    options,
+                    seed_job.clone(),
+                    &mut |_| Ok(()),
+                )
+                .unwrap();
+            assert_eq!(seed.mapping_statistics().completed, 2);
+            drop(seed);
+            assert_eq!(seed_job.lock().unwrap().0, 0);
+        }
+        let job = Arc::new(Mutex::new((0, 0)));
+        inner.observed_budget = Some(job.clone());
+        let loads = Arc::new(AtomicUsize::new(0));
+        let writes_before = inner.writes;
+        let mut memo = Stopped {
+            inner,
+            loads: loads.clone(),
+            stop_store,
+            stop_validation,
+        };
+        let mut validation_stopped = false;
+        let result = repo.memo_blame(
+            tip,
+            b"f",
+            Default::default(),
+            &mut memo,
+            options,
+            job.clone(),
+            &mut |event| {
+                if stop_validation
+                    && loads.load(Ordering::Relaxed) == 2
+                    && event.stage == Stage::Preprocess
+                    && event.processed > 0
+                {
+                    validation_stopped = true;
+                    return Err(Cancelled);
+                }
+                Ok(())
+            },
+        );
+        assert!(result.is_err(), "a later callback/control stop must return no owner");
+        assert_eq!(loads.load(Ordering::Relaxed), 2);
+        assert_eq!(validation_stopped, stop_validation);
+        assert_eq!(memo.inner.writes - writes_before, usize::from(!warm));
+        assert_eq!(job.lock().unwrap().0, 0);
+    }
+}
+
+#[test]
+fn retained_memo_slot_rejects_bad_reported_lengths_without_importing_dirty_tails() {
+    use gix_blame::memo::{MappingKey, MappingMemo, UNIT_BYTES};
+    use gix_diff::blob::control::Cancelled;
+    #[derive(Clone, Copy)]
+    enum Length {
+        Empty,
+        Oversized,
+        Truncated,
+        Trailing,
+    }
+    struct BadLength {
+        inner: MemoryMemo,
+        loads: usize,
+        length: Length,
+    }
+    impl MappingMemo for BadLength {
+        fn load(&mut self, key: &MappingKey, into: &mut [u8]) -> Result<Option<usize>, Cancelled> {
+            self.loads += 1;
+            let length = self.inner.load(key, into)?.expect("a real warm unit must exist");
+            Ok(Some(if self.loads == 2 {
+                match self.length {
+                    Length::Empty => 0,
+                    Length::Oversized => UNIT_BYTES + 1,
+                    Length::Truncated => length - 1,
+                    Length::Trailing => length + 1,
+                }
+            } else {
+                length
+            }))
+        }
+        fn completed(&mut self, key: &MappingKey, wire: &[u8]) -> Result<(), Cancelled> {
+            self.inner.completed(key, wire)
+        }
+    }
+    let repo = Repo::new();
+    let root = repo.commit(&[(b"f", b"anchor\nold\n", "100644")], &[], 1);
+    let middle = repo.commit(&[(b"f", b"anchor\nmiddle\n", "100644")], &[root], 2);
+    let tip = repo.commit(&[(b"f", b"anchor\nnew\n", "100644")], &[middle], 3);
+    let native = repo.assert_blame(tip, b"f");
+    assert_eq!((native[0].commit, native[1].commit), (root, tip));
+    let options = gix_blame::memo::MappingOptions {
+        reuse: true,
+        producer: [1; 32],
+        options: [2; 32],
+    };
+    for length in [Length::Empty, Length::Oversized, Length::Truncated, Length::Trailing] {
+        let mut inner = MemoryMemo {
+            dirty_tail: true,
+            ..Default::default()
+        };
+        let seed_job = Arc::new(Mutex::new((0, 0)));
+        let seed = repo
+            .memo_blame(
+                tip,
+                b"f",
+                Default::default(),
+                &mut inner,
+                options,
+                seed_job.clone(),
+                &mut |_| Ok(()),
+            )
+            .unwrap();
+        assert_eq!(seed.mapping_statistics().completed, 2);
+        let job = Arc::new(Mutex::new((0, 0)));
+        inner.observed_budget = Some(job.clone());
+        let mut memo = BadLength {
+            inner,
+            loads: 0,
+            length,
+        };
+        let owner = repo
+            .memo_blame(
+                tip,
+                b"f",
+                Default::default(),
+                &mut memo,
+                options,
+                job.clone(),
+                &mut |_| Ok(()),
+            )
+            .unwrap();
+        assert_eq!(owner.outcome().blob, seed.outcome().blob);
+        assert_eq!(owner.outcome().entries, seed.outcome().entries);
+        assert_eq!(owner.native_trace(), seed.native_trace());
+        assert_eq!(
+            owner.mapping_statistics(),
+            gix_blame::memo::MappingStatistics {
+                edges_visited: 2,
+                hits: 1,
+                computations: 1,
+                rejected: 1,
+                completed: 1,
+            }
+        );
+        drop(owner);
+        assert_eq!(job.lock().unwrap().0, 0);
+        drop(seed);
+        assert_eq!(seed_job.lock().unwrap().0, 0);
     }
 }
 

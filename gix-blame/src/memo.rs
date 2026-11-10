@@ -98,6 +98,8 @@ pub struct MappingRequest<'a> {
 pub(crate) struct State<'a> {
     request: MappingRequest<'a>,
     tuning: u8,
+    // Length tracks initialized backing, not the last wire length. Encoding must
+    // overwrite only a prefix so later edges never reinitialize the full slot.
     slot: Vec<u8>,
     pub statistics: MappingStatistics,
 }
@@ -187,12 +189,12 @@ impl<'a> State<'a> {
         // Validate before publication, not a partial vector or an opaque token-ID
         // snapshot. Validation allocates nothing.
         if !hit
-            && encode(&mut self.slot, key, before, after, changes, check)?
-            && validate(&self.slot, key, before, after, check)?.is_some()
+            && let Some(length) = encode(&mut self.slot, key, before, after, changes, check)?
+            && validate(&self.slot[..length], key, before, after, check)?.is_some()
         {
-            self.request.memo.completed(key, &self.slot)?;
+            self.request.memo.completed(key, &self.slot[..length])?;
             self.statistics.completed += 1;
-            tick(check, self.slot.len())?;
+            tick(check, length)?;
         }
         if let Some(boundary) = self.request.boundary.as_mut() {
             boundary.completed(self.statistics)?;
@@ -267,13 +269,13 @@ fn digest(bytes: &[u8], key: &MappingKey, check: &mut Check<'_>) -> Result<Optio
 }
 
 fn encode(
-    slot: &mut Vec<u8>,
+    slot: &mut [u8],
     key: &MappingKey,
     before: &[u8],
     after: &[u8],
     changes: &[Change],
     check: &mut Check<'_>,
-) -> Result<bool, Cancelled> {
+) -> Result<Option<usize>, Cancelled> {
     let old = lines(before, check)?;
     let new = lines(after, check)?;
     // Both complete partitions, every record, fixed key, counts and checksum.
@@ -282,39 +284,50 @@ fn encode(
         .and_then(|n| n.checked_add(12))
         .and_then(|n| n.checked_add((old as usize + new as usize + 2).checked_mul(8)?))
         .and_then(|n| n.checked_add(changes.len().checked_mul(13)?));
-    if size.is_none_or(|n| n > UNIT_BYTES) {
-        return Ok(false);
+    if size.is_none_or(|n| n > UNIT_BYTES || n > slot.len()) {
+        return Ok(None);
     }
-    slot.clear();
-    // The reusable slot was admitted before the load callback, even on a miss.
-    key_bytes(key, |bytes| slot.extend_from_slice(bytes));
-    slot.extend_from_slice(&old.to_le_bytes());
-    slot.extend_from_slice(&new.to_le_bytes());
     let Ok(count) = u32::try_from(changes.len()) else {
-        return Ok(false);
+        return Ok(None);
     };
-    slot.extend_from_slice(&count.to_le_bytes());
-    partition(before, |offset| slot.extend_from_slice(&offset.to_le_bytes()), check)?;
-    partition(after, |offset| slot.extend_from_slice(&offset.to_le_bytes()), check)?;
-    for (index, change) in changes.iter().enumerate() {
-        let (tag, start, end, removed) = match change {
-            Change::Unchanged(range) => (0, range.start, range.end, 0),
-            Change::AddedOrReplaced(range, removed) => (1, range.start, range.end, *removed),
-            Change::Deleted(start, removed) => (2, *start, *start, *removed),
+    // The complete initialized slot was admitted before load, even on a miss.
+    // The checked size bounds every write; bytes beyond this unit are neither
+    // hashed nor validated nor published, including arbitrary callback tails.
+    let length = {
+        let mut cursor = 0;
+        let mut emit = |bytes: &[u8]| {
+            let end = cursor + bytes.len();
+            slot[cursor..end].copy_from_slice(bytes);
+            cursor = end;
         };
-        slot.push(tag);
-        for n in [start, end, removed] {
-            slot.extend_from_slice(&n.to_le_bytes());
+        key_bytes(key, &mut emit);
+        emit(&old.to_le_bytes());
+        emit(&new.to_le_bytes());
+        emit(&count.to_le_bytes());
+        partition(before, |offset| emit(&offset.to_le_bytes()), check)?;
+        partition(after, |offset| emit(&offset.to_le_bytes()), check)?;
+        for (index, change) in changes.iter().enumerate() {
+            let (tag, start, end, removed) = match change {
+                Change::Unchanged(range) => (0, range.start, range.end, 0),
+                Change::AddedOrReplaced(range, removed) => (1, range.start, range.end, *removed),
+                Change::Deleted(start, removed) => (2, *start, *start, *removed),
+            };
+            emit(&[tag]);
+            for n in [start, end, removed] {
+                emit(&n.to_le_bytes());
+            }
+            if index % 256 == 0 {
+                tick(check, index)?;
+            }
         }
-        if index % 256 == 0 {
-            tick(check, index)?;
-        }
-    }
-    let Some(hash) = digest(slot, key, check)? else {
-        return Ok(false);
+        cursor
     };
-    slot.extend_from_slice(hash.as_bytes());
-    Ok(true)
+    let Some(hash) = digest(&slot[..length], key, check)? else {
+        return Ok(None);
+    };
+    let end = length + hash.as_bytes().len();
+    slot[length..end].copy_from_slice(hash.as_bytes());
+    Ok(Some(end))
 }
 
 fn number(bytes: &[u8], offset: usize) -> Option<u32> {
