@@ -60,6 +60,18 @@ pub enum Stage {
     },
     /// Complete the census; only absent, already-freed backings may be released.
     RetainEnd,
+    /// Move an immutable, still-owned backing out of repeated scratch censuses.
+    /// Its owner must stay alive until `RetainScopeEnd`, including error exits.
+    RetainPinned {
+        /// Opaque backing identity, never dereferenced.
+        address: usize,
+    },
+    /// Compact mutable scratch tracking after the initial complete census and
+    /// immutable-root marking. No pinned root may be destroyed in this scope.
+    RetainScopeBegin,
+    /// End immutable-root protection. The next complete census must enumerate
+    /// all surviving roots normally; this event itself never refunds a charge.
+    RetainScopeEnd,
     /// Before a commit-processing step; processed counts previously visited commits.
     /// This is independent of live-memory admission.
     Commit,
@@ -112,6 +124,8 @@ pub trait Allocator: Send + Sync {
 pub struct Allocations {
     pending: Vec<Box<dyn Allocation>>,
     backings: std::collections::HashMap<usize, (Box<dyn Allocation>, u64)>,
+    pinned: std::collections::HashMap<usize, (Box<dyn Allocation>, u64)>,
+    pinned_scope: bool,
     epoch: u64,
     metadata: Box<dyn Allocation>,
     allocator: std::sync::Arc<dyn Allocator>,
@@ -129,11 +143,13 @@ impl Allocations {
         }
         drop(std::mem::take(&mut self.pending));
         let mut count = 0;
-        for entry in std::mem::take(&mut self.backings) {
-            drop(entry);
-            count += 1;
-            if count % 32 == 0 {
-                let _ = poll(check, Stage::Cleanup, count);
+        for map in [&mut self.backings, &mut self.pinned] {
+            for entry in std::mem::take(map) {
+                drop(entry);
+                count += 1;
+                if count % 32 == 0 {
+                    let _ = poll(check, Stage::Cleanup, count);
+                }
             }
         }
         let _ = self.metadata.resize(0);
@@ -144,6 +160,8 @@ impl Allocations {
         Ok(Self {
             pending: Vec::new(),
             backings: Default::default(),
+            pinned: Default::default(),
+            pinned_scope: false,
             epoch: 0,
             metadata: allocator.reserve(0)?,
             allocator,
@@ -154,14 +172,15 @@ impl Allocations {
     /// caller must emit an Allocate event for every controlled backing growth
     /// and associate persistent backing with an allocated event.
     pub fn admit(&mut self, bytes: usize) -> Result<(), Cancelled> {
-        let live = self.pending.len() + self.backings.len();
+        let live = self.pending.len() + self.backings.len() + self.pinned.len();
         if live >= 131072 {
             return Err(Cancelled);
         }
         let target = (live + 1).next_power_of_two().max(32);
         // Admit both old and replacement metadata while either can be live.
         self.metadata.resize(
-            (target * 4 + self.backings.capacity() * 2) * std::mem::size_of::<(usize, (Box<dyn Allocation>, u64))>()
+            (target * 4 + self.backings.capacity() * 2 + self.pinned.capacity() * 2)
+                * std::mem::size_of::<(usize, (Box<dyn Allocation>, u64))>()
                 + (target + self.pending.capacity()) * std::mem::size_of::<Box<dyn Allocation>>()
                 + 128,
         )?;
@@ -181,6 +200,7 @@ impl Allocations {
         }
         if old != 0 {
             self.backings.remove(&old);
+            self.pinned.remove(&old);
         }
         if new != 0 && bytes != 0 {
             self.backings.insert(new, (lease, self.epoch));
@@ -196,9 +216,77 @@ impl Allocations {
 
     /// Mark a backing still owned by the complete persistent-root set.
     pub fn retain(&mut self, address: usize) {
-        if let Some((_, epoch)) = self.backings.get_mut(&address) {
+        if let Some((_, epoch)) = self
+            .backings
+            .get_mut(&address)
+            .or_else(|| self.pinned.get_mut(&address))
+        {
             *epoch = self.epoch;
         }
+    }
+
+    /// Protect a charged immutable backing. Merely seeing a progress checkpoint
+    /// cannot establish this lifetime: the owner explicitly supplies its address.
+    pub fn pin(&mut self, address: usize) -> Result<(), Cancelled> {
+        if self.pinned.contains_key(&address) {
+            return Ok(());
+        }
+        if !self.backings.contains_key(&address) {
+            return Err(Cancelled);
+        }
+        if self.pinned.len() == self.pinned.capacity() {
+            let target = (self.pinned.len() + 1).next_power_of_two().max(32);
+            self.metadata.resize(
+                (target * 4 + self.backings.capacity() * 2 + self.pinned.capacity() * 2)
+                    * std::mem::size_of::<(usize, (Box<dyn Allocation>, u64))>()
+                    + self.pending.capacity() * std::mem::size_of::<Box<dyn Allocation>>()
+                    + 128,
+            )?;
+            self.pinned.try_reserve(1).map_err(|_| Cancelled)?;
+        }
+        let entry = self.backings.remove(&address).ok_or(Cancelled)?;
+        self.pinned.insert(address, entry);
+        Ok(())
+    }
+
+    /// Start one nonnested immutable-owner scope after a complete census. Rebuild
+    /// only the remaining mutable registry so dead historical capacity is not
+    /// scanned once per immutable output row. Peak old/new metadata is admitted.
+    pub fn begin_pinned_scope(&mut self, check: &mut Check<'_>) -> Result<(), Cancelled> {
+        poll(check, Stage::Cleanup, 0)?;
+        if self.pinned_scope || !self.pending.is_empty() {
+            return Err(Cancelled);
+        }
+        let target = self.backings.len().next_power_of_two().max(32);
+        self.metadata.resize(
+            (target * 4 + self.backings.capacity() * 2 + self.pinned.capacity() * 2)
+                * std::mem::size_of::<(usize, (Box<dyn Allocation>, u64))>()
+                + self.pending.capacity() * std::mem::size_of::<Box<dyn Allocation>>()
+                + 128,
+        )?;
+        let mut compact = std::collections::HashMap::new();
+        compact.try_reserve(self.backings.len()).map_err(|_| Cancelled)?;
+        let mut stopped = false;
+        for (index, entry) in self.backings.drain().enumerate() {
+            compact.insert(entry.0, entry.1);
+            if index % 32 == 0 {
+                stopped |= poll(check, Stage::Cleanup, index).is_err();
+            }
+        }
+        self.backings = compact;
+        self.pinned_scope = true;
+        // Never stop a move halfway and drop charges for still-live owners.
+        if stopped {
+            Err(Cancelled)
+        } else {
+            poll(check, Stage::Cleanup, 0)
+        }
+    }
+
+    /// No owner is freed or refunded here. Normal final censuses (or ordered
+    /// error cleanup) again account both registries after the scope ends.
+    pub fn end_pinned_scope(&mut self) {
+        self.pinned_scope = false;
     }
 
     /// Release only allocations absent from that authoritative root set. A stop
@@ -212,15 +300,21 @@ impl Allocations {
             }
             stopped |= poll(check, Stage::Cleanup, self.pending.len()).is_err();
         }
-        self.backings.retain(|_, (_, epoch)| {
+        let mut retain = |_: &usize, (_, epoch): &mut (Box<dyn Allocation>, u64)| {
             count += 1;
             if count % 32 == 0 {
                 stopped |= poll(check, Stage::Cleanup, count).is_err();
             }
             *epoch == self.epoch
-        });
+        };
+        self.backings.retain(&mut retain);
+        if !self.pinned_scope {
+            self.pinned.retain(&mut retain);
+        }
         self.metadata.resize(
-            self.backings.capacity() * 2 * std::mem::size_of::<(usize, (Box<dyn Allocation>, u64))>()
+            (self.backings.capacity() + self.pinned.capacity())
+                * 2
+                * std::mem::size_of::<(usize, (Box<dyn Allocation>, u64))>()
                 + self.pending.capacity() * std::mem::size_of::<Box<dyn Allocation>>()
                 + 128,
         )?;

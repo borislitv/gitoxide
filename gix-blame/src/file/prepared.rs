@@ -225,12 +225,11 @@ impl PreparedInput {
                         end -= 1;
                     }
                     extend(&mut self.input.before, &self.input.after[first..end], check)?;
-                    for &end in &self.offsets[first + 1..=end] {
-                        gix_diff::blob::control::try_push(
-                            &mut self.spare_offsets,
-                            position + (end - source_start),
-                            check,
-                        )?;
+                    let ends = &self.offsets[first + 1..=end];
+                    gix_diff::blob::control::try_reserve(&mut self.spare_offsets, ends.len(), check)?;
+                    for chunk in ends.chunks(1024) {
+                        self.spare_offsets
+                            .extend(chunk.iter().map(|&end| position + (end - source_start)));
                         poll(check, Stage::Copy, self.spare_offsets.len())?;
                     }
                     position += self.offsets[end] - source_start;
@@ -259,8 +258,11 @@ impl PreparedInput {
         }
         extend(&mut self.input.before, &self.input.after[suffix_line..], check)?;
         let suspect_suffix = self.offsets[suffix_line];
-        for &end in &self.offsets[suffix_line + 1..] {
-            gix_diff::blob::control::try_push(&mut self.spare_offsets, parent_suffix + (end - suspect_suffix), check)?;
+        let ends = &self.offsets[suffix_line + 1..];
+        gix_diff::blob::control::try_reserve(&mut self.spare_offsets, ends.len(), check)?;
+        for chunk in ends.chunks(1024) {
+            self.spare_offsets
+                .extend(chunk.iter().map(|&end| parent_suffix + (end - suspect_suffix)));
             poll(check, Stage::Copy, self.spare_offsets.len())?;
         }
         std::mem::swap(&mut self.offsets, &mut self.spare_offsets);
@@ -314,33 +316,57 @@ impl PreparedInput {
 }
 
 fn try_common_prefix(left: &[u8], right: &[u8], check: &mut Check<'_>) -> Result<usize, Cancelled> {
+    poll(check, Stage::Common, 0)?;
     let mut count = 0;
     for (left, right) in left.chunks(BYTE_CHUNK).zip(right.chunks(BYTE_CHUNK)) {
-        let matched = left.iter().zip(right).take_while(|(a, b)| a == b).count();
+        let blocks = left
+            .as_chunks::<256>()
+            .0
+            .iter()
+            .zip(right.as_chunks::<256>().0)
+            .take_while(|(a, b)| a == b)
+            .count();
+        let prefix = blocks * 256;
+        let matched = prefix
+            + left[prefix..]
+                .iter()
+                .zip(&right[prefix..])
+                .take_while(|(a, b)| a == b)
+                .count();
         count += matched;
         poll(check, Stage::Common, count)?;
         if matched != left.len().min(right.len()) {
             break;
         }
     }
+    poll(check, Stage::Common, count)?;
     Ok(count)
 }
 
 fn try_common_suffix(left: &[u8], right: &[u8], check: &mut Check<'_>) -> Result<usize, Cancelled> {
+    poll(check, Stage::Common, 0)?;
     let mut count = 0;
     for (left, right) in left.rchunks(BYTE_CHUNK).zip(right.rchunks(BYTE_CHUNK)) {
-        let matched = left
-            .iter()
-            .rev()
-            .zip(right.iter().rev())
+        let blocks = left
+            .rchunks_exact(256)
+            .zip(right.rchunks_exact(256))
             .take_while(|(a, b)| a == b)
             .count();
+        let prefix = blocks * 256;
+        let matched = prefix
+            + left[..left.len() - prefix]
+                .iter()
+                .rev()
+                .zip(right[..right.len() - prefix].iter().rev())
+                .take_while(|(a, b)| a == b)
+                .count();
         count += matched;
         poll(check, Stage::Common, count)?;
         if matched != left.len().min(right.len()) {
             break;
         }
     }
+    poll(check, Stage::Common, count)?;
     Ok(count)
 }
 

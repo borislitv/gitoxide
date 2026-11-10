@@ -216,6 +216,12 @@ fn file_admitted(
                 return Ok(());
             }
             Stage::RetainEnd => return allocations.end_retention(check),
+            Stage::RetainPinned { address } => return allocations.pin(address),
+            Stage::RetainScopeBegin => return allocations.begin_pinned_scope(check),
+            Stage::RetainScopeEnd => {
+                allocations.end_pinned_scope();
+                return Ok(());
+            }
             _ => {}
         }
         check(event)?;
@@ -367,41 +373,80 @@ fn build_native_trace(
     let mut forward = |e| (**shared.borrow_mut())(e);
     let check: &mut Check<'_> = &mut forward;
     let mut rows = VecOwner::new(Vec::new(), &shared);
-    poll(check, Stage::OriginTrace, 0)?;
-    for (index, entry) in outcome.entries.iter().enumerate() {
-        let path = entry
-            .source_file_name
-            .as_ref()
-            .map_or(file_path, |path| BStr::new(path.as_slice()));
-        let previous = native_previous(&objects, entry.commit_id, path, platform, rewrites, check)?;
-        let source_end = entry
-            .start_in_source_file
-            .checked_add(entry.len.get())
-            .ok_or_else(|| message("source range overflow").raise())?;
-        let final_end = entry
-            .start_in_blamed_file
-            .checked_add(entry.len.get())
-            .ok_or_else(|| message("final range overflow").raise())?;
-        let row = crate::native::NativeOrigin {
-            commit_id: entry.commit_id,
-            source_file_name: try_copy_bytes(path, check)?.into(),
-            previous,
-            boundary: false,
-            source_range: entry.start_in_source_file..source_end,
-            final_range: entry.start_in_blamed_file..final_end,
-            group_id: u32::try_from(index).map_err(|_| message("native group identity overflow").raise())?,
-            group_count: entry.len.get(),
-        };
-        gix_diff::blob::control::try_push(&mut rows, row, check).map_err(|e| e.raise())?;
-        poll(check, Stage::OriginTrace, rows.len())?;
-        // The previous-origin resolver's scratch has been destroyed. Preserve
-        // complete output and trace owners while refunding only dead scratch.
+    let result = (|| -> Result {
+        poll(check, Stage::OriginTrace, 0)?;
+        // First refund destroyed traversal scratch with an ordinary, complete
+        // census. Immutable outcome owners remain borrowed for this entire scope.
         poll(check, Stage::RetainBegin, 0)?;
         retain_outcome(outcome, check)?;
-        retain_native_trace(&rows, check)?;
         platform.retain_controlled_backings(check).map_err(|e| e.raise())?;
         poll(check, Stage::RetainEnd, 0)?;
-    }
+        retain_outcome(outcome, &mut |mut event| {
+            if let Stage::Retain { address } = event.stage {
+                event.stage = Stage::RetainPinned { address };
+            }
+            check(event)
+        })?;
+        poll(check, Stage::RetainScopeBegin, 0)?;
+        for (index, entry) in outcome.entries.iter().enumerate() {
+            let path = entry
+                .source_file_name
+                .as_ref()
+                .map_or(file_path, |path| BStr::new(path.as_slice()));
+            let previous = native_previous(&objects, entry.commit_id, path, platform, rewrites, check)?;
+            let source_end = entry
+                .start_in_source_file
+                .checked_add(entry.len.get())
+                .ok_or_else(|| message("source range overflow").raise())?;
+            let final_end = entry
+                .start_in_blamed_file
+                .checked_add(entry.len.get())
+                .ok_or_else(|| message("final range overflow").raise())?;
+            let row = crate::native::NativeOrigin {
+                commit_id: entry.commit_id,
+                source_file_name: try_copy_bytes(path, check)?.into(),
+                previous,
+                boundary: false,
+                source_range: entry.start_in_source_file..source_end,
+                final_range: entry.start_in_blamed_file..final_end,
+                group_id: u32::try_from(index).map_err(|_| message("native group identity overflow").raise())?,
+                group_count: entry.len.get(),
+            };
+            gix_diff::blob::control::try_push(&mut rows, row, check).map_err(|e| e.raise())?;
+            // Only the newly owned immutable paths need marking. Old rows stay
+            // owned even if their mutable outer Vec relocates; pin no scratch root.
+            let row = &rows[index];
+            poll(
+                check,
+                Stage::RetainPinned {
+                    address: row.source_file_name.as_ptr() as usize,
+                },
+                0,
+            )?;
+            if let Some(previous) = &row.previous {
+                poll(
+                    check,
+                    Stage::RetainPinned {
+                        address: previous.source_file_name.as_ptr() as usize,
+                    },
+                    0,
+                )?;
+            }
+            poll(check, Stage::OriginTrace, rows.len())?;
+            // The previous-origin resolver's scratch has been destroyed. Preserve
+            // immutable roots while refunding only dead scratch. The mutable rows
+            // Vec and platform are enumerated normally, never lifetime-exempted.
+            poll(check, Stage::RetainBegin, 0)?;
+            gix_diff::blob::control::retain_vec(&rows, check).map_err(|e| e.raise())?;
+            platform.retain_controlled_backings(check).map_err(|e| e.raise())?;
+            poll(check, Stage::RetainEnd, 0)?;
+        }
+        Ok(())
+    })();
+    // End protection on every success/error path before the caller's final
+    // complete census or ordered owner destruction. Ending never refunds roots.
+    let release = poll(check, Stage::RetainScopeEnd, 0);
+    result.and(release)?;
     Ok(rows.take())
 }
 

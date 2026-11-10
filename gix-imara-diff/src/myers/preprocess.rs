@@ -50,24 +50,27 @@ impl TokenCounts {
 }
 
 fn count_tokens(file: &[Token], check: &mut Check<'_>) -> Result<Vec<u32>, Cancelled> {
+    poll(check, Stage::Preprocess, 0)?;
     let mut occurrences = Vec::new();
     let mut buckets = 0;
-    for token in file {
-        buckets = buckets.max(token.0 as usize + 1);
-        poll(check, Stage::Preprocess, buckets)?;
+    for (index, chunk) in file.chunks(1024).enumerate() {
+        for token in chunk {
+            buckets = buckets.max(token.0 as usize + 1);
+        }
+        poll(check, Stage::Preprocess, index * 1024 + chunk.len())?;
     }
     crate::control::try_reserve(&mut occurrences, buckets, check)?;
-    for token in file {
-        let bucket = token.0 as usize;
-        if bucket >= occurrences.len() {
-            while bucket >= occurrences.len() {
-                occurrences.resize((bucket + 1).min(occurrences.len() + 1024), 0u32);
-                poll(check, Stage::Preprocess, occurrences.len())?;
-            }
-        }
-        occurrences[bucket] += 1;
-        poll(check, Stage::Preprocess, bucket)?;
+    while occurrences.len() < buckets {
+        occurrences.resize(buckets.min(occurrences.len() + 1024), 0u32);
+        poll(check, Stage::Preprocess, occurrences.len())?;
     }
+    for (index, chunk) in file.chunks(1024).enumerate() {
+        for token in chunk {
+            occurrences[token.0 as usize] += 1;
+        }
+        poll(check, Stage::Preprocess, index * 1024 + chunk.len())?;
+    }
+    poll(check, Stage::Preprocess, file.len())?;
     Ok(occurrences)
 }
 
@@ -98,12 +101,16 @@ fn token_occurrences(
     check: &mut Check<'_>,
 ) -> Result<Vec<Occurrences>, Cancelled> {
     let mut result = Vec::new();
+    poll(check, Stage::Preprocess, 0)?;
     crate::control::try_reserve(&mut result, file.len(), check)?;
-    for token in file {
-        let occurrences = other_counts.get(token.0 as usize).copied().unwrap_or(0);
-        poll(check, Stage::Preprocess, token.0 as usize)?;
-        result.push(Occurrences::from_occurrences(occurrences, eqlimit));
+    for (index, chunk) in file.chunks(1024).enumerate() {
+        for token in chunk {
+            let occurrences = other_counts.get(token.0 as usize).copied().unwrap_or(0);
+            result.push(Occurrences::from_occurrences(occurrences, eqlimit));
+        }
+        poll(check, Stage::Preprocess, index * 1024 + chunk.len())?;
     }
+    poll(check, Stage::Preprocess, file.len())?;
     Ok(result)
 }
 

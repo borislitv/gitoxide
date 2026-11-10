@@ -256,6 +256,23 @@ impl Diff {
         let (mut before, mut after) = (0, 0);
         let mut result = Vec::new();
         while before < self.removed.len() || after < self.added.len() {
+            // Skip aligned unchanged flags in bounded numeric chunks, rather
+            // than invoking two hunk-end scans and a check for every equal line.
+            for (left, right) in self.removed[before..]
+                .chunks(1024)
+                .zip(self.added[after..].chunks(1024))
+            {
+                let unchanged = left.iter().zip(right).take_while(|(a, b)| !**a && !**b).count();
+                before += unchanged;
+                after += unchanged;
+                control::poll(check, control::Stage::Output, before + after)?;
+                if unchanged < left.len().min(right.len()) {
+                    break;
+                }
+            }
+            if before == self.removed.len() && after == self.added.len() {
+                break;
+            }
             let end_before = util::try_find_hunk_end(&self.removed, before as u32, check)? as usize;
             let end_after = util::try_find_hunk_end(&self.added, after as u32, check)? as usize;
             if end_before != before || end_after != after {
@@ -272,6 +289,7 @@ impl Diff {
             after = (end_after + 1).min(self.added.len());
             control::poll(check, control::Stage::Output, before + after)?;
         }
+        control::poll(check, control::Stage::Output, before + after)?;
         Ok(result)
     }
 
@@ -296,11 +314,25 @@ impl Diff {
         check: &mut control::Check<'_>,
     ) -> Result<Self, control::Cancelled> {
         let mut indents = Vec::new();
+        control::poll(check, control::Stage::Postprocess, 0)?;
         control::try_reserve(&mut indents, interner.num_tokens() as usize, check)?;
+        let mut work = 0;
+        let mut items = 0;
         for id in 0..interner.num_tokens() {
-            indents.push(IndentLevel::try_for_ascii_line(interner[Token(id)].as_ref(), 8, check)?);
-            control::poll(check, control::Stage::Postprocess, id as usize + 1)?;
+            let line = interner[Token(id)].as_ref();
+            // Charge even empty tokens one unit. Long lines retain their own
+            // inner byte checks; short lines share at most 4 KiB of input work.
+            let cost = line.len().clamp(1, control::BYTE_CHUNK);
+            if work + cost > control::BYTE_CHUNK || items == 1024 {
+                control::poll(check, control::Stage::Postprocess, id as usize)?;
+                work = 0;
+                items = 0;
+            }
+            indents.push(IndentLevel::try_for_ascii_line(line, 8, check)?);
+            work += cost;
+            items += 1;
         }
+        control::poll(check, control::Stage::Postprocess, interner.num_tokens() as usize)?;
         self.try_postprocess_with(
             before,
             after,

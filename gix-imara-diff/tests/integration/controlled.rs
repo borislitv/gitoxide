@@ -12,6 +12,241 @@ use gix_imara_diff::{
 };
 
 #[test]
+fn large_distinct_token_diff_batches_numeric_work_without_losing_inner_stops() {
+    use gix_imara_diff::Token;
+    let before: Vec<_> = (0..20_000).map(Token).collect();
+    let mut after = before.clone();
+    after[10_000] = Token(20_000);
+    let mut checks = 0;
+    let diff = Diff::try_compute_with(Algorithm::Myers, &before, &after, 20_001, &mut |event| {
+        if event.stage == Stage::Preprocess {
+            checks += 1;
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert!(
+        checks < 512,
+        "one small edit must not require per-token clock checks: {checks}"
+    );
+    let mut output_progress = 0;
+    assert_eq!(
+        diff.try_hunks(&mut |event| {
+            if event.stage == Stage::Output {
+                assert!(
+                    event.processed.saturating_sub(output_progress) <= 2048,
+                    "unchanged output scan exceeded 1024 paired flags"
+                );
+                output_progress = event.processed;
+            }
+            Ok(())
+        })
+        .unwrap(),
+        [Hunk {
+            before: 10_000..10_001,
+            after: 10_000..10_001
+        }]
+    );
+    eprintln!("DISTINCT_20000 preprocess_checks={checks}");
+
+    let mut previous = 0;
+    Diff::try_compute_with(Algorithm::Myers, &before, &after, 20_001, &mut |event| {
+        if event.stage == Stage::Preprocess {
+            assert!(
+                event.processed.saturating_sub(previous) <= 1024,
+                "numeric preprocessing exceeded its work quantum"
+            );
+            previous = event.processed;
+        }
+        Ok(())
+    })
+    .unwrap();
+
+    let mut reached = false;
+    let stopped = Diff::try_compute_with(Algorithm::Myers, &before, &after, 20_001, &mut |event| {
+        if event.stage == Stage::Preprocess && event.processed == 1024 {
+            reached = true;
+            return Err(Cancelled);
+        }
+        Ok(())
+    });
+    assert!(reached && matches!(stopped, Err(Cancelled)));
+}
+
+#[test]
+fn indentation_batches_short_tokens_but_stops_within_the_byte_work_budget() {
+    use gix_imara_diff::{Interner, Token};
+    use std::cell::Cell;
+    struct Line<'a> {
+        bytes: Vec<u8>,
+        accessed: &'a Cell<usize>,
+    }
+    impl PartialEq for Line<'_> {
+        fn eq(&self, other: &Self) -> bool {
+            self.bytes == other.bytes
+        }
+    }
+    impl Eq for Line<'_> {}
+    impl std::hash::Hash for Line<'_> {
+        fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+            std::hash::Hash::hash(&self.bytes, state);
+        }
+    }
+    impl AsRef<[u8]> for Line<'_> {
+        fn as_ref(&self) -> &[u8] {
+            self.accessed.set(self.accessed.get() + self.bytes.len());
+            &self.bytes
+        }
+    }
+    let accessed = Cell::new(0);
+    let mut interner = Interner::new(0);
+    // The observed public byte views count real dictionary accesses, not private
+    // indentation calls or callback order. All tokens start with non-whitespace.
+    for id in 0..20_000 {
+        interner.intern(Line {
+            bytes: format!("row-{id:05}\n").into_bytes(),
+            accessed: &accessed,
+        });
+    }
+    let before: Vec<_> = (0..20_000).map(Token).collect();
+    let diff = Diff::try_compute_with(Algorithm::Myers, &before, &before, 20_000, &mut |_| Ok(())).unwrap();
+    let mut positive = false;
+    let result = diff.try_postprocess_lines_with(&before, &before, &interner, &mut |event| {
+        if event.stage == Stage::Postprocess {
+            let bytes = accessed.replace(0);
+            // One ten-byte view may have been obtained to size the next token
+            // before the pre-scan check; its indentation has not been scanned.
+            assert!(
+                bytes <= BYTE_CHUNK + 10,
+                "short-token views between checks exceeded their bounded lookahead: {bytes}"
+            );
+            if bytes > 0 {
+                positive = true;
+                return Err(Cancelled);
+            }
+        }
+        Ok(())
+    });
+    assert!(
+        positive && matches!(result, Err(Cancelled)),
+        "must stop inside actual dictionary work, not just at entry"
+    );
+
+    accessed.set(0);
+    let diff = Diff::try_compute_with(Algorithm::Myers, &before, &before, 20_000, &mut |_| Ok(())).unwrap();
+    let mut postprocess = 0;
+    let mut output = 0;
+    let mut check = |event: gix_imara_diff::control::Checkpoint| {
+        match event.stage {
+            Stage::Postprocess => postprocess += 1,
+            Stage::Output => output += 1,
+            _ => {}
+        }
+        Ok(())
+    };
+    let diff = diff
+        .try_postprocess_lines_with(&before, &before, &interner, &mut check)
+        .unwrap();
+    assert!(diff.try_hunks(&mut check).unwrap().is_empty());
+    assert!(
+        postprocess < 512 && output < 128,
+        "short-line dictionary/output work must be batched: {postprocess}/{output}"
+    );
+    eprintln!("DISTINCT_20000 postprocess_checks={postprocess} output_checks={output}");
+}
+
+#[test]
+fn immutable_scope_preserves_live_roots_refunds_scratch_and_ends_protection() {
+    use gix_imara_diff::control::{Allocation, Allocations, Allocator};
+    use std::sync::Mutex;
+    #[derive(Clone, Default)]
+    struct Budget(Arc<Mutex<Vec<usize>>>);
+    struct Lease {
+        budget: Budget,
+        id: usize,
+    }
+    impl Allocation for Lease {
+        fn resize(&mut self, bytes: usize) -> Result<(), Cancelled> {
+            self.budget.0.lock().unwrap()[self.id] = bytes;
+            Ok(())
+        }
+    }
+    impl Drop for Lease {
+        fn drop(&mut self) {
+            self.budget.0.lock().unwrap()[self.id] = 0;
+        }
+    }
+    impl Allocator for Budget {
+        fn reserve(&self, bytes: usize) -> Result<Box<dyn Allocation>, Cancelled> {
+            let mut live = self.0.lock().unwrap();
+            let id = live.len();
+            live.push(bytes);
+            Ok(Box::new(Lease {
+                budget: self.clone(),
+                id,
+            }))
+        }
+    }
+    fn buffer(arena: &mut Allocations, size: usize) -> Vec<u8> {
+        arena.admit(size).unwrap();
+        let data = vec![0; size];
+        arena.allocated(0, data.as_ptr() as usize, data.capacity()).unwrap();
+        data
+    }
+    let budget = Budget::default();
+    let mut arena = Allocations::new(Arc::new(budget.clone())).unwrap();
+    let mut roots = vec![buffer(&mut arena, 64)];
+    arena.begin_retention().unwrap();
+    arena.retain(roots[0].as_ptr() as usize);
+    arena.end_retention(&mut |_| Ok(())).unwrap();
+    arena.pin(roots[0].as_ptr() as usize).unwrap();
+    arena.begin_pinned_scope(&mut |_| Ok(())).unwrap();
+    let mut cleanup_checks = 0;
+    for count in 2..=129 {
+        let scratch = buffer(&mut arena, 96);
+        let root = buffer(&mut arena, 64);
+        arena.pin(root.as_ptr() as usize).unwrap();
+        roots.push(root);
+        drop(scratch);
+        arena.begin_retention().unwrap();
+        arena
+            .end_retention(&mut |_| {
+                cleanup_checks += 1;
+                Ok(())
+            })
+            .unwrap();
+        let live = budget.0.lock().unwrap().clone();
+        assert_eq!(
+            live.iter().filter(|&&n| n == 64).count(),
+            count,
+            "protected roots must stay charged"
+        );
+        assert!(!live.contains(&96), "dead per-row scratch must be refunded each census");
+    }
+    assert!(
+        cleanup_checks < 32,
+        "scratch censuses must not rescan the growing immutable registry: {cleanup_checks}"
+    );
+    arena.end_pinned_scope();
+    arena.begin_retention().unwrap();
+    for root in &roots {
+        arena.retain(root.as_ptr() as usize);
+    }
+    arena.end_retention(&mut |_| Ok(())).unwrap();
+    assert_eq!(budget.0.lock().unwrap().iter().filter(|&&n| n == 64).count(), 129);
+    drop(roots);
+    arena.begin_retention().unwrap();
+    let stopped = arena.end_retention(&mut |_| Err(Cancelled));
+    assert!(
+        !budget.0.lock().unwrap().contains(&64),
+        "ended scope must not leak freed roots even on stop"
+    );
+    assert_eq!(stopped, Err(Cancelled));
+    arena.clear_with_control(&mut |_| Err(Cancelled));
+    assert_eq!(budget.0.lock().unwrap().iter().sum::<usize>(), 0);
+}
+
+#[test]
 fn histogram_bounds_adversarial_recursive_search_without_partial_success() {
     use gix_imara_diff::{Token, control::MAX_SEARCH_DEPTH};
 

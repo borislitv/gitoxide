@@ -63,7 +63,7 @@ impl Repo {
         write!(body, "author Fixture <fixture@example.invalid> {time} -0000\ncommitter Fixture <fixture@example.invalid> {time} +0055\n\nSynthetic origin\n").unwrap();
         self.object("commit", body.as_bytes())
     }
-    fn assert_blame(&self, commit: ObjectId, path: &[u8]) -> Vec<Line> {
+    fn native_blame(&self, commit: ObjectId, path: &[u8]) -> Vec<Line> {
         self.git(&["update-ref", "refs/heads/main", &commit.to_string()], b"");
         let output = self.git_path(
             &[
@@ -80,7 +80,10 @@ impl Repo {
             Some(path),
             b"",
         );
-        let expected = parse(&output);
+        parse(&output)
+    }
+    fn assert_blame(&self, commit: ObjectId, path: &[u8]) -> Vec<Line> {
+        let expected = self.native_blame(commit, path);
         for tuning in [
             gix_blame::Tuning::default(),
             gix_blame::Tuning {
@@ -321,6 +324,115 @@ impl gix_blame::memo::MappingMemo for MemoryMemo {
             }
         }
         Ok(())
+    }
+}
+
+#[test]
+fn many_native_groups_have_linear_trace_root_work_and_stop_with_no_retained_charges() {
+    use gix_diff::blob::control::{Cancelled, Stage};
+    let repo = Repo::new();
+    let mut contents: Vec<_> = (0..258).map(|id| format!("line-{id:03}\n")).collect();
+    let root = repo.commit(&[(b"f", contents.concat().as_bytes(), "100644")], &[], 1);
+    let mut tip = root;
+    for id in 0..128 {
+        contents[id * 2 + 1] = format!("changed-{id:03}\n");
+        tip = repo.commit(&[(b"f", contents.concat().as_bytes(), "100644")], &[tip], id as u32 + 2);
+    }
+    let expected = repo.native_blame(tip, b"f");
+    for stop in [false, true] {
+        let job = Arc::new(Mutex::new((0, 0)));
+        let mut platform = super::Fixture::new().unwrap().resource_cache;
+        let odb = gix_odb::at(repo.0.path().join("objects"), super::fixture_hash_kind()).unwrap();
+        let mut tracing = false;
+        let mut output_checks = 0;
+        let mut stopped = false;
+        let result = gix_blame::file_with_allocations_and_trace(
+            odb,
+            gix_blame::Start::Commit(tip),
+            None,
+            &mut platform,
+            "f".into(),
+            gix_blame::Options {
+                diff_algorithm: gix_diff::blob::Algorithm::Myers,
+                rewrites: Some(gix_diff::Rewrites::default()),
+                ..Default::default()
+            },
+            gix_blame::Tuning {
+                reuse_line_tokens: true,
+                retain_current_input_tokens: true,
+                reuse_unchanged_runs: true,
+                bounded_resource_cache: true,
+                index_changes: true,
+            },
+            Arc::new(super::deep::Budget(job.clone(), 32 * 1024 * 1024)),
+            &mut |event| {
+                if stopped {
+                    return Err(Cancelled);
+                }
+                if event.stage == Stage::OriginTrace {
+                    tracing = true;
+                    if stop && event.processed == 64 {
+                        stopped = true;
+                        return Err(Cancelled);
+                    }
+                }
+                if tracing && event.stage == Stage::Output {
+                    output_checks += 1;
+                }
+                Ok(())
+            },
+        );
+        if stop {
+            assert!(
+                stopped && result.is_err(),
+                "must stop after real immutable rows are owned"
+            );
+        } else {
+            let owner = result.unwrap();
+            let rows = owner.native_trace().unwrap();
+            assert_eq!(
+                rows.len(),
+                257,
+                "every separated changed line and root interval is a native group"
+            );
+            let mut position = 0;
+            for (index, row) in rows.iter().enumerate() {
+                assert_eq!(row.group_id as usize, index);
+                assert_eq!(expected[position].group_count, Some(row.group_count));
+                for offset in 0..row.group_count {
+                    let native = &expected[position];
+                    assert_eq!(
+                        (
+                            row.commit_id,
+                            row.source_range.start + offset + 1,
+                            row.final_range.start + offset + 1
+                        ),
+                        (native.commit, native.source, native.final_line)
+                    );
+                    assert_eq!(row.source_file_name.as_slice(), native.filename);
+                    assert_eq!(
+                        row.previous
+                            .as_ref()
+                            .map(|p| (p.commit_id, p.source_file_name.as_slice())),
+                        native.previous.as_ref().map(|(id, path)| (*id, path.as_slice()))
+                    );
+                    assert_eq!(row.boundary, native.boundary);
+                    position += 1;
+                }
+            }
+            assert_eq!(position, expected.len());
+            assert!(
+                output_checks <= 32,
+                "growing trace roots must not be rescanned per row: {output_checks}"
+            );
+            eprintln!("NATIVE_257 trace_output_checks={output_checks}");
+            drop(owner);
+        }
+        assert_eq!(
+            job.lock().unwrap().0,
+            0,
+            "success/inner-stop must release protected owners and metadata"
+        );
     }
 }
 

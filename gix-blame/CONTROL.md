@@ -184,6 +184,39 @@ serializer. A caller retaining/materializing that additional output must supply
 its own capacity admission and ownership; the borrowed `AdmittedOutcome` does
 not automatically charge arbitrary downstream allocations.
 
+## Bounded maintenance work
+
+Fixed-width token-count/classification passes, numeric initialization, paired
+unchanged-output scans and prepared offset copies check after at most 1024
+items. Indentation setup checks after at most 1024 tokens or 4 KiB of weighted
+input work, whichever comes first; empty tokens cost one unit. Long tokens keep
+their independent inner 4 KiB byte checks. Hashing, collision equality, Myers
+search and the variable-cost pruning/slider checks are not globally throttled.
+Prepared common-prefix/suffix scans compare 256-byte blocks inside the existing
+4 KiB polling chunks, with explicit entry and completion checks.
+
+Native trace construction first performs a complete ordinary census, then
+explicitly pins only immutable outcome owners. Each completed row pins its own
+immutable path backings once. The mutable row vector, platform resources and
+resolver scratch retain ordinary per-row census semantics. Protected backing
+leases are held in a separate admitted registry, not repeatedly swept with
+scratch; mutable registry metadata is compacted once with old/new peak admission.
+Protection ends on success and error, without refunding anything by itself. The
+final complete census or ordered error cleanup accounts all owners normally.
+Trace-root enumeration is O(groups), rather than re-enumerating every output
+entry and accumulated row for each group; resolver work remains separate. The
+per-commit interner census and 1024-token optional-history bound are unchanged.
+
+The follow-up qualification passes 300 behavioral/provenance and five doc tests,
+all 24 optimized native/memo cases and 14 optimized controlled-diff cases, strict
+Clippy and formatting. Both physical 160000-commit liveness regressions pass.
+A 20000-token public-interface probe observes 172 preprocessing checks (110058
+with the old counting loop restored), 92 postprocessing checks and 22 output
+checks. A native-equal 257-group fixture observes 10 trace-output checks versus
+1171 when quadratic root enumeration is restored. Bounded-gap, live-root,
+scope-end/refund and memo-prefix/refill mutations fail their intended assertions.
+These work counts do not qualify application prepared/hosted latency thresholds.
+
 ## Bounds and provider contract
 
 - Byte hash/comparison/copy scans check at most every 4 KiB; ordinary numeric
