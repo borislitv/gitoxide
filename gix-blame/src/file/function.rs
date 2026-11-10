@@ -40,6 +40,7 @@ fn retain_entries(entries: &Vec<BlameEntry>, check: &mut Check<'_>) -> Result {
 pub struct AdmittedOutcome {
     outcome: Outcome,
     native_trace: Option<Vec<crate::native::NativeOrigin>>,
+    mapping_statistics: crate::memo::MappingStatistics,
     _allocations: gix_diff::blob::control::Allocations,
 }
 
@@ -51,6 +52,10 @@ impl AdmittedOutcome {
     /// Native origin groups, available only from the opt-in traced entrypoint.
     pub fn native_trace(&self) -> Option<&[crate::native::NativeOrigin]> {
         self.native_trace.as_deref()
+    }
+    /// Actual mapping work for the opt-in memo seam; zero for existing APIs.
+    pub fn mapping_statistics(&self) -> crate::memo::MappingStatistics {
+        self.mapping_statistics
     }
 
     /// Release output's nested ownership in checked batches before an executor
@@ -104,6 +109,7 @@ pub fn file_with_allocations(
         allocator,
         check,
         false,
+        None,
     )
 }
 
@@ -122,17 +128,7 @@ pub fn file_with_allocations_and_trace(
     allocator: std::sync::Arc<dyn gix_diff::blob::control::Allocator>,
     check: &mut Check<'_>,
 ) -> Result<AdmittedOutcome> {
-    let renames = options
-        .rewrites
-        .is_some_and(|r| r.copies.is_none() && r.percentage == Some(0.5) && r.limit == 1000 && !r.track_empty);
-    if !matches!(start, Start::Commit(_))
-        || !matches!(options.ranges, crate::BlameRanges::WholeFile)
-        || options.since.is_some()
-        || options.diff_algorithm != gix_diff::blob::Algorithm::Myers
-        || !renames
-    {
-        return Err(message("native origin trace requires the immutable whole-file Myers/root rename profile").into());
-    }
+    validate_native_profile(&start, &options)?;
     file_admitted(
         odb,
         start,
@@ -144,7 +140,55 @@ pub fn file_with_allocations_and_trace(
         allocator,
         check,
         true,
+        None,
     )
+}
+
+/// Traced native-profile blame with request-local completed mapping reuse.
+/// Memory-only memo callbacks and separate complete-edge batching must obey
+/// [`crate::memo`] ownership, producer identity and boundedness contracts.
+#[expect(clippy::too_many_arguments)]
+pub fn file_with_allocations_trace_and_memo(
+    odb: impl gix_object::Find + gix_object::FindHeader,
+    start: Start,
+    cache: Option<gix_commitgraph::Graph>,
+    resource_cache: &mut gix_diff::blob::Platform,
+    file_path: &BStr,
+    options: Options,
+    tuning: crate::Tuning,
+    allocator: std::sync::Arc<dyn gix_diff::blob::control::Allocator>,
+    check: &mut Check<'_>,
+    memo: crate::memo::MappingRequest<'_>,
+) -> Result<AdmittedOutcome> {
+    validate_native_profile(&start, &options)?;
+    file_admitted(
+        odb,
+        start,
+        cache,
+        resource_cache,
+        file_path,
+        options,
+        tuning,
+        allocator,
+        check,
+        true,
+        Some(memo),
+    )
+}
+
+fn validate_native_profile(start: &Start, options: &Options) -> Result {
+    let renames = options
+        .rewrites
+        .is_some_and(|r| r.copies.is_none() && r.percentage == Some(0.5) && r.limit == 1000 && !r.track_empty);
+    if !matches!(start, Start::Commit(_))
+        || !matches!(options.ranges, crate::BlameRanges::WholeFile)
+        || options.since.is_some()
+        || options.diff_algorithm != gix_diff::blob::Algorithm::Myers
+        || !renames
+    {
+        return Err(message("native origin trace requires the immutable whole-file Myers/root rename profile").into());
+    }
+    Ok(())
 }
 
 #[expect(clippy::too_many_arguments)]
@@ -159,6 +203,7 @@ fn file_admitted(
     allocator: std::sync::Arc<dyn gix_diff::blob::control::Allocator>,
     check: &mut Check<'_>,
     trace: bool,
+    memo: Option<crate::memo::MappingRequest<'_>>,
 ) -> Result<AdmittedOutcome> {
     let mut allocations = gix_diff::blob::control::Allocations::new(allocator).map_err(|e| e.raise())?;
     let trace_rewrites = options.rewrites;
@@ -179,7 +224,7 @@ fn file_admitted(
         }
         Ok(())
     };
-    let result = file_with_control(
+    let result = file_controlled(
         &odb,
         start,
         cache,
@@ -188,7 +233,10 @@ fn file_admitted(
         options,
         tuning,
         &mut controlled,
+        memo,
     );
+    let mapping_statistics = result.as_ref().map(|(_, stats)| *stats).unwrap_or_default();
+    let result = result.map(|(outcome, _)| outcome);
     let result = result.and_then(|mut outcome| {
         let native_trace = if trace {
             match build_native_trace(
@@ -240,6 +288,7 @@ fn file_admitted(
         Ok((outcome, native_trace)) => Ok(AdmittedOutcome {
             outcome,
             native_trace,
+            mapping_statistics,
             _allocations: allocations,
         }),
         Err(error) => {
@@ -499,6 +548,7 @@ pub fn file_with_tuning(
         tuning,
         &mut |_| Ok(()),
         false,
+        &mut None,
     )
 }
 
@@ -517,6 +567,32 @@ pub fn file_with_control(
     tuning: crate::Tuning,
     check: &mut Check<'_>,
 ) -> Result<Outcome> {
+    file_controlled(
+        odb,
+        start,
+        cache,
+        resource_cache,
+        file_path,
+        options,
+        tuning,
+        check,
+        None,
+    )
+    .map(|(outcome, _)| outcome)
+}
+
+#[expect(clippy::too_many_arguments)]
+fn file_controlled(
+    odb: impl gix_object::Find + gix_object::FindHeader,
+    start: Start,
+    cache: Option<gix_commitgraph::Graph>,
+    resource_cache: &mut gix_diff::blob::Platform,
+    file_path: &BStr,
+    options: Options,
+    tuning: crate::Tuning,
+    check: &mut Check<'_>,
+    memo: Option<crate::memo::MappingRequest<'_>>,
+) -> Result<(Outcome, crate::memo::MappingStatistics)> {
     resource_cache.validate_controlled_raw()?;
     if let Start::Contents { contents, .. } = &start
         && contents.len() > super::bounded::OBJECT_LIMIT
@@ -531,6 +607,7 @@ pub fn file_with_control(
         inner: odb,
         check: &shared,
     };
+    let mut memo = memo.map(|request| crate::memo::State::new(request, tuning));
     let result = file_impl(
         objects,
         start,
@@ -541,9 +618,14 @@ pub fn file_with_control(
         tuning,
         &mut |event| (**shared.borrow_mut())(event),
         true,
+        &mut memo,
     );
     resource_cache.clear_controlled_raw(&mut |event| (**shared.borrow_mut())(event));
-    result
+    let statistics = memo.as_ref().map(|state| state.statistics).unwrap_or_default();
+    // The wire slot is scratch, not an output owner. Drop it before any later
+    // provenance/final-output census can refund its charge.
+    drop(memo);
+    result.map(|outcome| (outcome, statistics))
 }
 
 #[expect(clippy::too_many_arguments)]
@@ -557,6 +639,7 @@ fn file_impl(
     tuning: crate::Tuning,
     check: &mut Check<'_>,
     raw: bool,
+    memo: &mut Option<crate::memo::State<'_>>,
 ) -> Result<Outcome> {
     let shared = std::cell::RefCell::new(check);
     let mut forwarding = |event| (**shared.borrow_mut())(event);
@@ -660,6 +743,9 @@ fn file_impl(
                 gix_diff::blob::control::retain_vec(buffer, check).map_err(|e| e.raise())?;
             }
             queue.retain_backing(check)?;
+            if let Some(state) = memo.as_ref() {
+                state.retain(check).map_err(|e| e.raise())?;
+            }
             if let Some((_, _, path)) = &previous_entry {
                 poll(
                     check,
@@ -1037,6 +1123,7 @@ fn file_impl(
                             &mut prepared,
                             check,
                             raw,
+                            memo,
                         )?;
                         *hunks_to_blame = attribute_changes(
                             hunks_to_blame.take(),
@@ -1087,6 +1174,7 @@ fn file_impl(
                             &mut prepared,
                             check,
                             raw,
+                            memo,
                         )?;
                         *hunks_to_blame = attribute_changes(
                             hunks_to_blame.take(),
@@ -1658,6 +1746,7 @@ fn blob_changes(
     prepared: &mut Option<PreparedInput>,
     check: &mut Check<'_>,
     raw: bool,
+    memo: &mut Option<crate::memo::State<'_>>,
 ) -> Result<Vec<Change>> {
     poll(check, Stage::Preprocess, 0)?;
     if raw {
@@ -1698,7 +1787,20 @@ fn blob_changes(
 
     if raw {
         let (old_data, new_data) = resource_cache.controlled_raw_buffers()?;
-        return match prepared {
+        let key = memo.as_ref().map(|state| state.key(previous_oid, oid, diff_algorithm));
+        if let (Some(state), Some(key)) = (memo.as_mut(), key.as_ref()) {
+            if let Some(changes) = state.load(key, old_data, new_data, check).map_err(|e| e.raise())? {
+                if let Some(prepared) = prepared.as_mut() {
+                    prepared.invalidate();
+                }
+                state
+                    .finish(key, old_data, new_data, &changes, true, check)
+                    .map_err(|e| e.raise())?;
+                return Ok(changes);
+            }
+            state.computed();
+        }
+        let changes = match prepared {
             Some(prepared) => {
                 let (input, limits) = prepared
                     .try_prepare(previous_oid, old_data, oid, new_data, check)
@@ -1706,7 +1808,13 @@ fn blob_changes(
                 try_changes_from_input(input, limits, diff_algorithm, stats, check)
             }
             None => try_blob_changes_from_data(old_data, new_data, diff_algorithm, stats, check),
-        };
+        }?;
+        if let (Some(state), Some(key)) = (memo.as_mut(), key.as_ref()) {
+            state
+                .finish(key, old_data, new_data, &changes, false, check)
+                .map_err(|e| e.raise())?;
+        }
+        return Ok(changes);
     }
     let outcome = resource_cache.prepare_diff()?;
 

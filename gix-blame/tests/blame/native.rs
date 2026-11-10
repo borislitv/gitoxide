@@ -169,10 +169,769 @@ impl Repo {
                 }
             }
             assert_eq!(position, expected.len());
+            // Completed-unit reuse must preserve the complete native-checked
+            // owner/trace on every existing fixture, including unrelated roots,
+            // convergent renames, octopus and crisscross graphs.
+            let mut memo = MemoryMemo::default();
+            let mut cold = gix_blame::memo::MappingStatistics::default();
+            for (run, reuse) in [false, true, true].into_iter().enumerate() {
+                let job = Arc::new(Mutex::new((0, 0)));
+                memo.observed_budget = Some(job.clone());
+                let replay = self
+                    .memo_blame(
+                        commit,
+                        path,
+                        tuning,
+                        &mut memo,
+                        gix_blame::memo::MappingOptions {
+                            reuse,
+                            producer: [1; 32],
+                            options: [2; 32],
+                        },
+                        job.clone(),
+                        &mut |_| Ok(()),
+                    )
+                    .unwrap();
+                assert_eq!(replay.outcome().blob, outcome.outcome().blob);
+                assert_eq!(replay.outcome().entries, outcome.outcome().entries);
+                assert_eq!(replay.native_trace(), outcome.native_trace());
+                let stats = replay.mapping_statistics();
+                assert_eq!(stats.computations, replay.outcome().statistics.blobs_diffed as u64);
+                if run == 0 {
+                    assert_eq!((memo.loads, memo.writes), (0, 0));
+                    assert_eq!(stats.hits, 0);
+                } else if run == 1 {
+                    assert_eq!(
+                        stats.completed + stats.hits,
+                        stats.edges_visited,
+                        "every small complete fixture mapping must be published or consumed"
+                    );
+                    cold = stats;
+                } else {
+                    assert_eq!(stats.edges_visited, cold.edges_visited);
+                    assert_eq!(stats.computations, 0, "warm mappings must skip actual diff computation");
+                    if cold.completed > 0 {
+                        assert!(stats.hits > 0, "warm execution must consume real completed mappings");
+                        assert!(stats.computations < cold.computations);
+                    }
+                }
+                drop(replay);
+                assert_eq!(job.lock().unwrap().0, 0);
+            }
             drop(outcome);
             assert_eq!(state.lock().unwrap().0, 0);
         }
         expected
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn memo_blame(
+        &self,
+        commit: ObjectId,
+        path: &[u8],
+        tuning: gix_blame::Tuning,
+        memo: &mut dyn gix_blame::memo::MappingMemo,
+        options: gix_blame::memo::MappingOptions,
+        job: Arc<Mutex<(usize, usize)>>,
+        check: &mut gix_diff::blob::control::Check<'_>,
+    ) -> gix_error::Result<gix_blame::AdmittedOutcome> {
+        let odb = gix_odb::at(self.0.path().join("objects"), super::fixture_hash_kind()).unwrap();
+        let mut platform = super::Fixture::new().unwrap().resource_cache;
+        gix_blame::file_with_allocations_trace_and_memo(
+            odb,
+            gix_blame::Start::Commit(commit),
+            None,
+            &mut platform,
+            path.into(),
+            gix_blame::Options {
+                diff_algorithm: gix_diff::blob::Algorithm::Myers,
+                rewrites: Some(gix_diff::Rewrites::default()),
+                ..Default::default()
+            },
+            tuning,
+            Arc::new(super::deep::Budget(job, 32 * 1024 * 1024)),
+            check,
+            gix_blame::memo::MappingRequest {
+                options,
+                memo,
+                boundary: None,
+            },
+        )
+    }
+}
+
+// Small faithful bounded in-memory fixture, separate from each job's admission.
+// Production root worksets additionally own their independent storage budget.
+#[derive(Default)]
+struct MemoryMemo {
+    entries: Vec<(gix_blame::memo::MappingKey, Vec<u8>)>,
+    loads: usize,
+    writes: usize,
+    force_first: bool,
+    loaded: Option<Arc<std::sync::atomic::AtomicBool>>,
+    observed_budget: Option<Arc<Mutex<(usize, usize)>>>,
+}
+impl gix_blame::memo::MappingMemo for MemoryMemo {
+    fn load(
+        &mut self,
+        key: &gix_blame::memo::MappingKey,
+        into: &mut [u8],
+    ) -> Result<Option<usize>, gix_diff::blob::control::Cancelled> {
+        self.loads += 1;
+        if let Some(job) = &self.observed_budget {
+            assert!(
+                job.lock().unwrap().0 >= gix_blame::memo::UNIT_BYTES,
+                "the reusable wire backing must remain charged across iteration censuses"
+            );
+        }
+        let entry = if self.force_first {
+            self.entries.first()
+        } else {
+            self.entries.iter().find(|(candidate, _)| candidate == key)
+        };
+        let Some((_, bytes)) = entry else {
+            return Ok(None);
+        };
+        assert!(bytes.len() <= into.len());
+        into[..bytes.len()].copy_from_slice(bytes);
+        if let Some(loaded) = &self.loaded {
+            loaded.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(Some(bytes.len()))
+    }
+    fn completed(
+        &mut self,
+        key: &gix_blame::memo::MappingKey,
+        bytes: &[u8],
+    ) -> Result<(), gix_diff::blob::control::Cancelled> {
+        self.writes += 1;
+        if self.entries.len() < 32
+            && self.entries.iter().map(|(_, bytes)| bytes.len()).sum::<usize>() + bytes.len() <= 256 * 1024
+        {
+            if let Some(entry) = self.entries.iter_mut().find(|(candidate, _)| candidate == key) {
+                entry.1 = bytes.to_vec();
+            } else {
+                self.entries.push((key.clone(), bytes.to_vec()));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn mapping_memo_rejects_corrupt_stale_and_wrong_partition_units_without_changing_origins() {
+    let repo = Repo::new();
+    let root = repo.commit(&[(b"f", b"anchor\nold\n", "100644")], &[], 5);
+    let tip = repo.commit(&[(b"f", b"anchor\nnew\n", "100644")], &[root], 10);
+    let options = gix_blame::memo::MappingOptions {
+        reuse: true,
+        producer: [1; 32],
+        options: [2; 32],
+    };
+    let mut seed = MemoryMemo::default();
+    let job = Arc::new(Mutex::new((0, 0)));
+    let baseline = repo
+        .memo_blame(
+            tip,
+            b"f",
+            Default::default(),
+            &mut seed,
+            options,
+            job.clone(),
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+    assert_eq!(baseline.mapping_statistics().computations, 1);
+    assert_eq!(
+        seed.entries.len(),
+        1,
+        "publish an actual completed mapping, not a fabricated vector"
+    );
+    let original = seed.entries[0].clone();
+    for case in 0..9 {
+        let mut memo = MemoryMemo {
+            force_first: true,
+            ..Default::default()
+        };
+        memo.entries.push(original.clone());
+        let mut requested = options;
+        let mut tuning = gix_blame::Tuning::default();
+        match case {
+            0 => {
+                *memo.entries[0].1.last_mut().unwrap() ^= 1;
+            }
+            1 => {
+                requested.producer = [9; 32];
+            }
+            2 => {
+                requested.options = [9; 32];
+            }
+            3 => {
+                memo.entries[0].1[8] = 2;
+            } // unsupported wire version
+            4 => {
+                memo.entries[0].1.push(0);
+            } // trailing garbage
+            5 => {
+                // SHA-1 key header is 120 bytes, then three u32 counts.
+                // The first old byte-line offset must be zero, even with a
+                // correctly recomputed checksum on the malformed stored unit.
+                memo.entries[0].1[132] = 1;
+                repair_mapping_checksum(&mut memo.entries[0].1);
+            }
+            6 => {
+                // Two complete 2-line partitions use 48 bytes. First record's
+                // new start at byte 181 must be zero: a gap is not a mapping.
+                memo.entries[0].1[181] = 1;
+                repair_mapping_checksum(&mut memo.entries[0].1);
+            }
+            7 => {
+                memo.entries[0].1.truncate(12);
+            }
+            8 => {
+                tuning.index_changes = true;
+            }
+            _ => unreachable!(),
+        }
+        let state = Arc::new(Mutex::new((0, 0)));
+        let actual = repo
+            .memo_blame(tip, b"f", tuning, &mut memo, requested, state.clone(), &mut |_| Ok(()))
+            .unwrap();
+        assert_eq!(actual.outcome().blob, baseline.outcome().blob, "case {case}");
+        assert_eq!(actual.outcome().entries, baseline.outcome().entries, "case {case}");
+        assert_eq!(actual.native_trace(), baseline.native_trace(), "case {case}");
+        assert_eq!(actual.mapping_statistics().rejected, 1, "case {case}");
+        assert_eq!(actual.mapping_statistics().computations, 1, "case {case}");
+        drop(actual);
+        assert_eq!(state.lock().unwrap().0, 0);
+    }
+    // A cache may return a unit for the opposite ordered blob pair. Validation
+    // must reject it and still replay the original DAG, not reverse its ranges.
+    let reverse = repo.commit(&[(b"f", b"anchor\nold\n", "100644")], &[tip], 15);
+    let mut memo = MemoryMemo {
+        force_first: true,
+        ..Default::default()
+    };
+    memo.entries.push(original);
+    let state = Arc::new(Mutex::new((0, 0)));
+    let actual = repo
+        .memo_blame(
+            reverse,
+            b"f",
+            Default::default(),
+            &mut memo,
+            options,
+            state.clone(),
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+    assert!(actual.mapping_statistics().rejected > 0);
+    assert!(actual.mapping_statistics().computations > 0);
+    assert_eq!(actual.outcome().blob, b"anchor\nold\n");
+    drop(actual);
+    assert_eq!(state.lock().unwrap().0, 0);
+    drop(baseline);
+    assert_eq!(job.lock().unwrap().0, 0);
+    repo.assert_blame(reverse, b"f");
+}
+
+fn repair_mapping_checksum(wire: &mut [u8]) {
+    let end = wire.len() - 20;
+    let mut hash = gix_hash::hasher(super::fixture_hash_kind());
+    hash.update(&wire[..end]);
+    wire[end..].copy_from_slice(hash.try_finalize().unwrap().as_bytes());
+}
+
+#[test]
+fn genuine_warm_myers_ties_match_native_but_self_checksums_do_not_authenticate_a_producer() {
+    let repo = Repo::new();
+    let root = repo.commit(&[(b"f", b"a\n", "100644")], &[], 5);
+    let duplicate = repo.commit(&[(b"f", b"a\na\n", "100644")], &[root], 10);
+    let tip = repo.commit(&[(b"f", b"a\n", "100644")], &[duplicate], 15);
+    // The two byte-identical input lines have different historical owners.
+    // The ordinary off/cold/warm helper compares the complete native trace.
+    let input = repo.assert_blame(duplicate, b"f");
+    assert_eq!(input.len(), 2);
+    assert_ne!(input[0].commit, input[1].commit);
+    assert!(input.iter().any(|line| line.commit == root));
+    assert!(input.iter().any(|line| line.commit == duplicate));
+    let native = repo.assert_blame(tip, b"f");
+    assert_eq!(native.len(), 1);
+    let selected_old = input.iter().position(|line| line.commit == native[0].commit).unwrap();
+    let alternate_old = 1 - selected_old;
+
+    let options = gix_blame::memo::MappingOptions {
+        reuse: true,
+        producer: [1; 32],
+        options: [2; 32],
+    };
+    let mut memo = MemoryMemo::default();
+    let cold_job = Arc::new(Mutex::new((0, 0)));
+    let canonical = repo
+        .memo_blame(
+            tip,
+            b"f",
+            Default::default(),
+            &mut memo,
+            options,
+            cold_job.clone(),
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+    let warm_job = Arc::new(Mutex::new((0, 0)));
+    let warm = repo
+        .memo_blame(
+            tip,
+            b"f",
+            Default::default(),
+            &mut memo,
+            options,
+            warm_job.clone(),
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+    assert!(warm.mapping_statistics().hits > 0);
+    assert_eq!(warm.mapping_statistics().computations, 0);
+    assert_eq!(warm.outcome().entries, canonical.outcome().entries);
+    assert_eq!(warm.native_trace(), canonical.native_trace());
+    drop(warm);
+    assert_eq!(warm_job.lock().unwrap().0, 0);
+
+    let before = repo.object("blob", b"a\na\n");
+    let after = repo.object("blob", b"a\n");
+    let unit = memo
+        .entries
+        .iter_mut()
+        .find(|(key, _)| key.before == before && key.after == after)
+        .unwrap();
+    // Independently specified v1 SHA-1 layout: key=120 bytes, counts=12,
+    // complete (2+1) and (1+1) offset arrays=40, then two 13-byte records.
+    assert_eq!(&unit.1[120..132], &[2, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0]);
+    assert_eq!(unit.1.len(), 218);
+    // Keep the opposite old a from the independently observed native choice.
+    // All offsets, unchanged bytes,
+    // coverage and checksum are valid, but this is NOT the producer's native
+    // Myers choice. Deliberately violate MappingMemo's authenticated-record
+    // precondition to demonstrate its documented trust boundary, not to claim
+    // that a self-checksum prevents malicious producer impersonation.
+    let records = if alternate_old == 1 {
+        // Deleted(new 0, old 1), Unchanged(new 0..1).
+        [
+            2, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0,
+        ]
+    } else {
+        // Unchanged(new 0..1), Deleted(new 1, old 1).
+        [
+            0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0,
+        ]
+    };
+    unit.1[172..198].copy_from_slice(&records);
+    repair_mapping_checksum(&mut unit.1);
+    let unauthenticated = unit.clone();
+    let bad_job = Arc::new(Mutex::new((0, 0)));
+    let alternate = repo
+        .memo_blame(
+            tip,
+            b"f",
+            Default::default(),
+            &mut memo,
+            options,
+            bad_job.clone(),
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+    assert_eq!(
+        alternate.mapping_statistics().rejected,
+        0,
+        "structural checks are not authentication"
+    );
+    assert!(alternate.mapping_statistics().hits > 0);
+    assert_eq!(alternate.outcome().entries[0].commit_id, input[alternate_old].commit);
+    assert_ne!(alternate.outcome().entries[0].commit_id, native[0].commit);
+    assert_ne!(alternate.native_trace(), canonical.native_trace());
+    drop(alternate);
+    assert_eq!(bad_job.lock().unwrap().0, 0);
+
+    // A genuinely different expected producer identity rejects that same
+    // alternate payload and recomputes the canonical Rust/native choice.
+    let mut stale = MemoryMemo {
+        force_first: true,
+        ..Default::default()
+    };
+    stale.entries.push(unauthenticated);
+    let fresh_job = Arc::new(Mutex::new((0, 0)));
+    let fresh = repo
+        .memo_blame(
+            tip,
+            b"f",
+            Default::default(),
+            &mut stale,
+            gix_blame::memo::MappingOptions {
+                producer: [9; 32],
+                ..options
+            },
+            fresh_job.clone(),
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+    assert!(fresh.mapping_statistics().rejected > 0);
+    assert!(fresh.mapping_statistics().computations > 0);
+    assert_eq!(fresh.outcome().entries, canonical.outcome().entries);
+    assert_eq!(fresh.native_trace(), canonical.native_trace());
+    drop(fresh);
+    assert_eq!(fresh_job.lock().unwrap().0, 0);
+    drop(canonical);
+    assert_eq!(cold_job.lock().unwrap().0, 0);
+}
+
+#[test]
+fn memo_slot_admission_denial_stops_before_callbacks_and_refunds_scratch() {
+    use gix_blame::memo::{MappingBoundary, MappingStatistics};
+    use gix_diff::blob::control::{Allocation, Allocator, Cancelled};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    struct ObservedBudget {
+        inner: super::deep::Budget,
+        attempted_slot: Arc<AtomicBool>,
+    }
+    impl Allocator for ObservedBudget {
+        fn reserve(&self, bytes: usize) -> Result<Box<dyn Allocation>, Cancelled> {
+            if bytes == gix_blame::memo::UNIT_BYTES {
+                self.attempted_slot.store(true, Ordering::Relaxed);
+            }
+            self.inner.reserve(bytes)
+        }
+    }
+    struct Unreached;
+    impl MappingBoundary for Unreached {
+        fn completed(&mut self, _: MappingStatistics) -> Result<(), Cancelled> {
+            panic!("a denied wire slot cannot produce a complete mapping boundary")
+        }
+    }
+    let repo = Repo::new();
+    let root = repo.commit(&[(b"f", b"old\n", "100644")], &[], 5);
+    let tip = repo.commit(&[(b"f", b"new\n", "100644")], &[root], 10);
+    let odb = gix_odb::at(repo.0.path().join("objects"), super::fixture_hash_kind()).unwrap();
+    let mut platform = super::Fixture::new().unwrap().resource_cache;
+    let job = Arc::new(Mutex::new((0, 0)));
+    let attempted_slot = Arc::new(AtomicBool::new(false));
+    let mut memo = MemoryMemo::default();
+    let result = gix_blame::file_with_allocations_trace_and_memo(
+        odb,
+        gix_blame::Start::Commit(tip),
+        None,
+        &mut platform,
+        "f".into(),
+        gix_blame::Options {
+            diff_algorithm: gix_diff::blob::Algorithm::Myers,
+            rewrites: Some(gix_diff::Rewrites::default()),
+            ..Default::default()
+        },
+        Default::default(),
+        Arc::new(ObservedBudget {
+            inner: super::deep::Budget(job.clone(), 1024 * 1024),
+            attempted_slot: attempted_slot.clone(),
+        }),
+        &mut |_| Ok(()),
+        gix_blame::memo::MappingRequest {
+            options: gix_blame::memo::MappingOptions {
+                reuse: true,
+                producer: [1; 32],
+                options: [2; 32],
+            },
+            memo: &mut memo,
+            boundary: Some(&mut Unreached),
+        },
+    );
+    assert!(result.is_err());
+    assert!(
+        attempted_slot.load(Ordering::Relaxed),
+        "the actual 4 MiB wire admission must be attempted"
+    );
+    assert_eq!((memo.loads, memo.writes), (0, 0));
+    assert_eq!(job.lock().unwrap().0, 0);
+}
+
+#[test]
+fn oversized_complete_partitions_skip_storage_but_still_reach_the_complete_edge_boundary() {
+    use gix_blame::memo::{MappingBoundary, MappingStatistics, UNIT_BYTES};
+    use gix_diff::blob::control::Cancelled;
+    const SHARED_LINES: usize = 262_144;
+    // Both complete u64 offset arrays alone exceed the 4 MiB unit cap; the
+    // actual blobs and maintained two-record mapping remain small and valid.
+    const { assert!((2 * (SHARED_LINES + 2) * 8) > UNIT_BYTES) };
+    struct Boundary(usize);
+    impl MappingBoundary for Boundary {
+        fn completed(&mut self, statistics: MappingStatistics) -> Result<(), Cancelled> {
+            assert_eq!(statistics.edges_visited, 1);
+            assert_eq!(statistics.computations, 1);
+            assert_eq!(statistics.completed, 0);
+            self.0 += 1;
+            Ok(())
+        }
+    }
+    let repo = Repo::new();
+    let mut old = b"old\n".to_vec();
+    let mut new = b"new\n".to_vec();
+    for _ in 0..SHARED_LINES {
+        old.extend_from_slice(b"a\n");
+        new.extend_from_slice(b"a\n");
+    }
+    let root = repo.commit(&[(b"f", &old, "100644")], &[], 5);
+    let tip = repo.commit(&[(b"f", &new, "100644")], &[root], 10);
+    let odb = gix_odb::at(repo.0.path().join("objects"), super::fixture_hash_kind()).unwrap();
+    let mut platform = super::Fixture::new().unwrap().resource_cache;
+    let job = Arc::new(Mutex::new((0, 0)));
+    let mut memo = MemoryMemo::default();
+    let mut boundary = Boundary(0);
+    let owner = gix_blame::file_with_allocations_trace_and_memo(
+        odb,
+        gix_blame::Start::Commit(tip),
+        None,
+        &mut platform,
+        "f".into(),
+        gix_blame::Options {
+            diff_algorithm: gix_diff::blob::Algorithm::Myers,
+            rewrites: Some(gix_diff::Rewrites::default()),
+            ..Default::default()
+        },
+        Default::default(),
+        Arc::new(super::deep::Budget(job.clone(), 32 * 1024 * 1024)),
+        &mut |_| Ok(()),
+        gix_blame::memo::MappingRequest {
+            options: gix_blame::memo::MappingOptions {
+                reuse: true,
+                producer: [1; 32],
+                options: [2; 32],
+            },
+            memo: &mut memo,
+            boundary: Some(&mut boundary),
+        },
+    )
+    .unwrap();
+    assert_eq!(boundary.0, 1);
+    assert_eq!((memo.loads, memo.writes), (1, 0));
+    assert_eq!(owner.outcome().blob, new);
+    assert_eq!(owner.outcome().entries.len(), 2);
+    assert_eq!(owner.outcome().entries[0].commit_id, tip);
+    assert_eq!(owner.outcome().entries[0].len.get(), 1);
+    assert_eq!(owner.outcome().entries[1].commit_id, root);
+    assert_eq!(owner.outcome().entries[1].len.get() as usize, SHARED_LINES);
+    assert_eq!(owner.native_trace().unwrap().len(), 2);
+    drop(owner);
+    assert_eq!(job.lock().unwrap().0, 0);
+}
+
+#[test]
+fn stopping_inside_a_loaded_mapping_returns_no_owner_and_refunds_scratch() {
+    use gix_diff::blob::control::{Cancelled, Stage};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let repo = Repo::new();
+    let root = repo.commit(&[(b"f", b"anchor\nold\n", "100644")], &[], 5);
+    let tip = repo.commit(&[(b"f", b"anchor\nnew\n", "100644")], &[root], 10);
+    let options = gix_blame::memo::MappingOptions {
+        reuse: true,
+        producer: [1; 32],
+        options: [2; 32],
+    };
+    let mut memo = MemoryMemo::default();
+    let seed = Arc::new(Mutex::new((0, 0)));
+    drop(
+        repo.memo_blame(
+            tip,
+            b"f",
+            Default::default(),
+            &mut memo,
+            options,
+            seed.clone(),
+            &mut |_| Ok(()),
+        )
+        .unwrap(),
+    );
+    assert_eq!(seed.lock().unwrap().0, 0);
+    // This small real unit's first digest scan is one bounded chunk. Gate on
+    // its payload size so unrelated later blob preprocessing cannot satisfy
+    // the stop assertion if memo validation loses its inner checks.
+    let validation_bytes = memo.entries[0].1.len() - memo.entries[0].0.before.as_bytes().len();
+    assert!(validation_bytes > 0 && validation_bytes <= gix_diff::blob::control::BYTE_CHUNK);
+    let loaded = Arc::new(AtomicBool::new(false));
+    memo.loaded = Some(loaded.clone());
+    let state = Arc::new(Mutex::new((0, 0)));
+    let mut stopped = false;
+    let result = repo.memo_blame(
+        tip,
+        b"f",
+        Default::default(),
+        &mut memo,
+        options,
+        state.clone(),
+        &mut |event| {
+            if loaded.load(Ordering::Relaxed) && event.stage == Stage::Preprocess && event.processed == validation_bytes
+            {
+                stopped = true;
+            }
+            if stopped { Err(Cancelled) } else { Ok(()) }
+        },
+    );
+    assert!(
+        loaded.load(Ordering::Relaxed),
+        "the regression must read a real warm unit"
+    );
+    assert!(stopped);
+    assert!(result.is_err());
+    assert_eq!(state.lock().unwrap().0, 0);
+}
+
+#[test]
+fn memo_callback_stop_is_not_an_optional_miss() {
+    use gix_blame::memo::{MappingKey, MappingMemo};
+    use gix_diff::blob::control::Cancelled;
+    struct Stopped;
+    impl MappingMemo for Stopped {
+        fn load(&mut self, _: &MappingKey, _: &mut [u8]) -> Result<Option<usize>, Cancelled> {
+            Err(Cancelled)
+        }
+        fn completed(&mut self, _: &MappingKey, _: &[u8]) -> Result<(), Cancelled> {
+            panic!("a stopped lookup cannot publish")
+        }
+    }
+    let repo = Repo::new();
+    let root = repo.commit(&[(b"f", b"old\n", "100644")], &[], 5);
+    let tip = repo.commit(&[(b"f", b"new\n", "100644")], &[root], 10);
+    let job = Arc::new(Mutex::new((0, 0)));
+    let result = repo.memo_blame(
+        tip,
+        b"f",
+        Default::default(),
+        &mut Stopped,
+        gix_blame::memo::MappingOptions {
+            reuse: true,
+            producer: [1; 32],
+            options: [2; 32],
+        },
+        job.clone(),
+        &mut |_| Ok(()),
+    );
+    assert!(result.is_err());
+    assert_eq!(job.lock().unwrap().0, 0);
+}
+
+#[test]
+fn mapping_batch_boundary_observes_only_a_complete_edge_and_cleans_up_on_stop() {
+    use gix_blame::memo::{MappingBoundary, MappingStatistics};
+    use gix_diff::blob::control::Cancelled;
+    struct Boundary {
+        calls: usize,
+        stop: bool,
+    }
+    impl MappingBoundary for Boundary {
+        fn completed(&mut self, statistics: MappingStatistics) -> Result<(), Cancelled> {
+            assert_eq!(statistics.edges_visited, 1);
+            assert_eq!(statistics.computations, 1);
+            assert_eq!(statistics.completed, 1);
+            self.calls += 1;
+            if self.stop { Err(Cancelled) } else { Ok(()) }
+        }
+    }
+    let repo = Repo::new();
+    let root = repo.commit(&[(b"f", b"anchor\nold\n", "100644")], &[], 5);
+    let tip = repo.commit(&[(b"f", b"anchor\nnew\n", "100644")], &[root], 10);
+    for stop in [false, true] {
+        let odb = gix_odb::at(repo.0.path().join("objects"), super::fixture_hash_kind()).unwrap();
+        let mut platform = super::Fixture::new().unwrap().resource_cache;
+        let job = Arc::new(Mutex::new((0, 0)));
+        let mut memo = MemoryMemo::default();
+        let mut boundary = Boundary { calls: 0, stop };
+        let result = gix_blame::file_with_allocations_trace_and_memo(
+            odb,
+            gix_blame::Start::Commit(tip),
+            None,
+            &mut platform,
+            "f".into(),
+            gix_blame::Options {
+                diff_algorithm: gix_diff::blob::Algorithm::Myers,
+                rewrites: Some(gix_diff::Rewrites::default()),
+                ..Default::default()
+            },
+            Default::default(),
+            Arc::new(super::deep::Budget(job.clone(), 32 * 1024 * 1024)),
+            &mut |_| Ok(()),
+            gix_blame::memo::MappingRequest {
+                options: gix_blame::memo::MappingOptions {
+                    reuse: true,
+                    producer: [1; 32],
+                    options: [2; 32],
+                },
+                memo: &mut memo,
+                boundary: Some(&mut boundary),
+            },
+        );
+        assert_eq!(boundary.calls, 1);
+        assert_eq!(memo.writes, 1);
+        assert_eq!(result.is_err(), stop);
+        if let Ok(owner) = result {
+            assert_eq!(owner.outcome().blob, b"anchor\nnew\n");
+            assert_eq!(owner.native_trace().unwrap().len(), 2);
+            drop(owner);
+        }
+        assert_eq!(job.lock().unwrap().0, 0);
+    }
+}
+
+#[test]
+fn memo_replay_keeps_eight_unrelated_roots_with_reversed_times_and_a_merge_owned_line() {
+    let repo = Repo::new();
+    let mut parents = Vec::new();
+    let mut content = b"merge-owned\n".to_vec();
+    for index in 0..8 {
+        let line = format!("branch-{index}\n");
+        parents.push(repo.commit(&[(b"f", line.as_bytes(), "100644")], &[], 30 - index));
+        content.extend_from_slice(line.as_bytes());
+    }
+    let tip = repo.commit(&[(b"f", &content, "100644")], &parents, 1);
+    // assert_blame runs hook-free, opted reuse-off, cold and warm reuse for both
+    // tuning profiles, comparing every complete native origin/group/path field.
+    let native = repo.assert_blame(tip, b"f");
+    assert_eq!(native.len(), 9);
+    assert_eq!(native[0].commit, tip);
+    for (index, parent) in parents.iter().enumerate() {
+        assert_eq!(native[index + 1].commit, *parent);
+        assert_eq!(native[index + 1].source, 1);
+        assert_eq!(native[index + 1].final_line, index as u32 + 2);
+    }
+    let mut memo = MemoryMemo::default();
+    for (run, reuse) in [false, true, true].into_iter().enumerate() {
+        let job = Arc::new(Mutex::new((0, 0)));
+        let owner = repo
+            .memo_blame(
+                tip,
+                b"f",
+                Default::default(),
+                &mut memo,
+                gix_blame::memo::MappingOptions {
+                    reuse,
+                    producer: [1; 32],
+                    options: [2; 32],
+                },
+                job.clone(),
+                &mut |_| Ok(()),
+            )
+            .unwrap();
+        assert_eq!(
+            owner.mapping_statistics(),
+            gix_blame::memo::MappingStatistics {
+                edges_visited: 8,
+                hits: if run == 2 { 8 } else { 0 },
+                computations: if run == 2 { 0 } else { 8 },
+                rejected: 0,
+                completed: if run == 1 { 8 } else { 0 },
+            }
+        );
+        assert_eq!(owner.outcome().blob, content);
+        if run == 0 {
+            assert_eq!((memo.loads, memo.writes), (0, 0));
+        }
+        drop(owner);
+        assert_eq!(job.lock().unwrap().0, 0);
     }
 }
 

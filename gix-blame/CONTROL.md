@@ -1,5 +1,75 @@
 # Request-local controls
 
+## Opt-in completed mappings
+
+`file_with_allocations_trace_and_memo` adds a final `memo::MappingRequest`
+argument to the admitted traced entrypoint. Existing entrypoints do not create
+hooks or allocate a memo slot. The same validated raw whole-file native profile
+is required; general-DAG attribution, origin discovery and trace construction
+remain unchanged.
+
+`MappingRequest` contains explicit `MappingOptions { reuse, producer, options }`,
+an in-memory `MappingMemo`, and an optional separate `MappingBoundary`. The two
+identities are caller-verified 32-byte producer/canonical-options identities.
+Each `MappingKey` additionally binds ordered physical old/new blob IDs, algorithm
+and all five immutable tuning flags. The caller still owns source authorization,
+physical-presence/OID verification and the enclosing authority/cache namespace.
+
+`MappingMemo::{load, completed}` may only read/copy or append to a bounded in-memory
+workset whose copies are admitted against the same job budget. They must not do SQL, network/filesystem I/O,
+unbounded eviction, or retain vendor slices. `Ok(None)`/a skipped write represents
+unavailable optional storage; `Err(Cancelled)` stops the real operation. The
+separate boundary hook runs after a whole mapping is ready, never from a control
+poll or the memory-store methods. Root-owned batching must preserve the original
+deadline/source hold and treat optional checkpoint failures as optional.
+
+One lazily admitted reusable slot is bounded by `memo::UNIT_BYTES` (4 MiB). Its
+actual backing is retained in the complete loop census and physically destroyed
+before trace/final-output censuses release scratch charges. Decode returns the
+same owned `Change` vector as fresh diff/postprocessing; attribution is not
+replaced by a timestamp, first-parent, or linear-history fast path. A hit
+invalidates the sequential prepared-input hint rather than importing token IDs.
+
+Wire version 1 persists full old/new byte-line partitions, line counts, all
+postprocessed changes including the complete tail, full key, and a chunk-checked
+digest. Key/version/length/checksum failures, line-boundary disagreement, gaps,
+overlaps, invalid deletion/old-offset accounting, and trailing bytes cause a
+normal Rust recomputation. Unchanged spans must match the verified raw bytes.
+Oversized complete units are not stored. LF/CRLF/no-final-LF/NUL boundaries are
+validated against actual raw blobs; no interner-relative token identity persists.
+
+Units are derived artifacts of a trusted verified producer: a self-checksum is
+not producer authentication, proof of canonical diff choices, or source access.
+The root must authenticate the trusted producer's cache record and enclosing
+repository/principal/generation/storage scope before exposing units. Comparing
+labels inside a unit or repairing its checksum does not establish that trust.
+Install a temporary imported workset only after the complete chunk read and its
+post-read authorization/generation fence both succeed, never inside the chunk
+callback before the fence. Equal lines can have different owners: for `a,a -> a`,
+both line selections can satisfy all byte/partition checks while only one is the
+maintained native Myers choice. No cheap canonical-choice proof is claimed.
+The mapping seam still reads raw resources and validates their bytes; it skips
+tokenization/diff/postprocessing on hits, not physical-source checks or all scans.
+Inline complete partitions consume unit capacity; this API does not claim a
+separate independently reusable line-token cache.
+
+`AdmittedOutcome::mapping_statistics()` exposes actual mapping-edge visits,
+validated hits, fresh computations, rejected units and complete units delivered
+to the store. Old entrypoints return zero memo statistics. Explicit `reuse=false`
+performs no memo callbacks but reports visits/computations for a baseline gate.
+These counters exclude separate rename discovery/origin-resolver diff work.
+The completed-mapping qualification uses Rust 1.99.1 and genuine ELF Git 2.56.0.
+The three-package suite passes 293 behavioral/provenance and five doc tests;
+all 20 native/memo cases also pass in optimized builds. Off/cold/warm fixtures
+compare complete owner/trace fields, and the eight-root gate observes eight
+visits/eight fresh computations with reuse off versus eight hits/no fresh
+computations when warm. Strict Clippy and changed-file formatting pass.
+Six targeted mutations fail their intended assertions: swapped blob identities,
+ignored options, discarded hits, lost inner stop checks, early slot-charge
+release, and a wrong native boundary marker. Sources are restored before final
+verification. This does not qualify a root cache's authenticated-record/fence
+implementation or hosted performance; those remain caller integration work.
+
 `file` preserves the original signature. `file_with_tuning` takes immutable
 `Tuning`: `reuse_line_tokens`, `retain_current_input_tokens`,
 `reuse_unchanged_runs`, `bounded_resource_cache`, and `index_changes`. These
