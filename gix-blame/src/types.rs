@@ -169,6 +169,22 @@ pub struct Options {
     pub debug_track_path: bool,
 }
 
+/// Immutable request-local optimization choices. They never read environment
+/// variables and do not change the general Rust attribution algorithm.
+#[derive(Default, Debug, Clone, Copy, Eq, PartialEq)]
+pub struct Tuning {
+    /// Reuse immutable raw-object line tokens when the pipeline permits it.
+    pub reuse_line_tokens: bool,
+    /// Exclude the current required input pair from historical token weight.
+    pub retain_current_input_tokens: bool,
+    /// Reuse verified byte-identical runs between edits.
+    pub reuse_unchanged_runs: bool,
+    /// Release historical fulltext resources between revisions.
+    pub bounded_resource_cache: bool,
+    /// Index changes when assigning pending hunks.
+    pub index_changes: bool,
+}
+
 /// Represents a change during history traversal for blame. It is supposed to capture enough
 /// information to allow reconstruction of the way a blame was performed, i. e. the path the
 /// history traversal, combined with repeated diffing of two subsequent states in this history, has
@@ -268,6 +284,83 @@ pub struct Statistics {
 }
 
 impl Outcome {
+    /// Collect complete entries and byte lines using request-local checks within
+    /// tokenization and each line copy. Cancellation returns no partial output.
+    /// This does not serialize native porcelain metadata.
+    pub fn try_entries_with_lines(
+        &self,
+        check: &mut gix_diff::blob::control::Check<'_>,
+    ) -> std::result::Result<Vec<(BlameEntry, Vec<BString>)>, gix_diff::blob::control::Cancelled> {
+        use crate::file::bounded::{Shared, VecOwner};
+        use gix_diff::blob::control::{BYTE_CHUNK, Checkpoint, Stage, try_line_ranges, try_push, try_reserve};
+        struct Rows<'a, 'b, 'c> {
+            data: Vec<(BlameEntry, Vec<BString>)>,
+            shared: &'a Shared<'b, 'c>,
+        }
+        impl Drop for Rows<'_, '_, '_> {
+            fn drop(&mut self) {
+                while let Some((entry, mut lines)) = self.data.pop() {
+                    gix_diff::blob::control::clear_with(&mut lines, &mut **self.shared.borrow_mut());
+                    drop(entry);
+                    let _ = (**self.shared.borrow_mut())(Checkpoint {
+                        stage: Stage::Cleanup,
+                        processed: self.data.len(),
+                    });
+                }
+            }
+        }
+        let shared = std::cell::RefCell::new(check);
+        let mut forward = |event| (**shared.borrow_mut())(event);
+        let check: &mut gix_diff::blob::control::Check<'_> = &mut forward;
+        let ranges = try_line_ranges(&self.blob, check)?;
+        let mut result = Rows {
+            data: Vec::new(),
+            shared: &shared,
+        };
+        for entry in &self.entries {
+            let mut lines = VecOwner::new(Vec::new(), &shared);
+            for range in &ranges[entry.range_in_blamed_file()] {
+                let mut line = Vec::new();
+                try_reserve(&mut line, range.len(), check)?;
+                for (n, chunk) in self.blob[range.clone()].chunks(BYTE_CHUNK).enumerate() {
+                    line.extend_from_slice(chunk);
+                    check(Checkpoint {
+                        stage: Stage::Output,
+                        processed: n * BYTE_CHUNK + chunk.len(),
+                    })?;
+                }
+                try_push(&mut lines, BString::new(line), check)?;
+            }
+            let source_file_name = if let Some(path) = entry.source_file_name.as_ref() {
+                let mut owned = Vec::new();
+                try_reserve(&mut owned, path.len(), check)?;
+                for chunk in path.chunks(BYTE_CHUNK) {
+                    owned.extend_from_slice(chunk);
+                    check(Checkpoint {
+                        stage: Stage::Output,
+                        processed: owned.len(),
+                    })?;
+                }
+                Some(BString::new(owned))
+            } else {
+                None
+            };
+            let owned = BlameEntry {
+                start_in_blamed_file: entry.start_in_blamed_file,
+                start_in_source_file: entry.start_in_source_file,
+                len: entry.len,
+                commit_id: entry.commit_id,
+                source_file_name,
+            };
+            try_push(&mut result.data, (owned, lines.take()), check)?;
+            check(Checkpoint {
+                stage: Stage::Output,
+                processed: result.data.len(),
+            })?;
+        }
+        Ok(std::mem::take(&mut result.data))
+    }
+
     /// Return an iterator over each entry in [`Self::entries`], along with its lines, line by line.
     ///
     /// Note that [`Self::blob`] must be tokenized in exactly the same way as the tokenizer that was used

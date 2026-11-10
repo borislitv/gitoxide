@@ -357,7 +357,13 @@ impl crate::blob::Platform {
                     ResourceKind::OldOrSource,
                     objects,
                 )?;
-                self.set_resource(id, entry_mode.kind(), location, ResourceKind::NewOrDestination, objects)?;
+                self.set_resource(
+                    id,
+                    entry_mode.kind(),
+                    location,
+                    ResourceKind::NewOrDestination,
+                    objects,
+                )?;
             }
             ChangeRef::Deletion {
                 location,
@@ -365,7 +371,13 @@ impl crate::blob::Platform {
                 entry_mode,
                 id,
             } => {
-                self.set_resource(id, entry_mode.kind(), location, ResourceKind::OldOrSource, objects)?;
+                self.set_resource(
+                    id,
+                    entry_mode.kind(),
+                    location,
+                    ResourceKind::OldOrSource,
+                    objects,
+                )?;
                 self.set_resource(
                     id.kind().null(),
                     entry_mode.kind(),
@@ -388,7 +400,13 @@ impl crate::blob::Platform {
                     ResourceKind::OldOrSource,
                     objects,
                 )?;
-                self.set_resource(id, entry_mode.kind(), location, ResourceKind::NewOrDestination, objects)?;
+                self.set_resource(
+                    id,
+                    entry_mode.kind(),
+                    location,
+                    ResourceKind::NewOrDestination,
+                    objects,
+                )?;
             }
             ChangeRef::Rewrite {
                 source_location,
@@ -409,7 +427,13 @@ impl crate::blob::Platform {
                     ResourceKind::OldOrSource,
                     objects,
                 )?;
-                self.set_resource(id, entry_mode.kind(), location, ResourceKind::NewOrDestination, objects)?;
+                self.set_resource(
+                    id,
+                    entry_mode.kind(),
+                    location,
+                    ResourceKind::NewOrDestination,
+                    objects,
+                )?;
             }
         }
         Ok(self)
@@ -483,7 +507,9 @@ impl<'a> ChangeRef<'a> {
             ChangeRef::Addition { location, .. }
             | ChangeRef::Deletion { location, .. }
             | ChangeRef::Modification { location, .. } => location,
-            ChangeRef::Rewrite { source_location, .. } => source_location,
+            ChangeRef::Rewrite {
+                source_location, ..
+            } => source_location,
         }
     }
 }
@@ -555,7 +581,9 @@ impl Change {
             Change::Addition { location, .. }
             | Change::Deletion { location, .. }
             | Change::Modification { location, .. } => location.as_bstr(),
-            Change::Rewrite { source_location, .. } => source_location.as_bstr(),
+            Change::Rewrite {
+                source_location, ..
+            } => source_location.as_bstr(),
         }
     }
 }

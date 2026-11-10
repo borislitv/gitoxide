@@ -1300,6 +1300,121 @@ mod util {
         util::{ObjectDb, insert, object_db},
     };
 
+    #[test]
+    fn candidate_stage_entry_requires_inner_work_check() {
+        use gix_diff::blob::control::{Cancelled, Stage};
+        let mut tracker = new_tracker(Rewrites {
+            percentage: None,
+            track_empty: true,
+            ..Default::default()
+        });
+        for (change, path) in [(Change::deletion(), "old"), (Change::addition(), "new")] {
+            tracker
+                .push_change_with_control(change, path.into(), &mut |_| Ok(()))
+                .unwrap();
+        }
+        let mut entered = false;
+        let mut stopped = false;
+        let mut emitted = false;
+        let result = tracker.emit_with_control(
+            |_, _| {
+                emitted = true;
+                Action::Continue(())
+            },
+            &mut new_platform_no_worktree(),
+            &gix_object::find::Never,
+            |_: &mut dyn FnMut(Change, &bstr::BStr) -> gix_error::Result| -> std::io::Result<()> {
+                panic!("no copy-source request")
+            },
+            &mut |event| {
+                if event.stage == Stage::RenameCandidate {
+                    if event.processed == 0 {
+                        entered = true;
+                    } else if entered {
+                        stopped = true;
+                        return Err(Cancelled);
+                    }
+                }
+                Ok(())
+            },
+        );
+        assert!(entered, "must enter actual candidate enumeration");
+        assert!(stopped, "entry-only check must not acknowledge inner cancellation");
+        assert!(result.is_err());
+        assert!(!emitted, "stop must precede rewrite publication");
+    }
+
+    #[test]
+    fn controlled_rename_stops_inside_candidate_work_and_keeps_filename_ties() {
+        use gix_diff::blob::control::{Cancelled, Stage};
+        fn input() -> rewrites::Tracker<Change> {
+            let mut tracker = new_tracker(Rewrites {
+                percentage: None,
+                track_empty: true,
+                ..Default::default()
+            });
+            for (change, path) in [
+                (Change::deletion(), "a/other"),
+                (Change::deletion(), "z/name"),
+                (Change::addition(), "q/name"),
+            ] {
+                tracker
+                    .push_change_with_control(change, path.into(), &mut |_| Ok(()))
+                    .unwrap();
+            }
+            tracker
+        }
+        let mut entered_sort = false;
+        let mut reached_candidate = false;
+        let mut emitted = Vec::new();
+        let result = input().emit_with_control(
+            |dst, _| {
+                emitted.push(dst.location.to_owned());
+                Action::Continue(())
+            },
+            &mut new_platform_no_worktree(),
+            &gix_object::find::Never,
+            |_: &mut dyn FnMut(Change, &bstr::BStr) -> gix_error::Result| -> std::io::Result<()> {
+                panic!("copy source scan is disabled")
+            },
+            &mut |event| {
+                entered_sort |= event.stage == Stage::Sort;
+                if entered_sort && event.stage == Stage::Rename {
+                    reached_candidate = true;
+                    Err(Cancelled)
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert!(
+            reached_candidate && result.is_err(),
+            "must stop in candidate work, not admission"
+        );
+        assert!(emitted.is_empty(), "no outcome may be emitted before the stopped match");
+        let mut renames = Vec::new();
+        input()
+            .emit_with_control(
+                |dst, src| {
+                    if let Some(src) = src {
+                        renames.push((src.location.to_owned(), dst.location.to_owned()));
+                    }
+                    Action::Continue(())
+                },
+                &mut new_platform_no_worktree(),
+                &gix_object::find::Never,
+                |_: &mut dyn FnMut(Change, &bstr::BStr) -> gix_error::Result| -> std::io::Result<()> {
+                    panic!("copy source scan is disabled")
+                },
+                &mut |_| Ok(()),
+            )
+            .unwrap();
+        assert_eq!(
+            renames,
+            vec![(bstr::BString::from("z/name"), bstr::BString::from("q/name"))]
+        );
+    }
+
     /// Add `blobs` `(change, location, data)` to tracker that will all be retained. Note that the `id` of the respective change will be adjusted to match.
     pub fn add_retained_blobs<'a>(
         tracker: &mut rewrites::Tracker<Change>,

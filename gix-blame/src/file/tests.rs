@@ -985,6 +985,52 @@ mod process_changes {
     }
 }
 
+#[test]
+fn indexed_changes_retain_overlapping_source_ranges_and_offsets() {
+    use crate::file::{Change, process_changes_indexed};
+
+    let suspect = zero_sha();
+    let parent = one_sha();
+    let unrelated = ObjectId::from_bytes_or_panic(&[2; 20]);
+    let hunks = vec![
+        (0..2, suspect, 14..16).into(),
+        (2..4, suspect, 8..10).into(),
+        (4..6, suspect, 4..6).into(),
+        (6..8, suspect, 1..3).into(),
+        (8..10, unrelated, 1..3).into(),
+        (10..12, suspect, 8..10).into(),
+        (12..14, suspect, 20..22).into(),
+    ];
+    let changes = vec![
+        Change::Unchanged(0..3),
+        Change::AddedOrReplaced(3..5, 1),
+        Change::Unchanged(5..8),
+        Change::Deleted(8, 3),
+        Change::Unchanged(8..10),
+        Change::AddedOrReplaced(10..11, 0),
+        Change::Unchanged(11..24),
+    ];
+    let (actual, skipped) = process_changes_indexed(hunks, changes, suspect, parent);
+    assert_eq!(
+        actual,
+        [
+            (0..2, parent, 15..17).into(),
+            (2..4, parent, 10..12).into(),
+            (4..5, suspect, 4..5).into(),
+            (5..6, parent, 4..5).into(),
+            (6..8, parent, 1..3).into(),
+            (8..10, unrelated, 1..3).into(),
+            (10..12, parent, 10..12).into(),
+            (12..14, parent, 21..23).into(),
+        ],
+        "prefix offsets preserve repeated/nonmonotonic source ranges and unrelated suspects"
+    );
+    assert_eq!(
+        skipped, 19,
+        "irrelevant change prefixes are not replayed for every hunk"
+    );
+}
+
 mod blame_ranges {
     use crate::BlameRanges;
 

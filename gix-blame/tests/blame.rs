@@ -5,6 +5,9 @@ use gix_blame::BlameRanges;
 use gix_hash::ObjectId;
 use gix_object::bstr;
 
+#[path = "blame/controlled.rs"]
+mod controlled;
+
 fn fixture_hash_kind() -> gix_hash::Kind {
     gix_testtools::object_hash()
 }

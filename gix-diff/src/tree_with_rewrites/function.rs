@@ -158,14 +158,18 @@ where
                     };
                     match (self.visit)(change) {
                         Ok(std::ops::ControlFlow::Break(())) => std::ops::ControlFlow::Break(()),
-                        Ok(std::ops::ControlFlow::Continue(())) => std::ops::ControlFlow::Continue(()),
+                        Ok(std::ops::ControlFlow::Continue(())) => {
+                            std::ops::ControlFlow::Continue(())
+                        }
                         Err(err) => {
                             self.err = Some(err);
                             std::ops::ControlFlow::Break(())
                         }
                     }
                 }
-                None => Self::emit_change(dest.change, dest.location, &mut self.visit, &mut self.err),
+                None => {
+                    Self::emit_change(dest.change, dest.location, &mut self.visit, &mut self.err)
+                }
             },
             diff_cache,
             self.objects,
@@ -224,10 +228,17 @@ mod tree_to_changes {
     }
 
     impl<'a> Delegate<'a> {
-        pub fn new(push: &'a mut dyn FnMut(Change, &BStr), location: Option<crate::tree::recorder::Location>) -> Self {
+        pub fn new(
+            push: &'a mut dyn FnMut(Change, &BStr),
+            location: Option<crate::tree::recorder::Location>,
+        ) -> Self {
             let location = location.map(|t| match t {
-                crate::tree::recorder::Location::FileName => gix_traverse::tree::recorder::Location::FileName,
-                crate::tree::recorder::Location::Path => gix_traverse::tree::recorder::Location::Path,
+                crate::tree::recorder::Location::FileName => {
+                    gix_traverse::tree::recorder::Location::FileName
+                }
+                crate::tree::recorder::Location::Path => {
+                    gix_traverse::tree::recorder::Location::Path
+                }
             });
             Self {
                 push,

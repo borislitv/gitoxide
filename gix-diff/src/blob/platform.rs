@@ -1,4 +1,4 @@
-use gix_error::Result;
+use gix_error::{ErrorExt, Result};
 use std::{cmp::Ordering, io::Write, process::Stdio};
 
 use bstr::{BStr, BString, ByteSlice};
@@ -65,6 +65,15 @@ impl Default for CacheKey {
 }
 
 impl CacheKey {
+    fn try_clone_controlled(&self, check: &mut crate::blob::control::Check<'_>) -> Result<Self> {
+        let location = crate::blob::control::try_copy_bytes(&self.location, check).map_err(|e| e.raise())?;
+        Ok(Self {
+            id: self.id,
+            location: location.into(),
+            use_id: self.use_id,
+            is_link: self.is_link,
+        })
+    }
     fn set_location(&mut self, rela_path: &BStr) {
         self.location.clear();
         self.location.extend_from_slice(rela_path);
@@ -275,7 +284,9 @@ pub mod set_resource {
     impl std::fmt::Display for Error {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             match self {
-                Self::InvalidMode { mode } => write!(f, "Can only diff blobs and links, not {mode:?}"),
+                Self::InvalidMode { mode } => {
+                    write!(f, "Can only diff blobs and links, not {mode:?}")
+                }
                 Self::Attributes { kind, rela_path } => {
                     write!(f, "Failed to obtain attributes for {kind} resource at \"{rela_path}\"")
                 }
@@ -437,6 +448,189 @@ pub struct Options {
 
 /// Lifecycle
 impl Platform {
+    /// Validate the service-only raw object path before reading any attributes,
+    /// filesystem data, filters or external drivers. Existing oversized legacy
+    /// caches are rejected, not traversed on a controlled request's behalf.
+    pub fn validate_controlled_raw(&self) -> Result {
+        if self.filter_mode != pipeline::Mode::ToGit
+            || self.filter.roots.old_root.is_some()
+            || self.filter.roots.new_root.is_some()
+            || !self.filter.drivers.is_empty()
+            || self.diff_cache.capacity() > 16
+            || (!self.diff_cache.is_empty() && !self.controlled_raw)
+            || self.free_list.len() > 2
+        {
+            return Err(message(
+                "controlled diff requires raw ToGit objects, no roots/drivers and a fresh bounded cache",
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    /// Load a raw immutable object without consulting attribute or conversion
+    /// pipelines. The provider must itself honour request control while filling
+    /// the buffer. Only two current resources and two spare buffers are retained.
+    /// No external command or worktree/filter code is reachable from this method.
+    pub fn set_resource_controlled_raw(
+        &mut self,
+        id: gix_hash::ObjectId,
+        mode: gix_object::tree::EntryKind,
+        path: &BStr,
+        kind: ResourceKind,
+        objects: &impl gix_object::FindObjectOrHeader,
+        check: &mut crate::blob::control::Check<'_>,
+    ) -> Result {
+        use crate::blob::control::{BYTE_CHUNK, Checkpoint, Stage, try_reserve};
+        self.validate_controlled_raw()?;
+        if !matches!(
+            mode,
+            gix_object::tree::EntryKind::Blob
+                | gix_object::tree::EntryKind::BlobExecutable
+                | gix_object::tree::EntryKind::Link
+        ) {
+            return Err(message("controlled diff resource is not a blob or symlink").into());
+        }
+        if path.len() > 65536 {
+            return Err(message("controlled diff path exceeds 64 KiB metadata limit").into());
+        }
+        let mut location = Vec::new();
+        try_reserve(&mut location, path.len(), check).map_err(|e| e.raise())?;
+        for chunk in path.chunks(BYTE_CHUNK) {
+            location.extend_from_slice(chunk);
+            check(Checkpoint {
+                stage: Stage::Copy,
+                processed: location.len(),
+            })
+            .map_err(|e| e.raise())?;
+        }
+        let key = CacheKey {
+            id,
+            location: location.into(),
+            use_id: true,
+            is_link: mode == gix_object::tree::EntryKind::Link,
+        };
+        *match kind {
+            ResourceKind::OldOrSource => &mut self.old,
+            ResourceKind::NewOrDestination => &mut self.new,
+        } = None;
+        if !self.diff_cache.contains_key(&key) {
+            // At most two entries: removing a victim cannot hide a cache-sized
+            // retain/rehash/cleanup loop. The keys compare fixed-size IDs only.
+            if self.diff_cache.len() >= 2 {
+                let other = match kind {
+                    ResourceKind::OldOrSource => self.new.as_ref(),
+                    ResourceKind::NewOrDestination => self.old.as_ref(),
+                };
+                let victim = self
+                    .diff_cache
+                    .keys()
+                    .find(|k| Some(*k) != other)
+                    .map(|k| k.try_clone_controlled(check))
+                    .transpose()?;
+                if let Some(victim) = victim {
+                    self.diff_cache.remove(&victim);
+                }
+            }
+            let mut buffer = self.free_list.pop().unwrap_or_default();
+            buffer.clear();
+            let data = if id.is_null() {
+                None
+            } else {
+                let header = objects
+                    .try_header(&id)?
+                    .ok_or_else(|| message("controlled diff object is missing").raise())?;
+                if header.kind != gix_object::Kind::Blob || header.size > 128 * 1024 * 1024 {
+                    return Err(message("controlled diff blob kind or 128 MiB size limit violated").into());
+                }
+                let size = usize::try_from(header.size).map_err(|_| message("blob size overflow").raise())?;
+                try_reserve(&mut buffer, size, check).map_err(|e| e.raise())?;
+                let reserved_pointer = buffer.as_ptr();
+                let found = objects
+                    .try_find(&id, &mut buffer)?
+                    .ok_or_else(|| message("controlled diff object is missing").raise())?;
+                if found.kind != gix_object::Kind::Blob || found.data.len() != size {
+                    return Err(message("controlled diff object disagrees with its header").into());
+                }
+                let mut binary = self.filter.options.large_file_threshold_bytes != 0
+                    && size as u64 > self.filter.options.large_file_threshold_bytes;
+                for (n, chunk) in found.data[..size.min(8000)].chunks(BYTE_CHUNK).enumerate() {
+                    binary |= chunk.contains(&0);
+                    check(Checkpoint {
+                        stage: Stage::Preprocess,
+                        processed: n * BYTE_CHUNK + chunk.len(),
+                    })
+                    .map_err(|e| e.raise())?;
+                }
+                // Find may return bytes borrowed from its own cache instead of
+                // filling the supplied scratch. Preserve those bytes explicitly.
+                let replacement = if found.data.as_ptr() != reserved_pointer {
+                    let mut owned = Vec::new();
+                    try_reserve(&mut owned, size, check).map_err(|e| e.raise())?;
+                    for chunk in found.data.chunks(BYTE_CHUNK) {
+                        owned.extend_from_slice(chunk);
+                        check(Checkpoint {
+                            stage: Stage::Copy,
+                            processed: owned.len(),
+                        })
+                        .map_err(|e| e.raise())?;
+                    }
+                    Some(owned)
+                } else {
+                    None
+                };
+                if let Some(owned) = replacement {
+                    buffer = owned;
+                }
+                buffer.truncate(size);
+                Some(if binary {
+                    pipeline::Data::Binary { size: size as u64 }
+                } else {
+                    pipeline::Data::Buffer { is_derived: false }
+                })
+            };
+            crate::blob::control::admit_bytes(16 * std::mem::size_of::<(CacheKey, CacheValue)>(), check)
+                .map_err(|e| e.raise())?;
+            self.diff_cache
+                .try_reserve(1)
+                .map_err(|_| message("controlled raw cache allocation failed").raise())?;
+            self.controlled_raw = true;
+            self.diff_cache.insert(
+                key.try_clone_controlled(check)?,
+                CacheValue {
+                    mode,
+                    buffer,
+                    conversion: pipeline::Outcome {
+                        driver_index: None,
+                        data,
+                    },
+                },
+            );
+        }
+        *match kind {
+            ResourceKind::OldOrSource => &mut self.old,
+            ResourceKind::NewOrDestination => &mut self.new,
+        } = Some(key);
+        Ok(())
+    }
+
+    /// Release controlled raw resources. Each entry owns one byte allocation,
+    /// not a dictionary of per-line allocations. Stop checks never skip cleanup.
+    pub fn clear_controlled_raw(&mut self, check: &mut crate::blob::control::Check<'_>) {
+        self.old = None;
+        self.new = None;
+        let mut cache = std::mem::take(&mut self.diff_cache);
+        for _value in cache.drain() {
+            let _ = check(crate::blob::control::Checkpoint {
+                stage: crate::blob::control::Stage::Cleanup,
+                processed: 1,
+            });
+        }
+        drop(cache);
+        crate::blob::control::clear_with(&mut self.free_list, check);
+        drop(std::mem::take(&mut self.free_list));
+    }
+
     /// Create a new instance with `options`, and a way to `filter` data from the object database to data that is diff-able.
     /// `filter_mode` decides how to do that specifically.
     /// Use `attr_stack` to access attributes pertaining worktree filters and diff settings.
@@ -450,6 +644,7 @@ impl Platform {
             old: None,
             new: None,
             diff_cache: Default::default(),
+            controlled_raw: false,
             free_list: Vec::with_capacity(2),
             options,
             filter,
@@ -489,6 +684,7 @@ impl Platform {
         kind: ResourceKind,
         objects: &impl gix_object::FindObjectOrHeader, // TODO: make this `dyn` once https://github.com/rust-lang/rust/issues/65991 is stable, then also make tracker.rs `objects` dyn
     ) -> ExnResult<(), set_resource::Error> {
+        self.controlled_raw = false;
         let res = self.set_resource_inner(id, mode, rela_path, kind, objects);
         if res.is_err() {
             *match kind {
@@ -659,7 +855,9 @@ impl Platform {
             (None, None) => {
                 bail!(prepare_diff::Error::SourceAndDestinationRemoved);
             }
-            (Some(pipeline::Data::Binary { .. }), _) | (_, Some(pipeline::Data::Binary { .. })) => return Ok(out),
+            (Some(pipeline::Data::Binary { .. }), _) | (_, Some(pipeline::Data::Binary { .. })) => {
+                return Ok(out);
+            }
             _either_missing_or_non_binary => {
                 if let Some(command) = old
                     .conversion
@@ -728,6 +926,23 @@ impl Platform {
             }
         }
         self.free_list.len()
+    }
+
+    /// Retain only the currently selected source and destination, plus at most two
+    /// reusable buffers. This bounds history retention while keeping the previous
+    /// source available as the next destination in a reverse history traversal.
+    pub fn retain_current_resources(&mut self) {
+        let old = self.old.as_ref();
+        let new = self.new.as_ref();
+        let free_list = &mut self.free_list;
+        free_list.truncate(2);
+        self.diff_cache.retain(|key, value| {
+            let keep = Some(key) == old || Some(key) == new;
+            if !keep && free_list.len() < 2 {
+                free_list.push(std::mem::take(&mut value.buffer));
+            }
+            keep
+        });
     }
 }
 

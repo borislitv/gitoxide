@@ -1,10 +1,10 @@
 // Modified for gitoxide from the upstream imara-diff crate.
 // Upstream source: git cat-file -p 32d1e45d3df061e6ccba6db7fdce92db29e345d8:src/myers/middle_snake.rs
 
+use crate::control::{Cancelled, Check, Stage, poll};
 use std::ptr::NonNull;
 
 use crate::myers::slice::FileSlice;
-use crate::util::{common_postfix, common_prefix};
 
 /// Minimum snake length to be considered a "good" snake for heuristics.
 const SNAKE_CNT: u32 = 20;
@@ -109,10 +109,12 @@ impl<const BACK: bool> MiddleSnakeSearch<BACK> {
         file1: &FileSlice,
         file2: &FileSlice,
         mut f: impl FnMut(i32, i32) -> bool,
-    ) -> Option<SearchResult> {
+        check: &mut Check<'_>,
+    ) -> Result<Option<SearchResult>, Cancelled> {
         let mut res = None;
         let mut k = self.kmax;
         while k >= self.kmin {
+            poll(check, Stage::Myers, k.unsigned_abs() as usize)?;
             #[cfg(test)]
             cov_mark::hit!(SPLIT_SEARCH_ITER);
             let mut token_idx1 = if BACK {
@@ -132,14 +134,22 @@ impl<const BACK: bool> MiddleSnakeSearch<BACK> {
                 if token_idx1 > 0 && token_idx2 > 0 {
                     let tokens1 = &file1.tokens[..token_idx1 as usize];
                     let tokens2 = &file2.tokens[..token_idx2 as usize];
-                    common_postfix(tokens1, tokens2)
+                    poll(check, Stage::MiddleSnake, 0)?;
+                    crate::util::try_common_postfix(tokens1, tokens2, &mut |mut event| {
+                        event.stage = Stage::MiddleSnake;
+                        check(event)
+                    })?
                 } else {
                     0
                 }
             } else if token_idx1 < file1.len() as i32 && token_idx2 < file2.len() as i32 {
                 let tokens1 = &file1.tokens[token_idx1 as usize..];
                 let tokens2 = &file2.tokens[token_idx2 as usize..];
-                common_prefix(tokens1, tokens2)
+                poll(check, Stage::MiddleSnake, 0)?;
+                crate::util::try_common_prefix(tokens1, tokens2, &mut |mut event| {
+                    event.stage = Stage::MiddleSnake;
+                    check(event)
+                })?
             } else {
                 0
             };
@@ -158,20 +168,26 @@ impl<const BACK: bool> MiddleSnakeSearch<BACK> {
             self.write_xpos_at_diagonal(k, token_idx1);
 
             if f(k, token_idx1) {
-                return Some(SearchResult::Found { token_idx1, token_idx2 });
+                return Ok(Some(SearchResult::Found { token_idx1, token_idx2 }));
             }
 
             k -= 2;
         }
 
-        res
+        Ok(res)
     }
 
-    pub fn best_position(&self, file1: &FileSlice, file2: &FileSlice) -> (isize, i32) {
+    pub fn best_position(
+        &self,
+        file1: &FileSlice,
+        file2: &FileSlice,
+        check: &mut Check<'_>,
+    ) -> Result<(isize, i32), Cancelled> {
         let mut best_distance: isize = if BACK { isize::MAX } else { -1 };
         let mut best_token_idx1 = if BACK { i32::MAX } else { -1 };
         let mut k = self.kmax;
         while k >= self.kmin {
+            poll(check, Stage::Myers, k.unsigned_abs() as usize)?;
             let mut token_idx1 = self.x_pos_at_diagonal(k);
             if BACK {
                 token_idx1 = token_idx1.max(0);
@@ -197,22 +213,29 @@ impl<const BACK: bool> MiddleSnakeSearch<BACK> {
 
             k -= 2;
         }
-        (best_distance, best_token_idx1)
+        Ok((best_distance, best_token_idx1))
     }
 
-    pub fn found_snake(&self, ec: u32, file1: &FileSlice, file2: &FileSlice) -> Option<(i32, i32)> {
+    pub fn found_snake(
+        &self,
+        ec: u32,
+        file1: &FileSlice,
+        file2: &FileSlice,
+        check: &mut Check<'_>,
+    ) -> Result<Option<(i32, i32)>, Cancelled> {
         let mut best_score = 0;
         let mut best_token_idx1 = 0;
         let mut best_token_idx2 = 0;
         let mut k = self.kmax;
         while k >= self.kmin {
+            poll(check, Stage::Myers, k.unsigned_abs() as usize)?;
             let (token_idx1, token_idx2) = self.pos_at_diagonal(k);
             if BACK {
-                if !(0..file1.len() as i32 - SNAKE_CNT as i32).contains(&token_idx1) {
+                if !(1..=file1.len() as i32 - SNAKE_CNT as i32).contains(&token_idx1) {
                     k -= 2;
                     continue;
                 }
-                if !(0..file2.len() as i32 - SNAKE_CNT as i32).contains(&token_idx2) {
+                if !(1..=file2.len() as i32 - SNAKE_CNT as i32).contains(&token_idx2) {
                     k -= 2;
                     continue;
                 }
@@ -227,13 +250,22 @@ impl<const BACK: bool> MiddleSnakeSearch<BACK> {
                 }
             }
 
-            let main_diagonal_distance = k.unsigned_abs() as usize;
+            // Coordinates are relative to this box. Backward progress is measured
+            // from its far corner, whose diagonal need not be zero.
+            let main_diagonal = if BACK {
+                file1.len() as i32 - file2.len() as i32
+            } else {
+                0
+            };
+            let main_diagonal_distance = (k - main_diagonal).unsigned_abs() as usize;
             let distance = if BACK {
                 (file1.len() - token_idx1 as u32) + (file2.len() - token_idx2 as u32)
             } else {
                 token_idx1 as u32 + token_idx2 as u32
             };
-            let score = distance as usize + main_diagonal_distance;
+            // Like Git's xdl_split(), penalize distance from the search corner's
+            // diagonal instead of rewarding a more unbalanced path.
+            let score = distance as usize - main_diagonal_distance;
             if score > (K_HEUR * ec) as usize && score > best_score {
                 let is_snake = if BACK {
                     file1.tokens[token_idx1 as usize..]
@@ -244,8 +276,8 @@ impl<const BACK: bool> MiddleSnakeSearch<BACK> {
                 } else {
                     file1.tokens[..token_idx1 as usize]
                         .iter()
-                        .zip(&file2.tokens[..token_idx2 as usize])
                         .rev()
+                        .zip(file2.tokens[..token_idx2 as usize].iter().rev())
                         .take(SNAKE_CNT as usize)
                         .all(|(token1, token2)| token1 == token2)
                 };
@@ -259,7 +291,7 @@ impl<const BACK: bool> MiddleSnakeSearch<BACK> {
             k -= 2;
         }
 
-        (best_score > 0).then_some((best_token_idx1, best_token_idx2))
+        Ok((best_score > 0).then_some((best_token_idx1, best_token_idx2)))
     }
 }
 

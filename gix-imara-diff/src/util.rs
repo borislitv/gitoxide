@@ -2,7 +2,34 @@
 // Upstream source: git cat-file -p 32d1e45d3df061e6ccba6db7fdce92db29e345d8:src/util.rs
 
 use crate::Hunk;
+use crate::control::{Cancelled, Check, Stage, poll};
 use crate::intern::Token;
+
+pub(crate) fn try_common_prefix(a: &[Token], b: &[Token], check: &mut Check<'_>) -> Result<u32, Cancelled> {
+    let mut count = 0;
+    for (a, b) in a.chunks(1024).zip(b.chunks(1024)) {
+        let matched = a.iter().zip(b).take_while(|(a, b)| a == b).count();
+        count += matched;
+        poll(check, Stage::Common, count)?;
+        if matched < a.len().min(b.len()) {
+            break;
+        }
+    }
+    Ok(count as u32)
+}
+
+pub(crate) fn try_common_postfix(a: &[Token], b: &[Token], check: &mut Check<'_>) -> Result<u32, Cancelled> {
+    let mut count = 0;
+    for (a, b) in a.rchunks(1024).zip(b.rchunks(1024)) {
+        let matched = a.iter().rev().zip(b.iter().rev()).take_while(|(a, b)| a == b).count();
+        count += matched;
+        poll(check, Stage::Common, count)?;
+        if matched < a.len().min(b.len()) {
+            break;
+        }
+    }
+    Ok(count as u32)
+}
 
 /// Computes the number of common tokens at the start of two sequences.
 pub fn common_prefix(file1: &[Token], file2: &[Token]) -> u32 {
@@ -26,13 +53,6 @@ pub fn common_postfix(file1: &[Token], file2: &[Token]) -> u32 {
         off += 1;
     }
     off
-}
-
-/// Computes both the common prefix and postfix lengths of two sequences.
-pub fn common_edges(file1: &[Token], file2: &[Token]) -> (u32, u32) {
-    let prefix = common_prefix(file1, file2);
-    let postfix = common_postfix(&file1[prefix as usize..], &file2[prefix as usize..]);
-    (prefix, postfix)
 }
 
 /// Removes the common prefix from both sequences and returns its length.
@@ -67,9 +87,14 @@ pub fn sqrt(val: usize) -> u32 {
 }
 
 impl Hunk {
-    pub(crate) fn next_hunk(&mut self, removed: &[bool], added: &[bool]) -> bool {
-        let Some(off) = find_next_change(added, self.after.end) else {
-            return false;
+    pub(crate) fn try_next_hunk(
+        &mut self,
+        removed: &[bool],
+        added: &[bool],
+        check: &mut Check<'_>,
+    ) -> Result<bool, Cancelled> {
+        let Some(off) = try_find_next_change(added, self.after.end, check)? else {
+            return Ok(false);
         };
         let mut off_before = 0;
         loop {
@@ -77,8 +102,8 @@ impl Hunk {
                 removed.len() as u32 != self.before.end || off == 0,
                 "broken hunk alignment {self:?} "
             );
-            let unchanged_tokens =
-                find_next_change(removed, self.before.end).unwrap_or(removed.len() as u32 - self.before.end);
+            let unchanged_tokens = try_find_next_change(removed, self.before.end, check)?
+                .unwrap_or(removed.len() as u32 - self.before.end);
             if off_before + unchanged_tokens > off {
                 self.before.start = self.before.end + (off - off_before);
                 self.before.end = self.before.start;
@@ -86,35 +111,54 @@ impl Hunk {
             }
             off_before += unchanged_tokens;
             self.before.start = self.before.end + unchanged_tokens;
-            self.before.end = find_hunk_end(removed, self.before.end + unchanged_tokens);
+            self.before.end = try_find_hunk_end(removed, self.before.end + unchanged_tokens, check)?;
             if off_before == off {
                 break;
             }
         }
         self.after.start = self.after.end + off;
-        self.after.end = find_hunk_end(added, self.after.start);
-        true
+        self.after.end = try_find_hunk_end(added, self.after.start, check)?;
+        Ok(true)
     }
 }
 
-/// Finds the offset to the next changed token starting from the given position.
-pub fn find_next_change(changes: &[bool], pos: u32) -> Option<u32> {
-    changes[pos as usize..]
-        .iter()
-        .position(|&changed| changed)
-        .map(|off| off as u32)
+pub(crate) fn try_find_next_change(
+    changes: &[bool],
+    pos: u32,
+    check: &mut Check<'_>,
+) -> Result<Option<u32>, Cancelled> {
+    for (n, chunk) in changes[pos as usize..].chunks(1024).enumerate() {
+        let found = chunk.iter().position(|&c| c);
+        poll(check, Stage::Postprocess, n * 1024 + found.unwrap_or(chunk.len()))?;
+        if let Some(off) = found {
+            return Ok(Some((n * 1024 + off) as u32));
+        }
+    }
+    Ok(None)
 }
 
-/// Finds the end position of a hunk of changed tokens starting from the given position.
-pub fn find_hunk_end(changes: &[bool], pos: u32) -> u32 {
-    pos + changes[pos as usize..].iter().take_while(|&&changed| changed).count() as u32
+pub(crate) fn try_find_hunk_end(changes: &[bool], pos: u32, check: &mut Check<'_>) -> Result<u32, Cancelled> {
+    let mut count = 0;
+    for chunk in changes[pos as usize..].chunks(1024) {
+        let matched = chunk.iter().take_while(|&&c| c).count();
+        count += matched;
+        poll(check, Stage::Postprocess, count)?;
+        if matched < chunk.len() {
+            break;
+        }
+    }
+    Ok(pos + count as u32)
 }
 
-/// Finds the start position of a hunk of changed tokens ending at the given position.
-pub fn find_hunk_start(changes: &[bool], pos: u32) -> u32 {
-    pos - changes[..pos as usize]
-        .iter()
-        .rev()
-        .take_while(|&&changed| changed)
-        .count() as u32
+pub(crate) fn try_find_hunk_start(changes: &[bool], pos: u32, check: &mut Check<'_>) -> Result<u32, Cancelled> {
+    let mut count = 0;
+    for chunk in changes[..pos as usize].rchunks(1024) {
+        let matched = chunk.iter().rev().take_while(|&&c| c).count();
+        count += matched;
+        poll(check, Stage::Postprocess, count)?;
+        if matched < chunk.len() {
+            break;
+        }
+    }
+    Ok(pos - count as u32)
 }

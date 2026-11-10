@@ -16,6 +16,61 @@ impl Default for Inflate {
 }
 
 impl Inflate {
+    /// Decode one complete stream with request-local checks between at most 32 KiB
+    /// of input and output work. Reject truncated streams and incorrect output sizes.
+    ///
+    /// This operation uses the resumable zlib-rs backend, including in builds with
+    /// `sirocco`, whose prefix API requires retaining contiguous output history.
+    /// On error the destination is incomplete and must not be published.
+    pub fn once_controlled(
+        &mut self,
+        input: &[u8],
+        out: &mut [u8],
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<(Status, usize, usize)> {
+        #[cfg(not(feature = "sirocco"))]
+        let decoder = &mut self.state;
+        #[cfg(feature = "sirocco")]
+        let mut controlled = crate::Decompress::default();
+        #[cfg(feature = "sirocco")]
+        let decoder = &mut controlled;
+        decoder.reset();
+        let (mut read, mut written) = (0, 0);
+        loop {
+            check()?;
+            let end = input.len().min(read + 32 * 1024);
+            let out_end = out.len().min(written + 32 * 1024);
+            // Once the promised output is full, consume the trailer with one byte
+            // of scratch so an oversized stream cannot masquerade as a complete one.
+            let mut extra = [0];
+            let destination = if written == out.len() {
+                &mut extra[..]
+            } else {
+                &mut out[written..out_end]
+            };
+            let before_in = decoder.total_in();
+            let before_out = decoder.total_out();
+            let status = decoder.decompress(&input[read..end], destination, crate::FlushDecompress::None)?;
+            let consumed = (decoder.total_in() - before_in) as usize;
+            let produced = (decoder.total_out() - before_out) as usize;
+            read += consumed;
+            if written == out.len() && produced != 0 {
+                return Err(gix_error::corruption("Zlib output exceeds the declared size").into());
+            }
+            written += produced;
+            check()?;
+            if status == Status::StreamEnd {
+                if written != out.len() {
+                    return Err(gix_error::corruption("Zlib output is shorter than the declared size").into());
+                }
+                return Ok((status, read, written));
+            }
+            if consumed == 0 && produced == 0 {
+                return Err(gix_error::corruption("Truncated zlib stream made no progress").into());
+            }
+        }
+    }
+
     /// Decompress the zlib stream at the start of `input` into `out`, returning `(status, consumed_in, written_out)`.
     ///
     /// If `out` can hold the whole decompressed stream, the status is [`Status::StreamEnd`]. Otherwise this behaves

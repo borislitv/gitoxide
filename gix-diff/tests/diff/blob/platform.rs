@@ -14,6 +14,123 @@ use crate::{
 };
 
 #[test]
+fn controlled_byte_diff_returns_complete_hunks_or_inner_cancellation() {
+    use gix_diff::blob::{
+        Hunk,
+        control::{BYTE_CHUNK, Cancelled, Stage},
+        try_diff_bytes,
+    };
+    let (input, diff) = try_diff_bytes(Algorithm::MyersMinimal, b"same\r\nold\n", b"same\r\nnew\n", &mut |_| {
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(
+        input.as_input().interner[input.as_input().before[0]].as_slice(),
+        b"same\r\n"
+    );
+    assert_eq!(
+        diff.try_hunks(&mut |_| Ok(())).unwrap(),
+        vec![Hunk {
+            before: 1..2,
+            after: 1..2
+        }]
+    );
+    let huge = vec![b'x'; 4 * BYTE_CHUNK];
+    let mut entered_hash = false;
+    let result = try_diff_bytes(Algorithm::Histogram, &huge, &huge, &mut |event| {
+        if event.stage == Stage::Hash && event.processed >= BYTE_CHUNK {
+            entered_hash = true;
+            Err(Cancelled)
+        } else {
+            Ok(())
+        }
+    });
+    assert!(entered_hash);
+    assert!(matches!(result, Err(Cancelled)));
+}
+
+#[test]
+fn controlled_raw_resources_reject_worktree_and_driver_paths_before_loading() {
+    let mut worktree = new_platform(None, pipeline::Mode::ToGit);
+    let mut driver = new_platform(
+        Some(gix_diff::blob::Driver {
+            name: "unused".into(),
+            command: Some("must-not-execute".into()),
+            ..Default::default()
+        }),
+        pipeline::Mode::ToGit,
+    );
+    driver.filter.roots.old_root = None;
+    for platform in [&mut worktree, &mut driver] {
+        let mut checkpoints = 0;
+        let result = platform.set_resource_controlled_raw(
+            crate::fixture_hash_kind().null(),
+            EntryKind::Blob,
+            "a".into(),
+            ResourceKind::OldOrSource,
+            &gix_object::find::Never,
+            &mut |_| {
+                checkpoints += 1;
+                Ok(())
+            },
+        );
+        assert!(result.unwrap_err().to_string().contains("raw ToGit"));
+        assert_eq!(checkpoints, 0, "validation must precede all resource work");
+        assert!(
+            platform.prepare_diff().is_err(),
+            "a rejected resource must not become usable"
+        );
+    }
+}
+
+#[test]
+fn controlled_raw_resource_keeps_provider_returned_bytes_and_rejects_legacy_cache() -> TestResult {
+    struct StaticBlob;
+    impl gix_object::Find for StaticBlob {
+        fn try_find<'a>(
+            &self,
+            _: &gix_hash::oid,
+            _: &'a mut Vec<u8>,
+        ) -> gix_error::Result<Option<gix_object::Data<'a>>> {
+            Ok(Some(gix_object::Data::new(
+                b"raw\n",
+                gix_object::Kind::Blob,
+                crate::fixture_hash_kind(),
+            )))
+        }
+    }
+    impl gix_object::FindHeader for StaticBlob {
+        fn try_header(&self, _: &gix_hash::oid) -> gix_error::Result<Option<gix_object::Header>> {
+            Ok(Some(gix_object::Header {
+                kind: gix_object::Kind::Blob,
+                size: 4,
+            }))
+        }
+    }
+    let db = object_db();
+    let id = insert(&db, "raw\n")?;
+    let mut platform = new_platform(None, pipeline::Mode::ToGit);
+    platform.filter.roots.old_root = None;
+    for kind in [ResourceKind::OldOrSource, ResourceKind::NewOrDestination] {
+        platform.set_resource_controlled_raw(id, EntryKind::Blob, "a".into(), kind, &StaticBlob, &mut |_| Ok(()))?;
+    }
+    let prepared = platform.prepare_diff()?;
+    assert_eq!(prepared.old.data.as_slice(), Some(b"raw\n".as_slice()));
+    assert_eq!(prepared.new.data.as_slice(), Some(b"raw\n".as_slice()));
+    platform.clear_controlled_raw(&mut |_| Err(gix_diff::blob::control::Cancelled));
+    assert!(
+        platform.prepare_diff().is_err(),
+        "cleanup must finish despite repeated cancellation"
+    );
+    platform.set_resource(id, EntryKind::Blob, "a".into(), ResourceKind::OldOrSource, &db)?;
+    assert!(
+        platform.validate_controlled_raw().is_err(),
+        "legacy conversion provenance is not raw provenance"
+    );
+    Ok(())
+}
+
+#[test]
 fn byte_lines_without_terminator() -> TestResult {
     let cases: &[(&[u8], &[&[u8]])] = &[
         (b"", &[]),
@@ -36,6 +153,73 @@ fn byte_lines_without_terminator() -> TestResult {
         assert_eq!(lines.next(), None, "the iterator remains exhausted");
         assert_eq!(lines.next(), None, "repeated calls remain exhausted");
     }
+    Ok(())
+}
+
+#[test]
+fn retaining_current_resources_reuses_the_pair_and_evicts_older_content() -> TestResult {
+    let mut platform = new_platform(None, pipeline::Mode::ToGit);
+    platform.filter.roots.old_root = None;
+    let db = object_db();
+    let first = insert(&db, "first\n")?;
+    let second = insert(&db, "second\n")?;
+    let third = insert(&db, "third\n")?;
+    let fourth = insert(&db, "fourth\n")?;
+    for (old, new) in [(first, second), (second, third)] {
+        platform.set_resource(old, EntryKind::Blob, "a".into(), ResourceKind::OldOrSource, &db)?;
+        platform.set_resource(new, EntryKind::Blob, "a".into(), ResourceKind::NewOrDestination, &db)?;
+    }
+    platform.retain_current_resources();
+    // A cache hit must still work when the immutable object store is unavailable.
+    // Both the old and new resource bytes must survive, not merely their keys.
+    platform.set_resource(
+        second,
+        EntryKind::Blob,
+        "a".into(),
+        ResourceKind::OldOrSource,
+        &gix_object::find::Never,
+    )?;
+    platform.set_resource(
+        third,
+        EntryKind::Blob,
+        "a".into(),
+        ResourceKind::NewOrDestination,
+        &gix_object::find::Never,
+    )?;
+    let outcome = platform.prepare_diff()?;
+    assert_eq!(outcome.old.data.as_slice(), Some(b"second\n".as_slice()));
+    assert_eq!(outcome.new.data.as_slice(), Some(b"third\n".as_slice()));
+    assert!(
+        platform
+            .set_resource(
+                first,
+                EntryKind::Blob,
+                "a".into(),
+                ResourceKind::NewOrDestination,
+                &gix_object::find::Never
+            )
+            .is_err(),
+        "an older resource must have been evicted"
+    );
+
+    platform.set_resource(fourth, EntryKind::Blob, "a".into(), ResourceKind::NewOrDestination, &db)?;
+    platform.retain_current_resources();
+    assert!(
+        platform
+            .set_resource(
+                third,
+                EntryKind::Blob,
+                "a".into(),
+                ResourceKind::NewOrDestination,
+                &gix_object::find::Never
+            )
+            .is_err(),
+        "the next retention must evict the superseded destination too"
+    );
+    assert!(
+        platform.clear_resource_cache_keep_allocation() <= 2,
+        "history retention must not grow the free-list"
+    );
     Ok(())
 }
 

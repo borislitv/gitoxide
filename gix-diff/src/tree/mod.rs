@@ -56,6 +56,18 @@ impl From<gix_error::Message> for Error {
 /// A trait to allow responding to a traversal designed to figure out the [changes](visit::Change)
 /// to turn tree A into tree B.
 pub trait Visit {
+    /// Check request-local control while traversing entries, including equal
+    /// entries that do not produce a change callback. Default preserves the
+    /// original uncontrolled API. Returning `Failure` distinguishes a work-check
+    /// failure from the delegate intentionally stopping after finding its target.
+    fn check(&mut self) -> Result<(), Error> {
+        Ok(())
+    }
+    /// Admit a conservative tree-queue backing size before its capacity grows.
+    /// Uncontrolled delegates retain the original allocation policy.
+    fn admit(&mut self, _bytes: usize) -> Result<(), Error> {
+        self.check()
+    }
     /// Sets the full path in front of the queue so future calls to push and pop components affect it instead.
     fn pop_front_tracked_path_and_set_current(&mut self);
     /// Append a `component` to the end of a path, which may be empty.
