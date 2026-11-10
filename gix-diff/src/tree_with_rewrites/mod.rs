@@ -20,3 +20,6 @@ pub struct Options {
 }
 
 pub(super) mod function;
+
+mod controlled;
+pub use controlled::diff_with_control;

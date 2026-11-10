@@ -108,6 +108,35 @@ impl<IndentOfToken: Fn(Token) -> IndentLevel> SliderHeuristic for IndentHeuristi
 pub struct IndentLevel(u8);
 
 impl IndentLevel {
+    /// Compute ASCII indentation with checks even for a line consisting of an
+    /// arbitrarily long run of CR or form-feed bytes (which do not increase indent).
+    pub fn try_for_ascii_line(
+        src: &[u8],
+        tab_width: u8,
+        check: &mut crate::control::Check<'_>,
+    ) -> Result<Self, crate::control::Cancelled> {
+        let mut level = IndentLevel(0);
+        let width = tab_width.max(1);
+        for (n, chunk) in src.chunks(crate::control::BYTE_CHUNK).enumerate() {
+            for &byte in chunk {
+                match byte {
+                    b' ' => level = level.increased_by(1),
+                    b'\t' => level = level.increased_by(width - level.0 % width),
+                    b'\r' | b'\n' | b'\x0C' => (),
+                    _ => return Ok(level),
+                }
+                if level >= Self::MAX {
+                    return Ok(Self::MAX);
+                }
+            }
+            crate::control::poll(
+                check,
+                crate::control::Stage::Postprocess,
+                n * crate::control::BYTE_CHUNK + chunk.len(),
+            )?;
+        }
+        Ok(Self::BLANK)
+    }
     /// Represents a line that is empty or contains only whitespace (or EOF).
     const BLANK: IndentLevel = IndentLevel(u8::MAX);
     /// The maximum trackable indentation level.

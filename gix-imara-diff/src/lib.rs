@@ -157,6 +157,8 @@ pub use intern::{InternedInput, Interner, Token, TokenSource};
 #[cfg(feature = "unified_diff")]
 pub use unified_diff::{BasicLineDiffPrinter, UnifiedDiff, UnifiedDiffConfig, UnifiedDiffPrinter};
 
+pub mod byte_input;
+pub mod control;
 mod histogram;
 mod intern;
 mod myers;
@@ -246,6 +248,122 @@ impl std::fmt::Debug for Diff {
 }
 
 impl Diff {
+    /// Collect all output hunks with checks in unchanged and changed runs. The
+    /// ordinary iterator cannot propagate errors, so this method returns only a
+    /// complete collection or cancellation, never a partially successful stream.
+    pub fn try_hunks(&self, check: &mut control::Check<'_>) -> Result<Vec<Hunk>, control::Cancelled> {
+        control::poll(check, control::Stage::Output, 0)?;
+        let (mut before, mut after) = (0, 0);
+        let mut result = Vec::new();
+        while before < self.removed.len() || after < self.added.len() {
+            let end_before = util::try_find_hunk_end(&self.removed, before as u32, check)? as usize;
+            let end_after = util::try_find_hunk_end(&self.added, after as u32, check)? as usize;
+            if end_before != before || end_after != after {
+                control::try_push(
+                    &mut result,
+                    Hunk {
+                        before: before as u32..end_before as u32,
+                        after: after as u32..end_after as u32,
+                    },
+                    check,
+                )?;
+            }
+            before = (end_before + 1).min(self.removed.len());
+            after = (end_after + 1).min(self.added.len());
+            control::poll(check, control::Stage::Output, before + after)?;
+        }
+        Ok(result)
+    }
+
+    /// Controlled line postprocessing with byte-safe indentation scans and no
+    /// partial output on error. The ASCII slider's search is limited to 100
+    /// positions and 20 context lines on each side, as in the original algorithm.
+    pub fn try_postprocess_lines<T: AsRef<[u8]>>(
+        self,
+        input: &InternedInput<T>,
+        check: &mut control::Check<'_>,
+    ) -> Result<Self, control::Cancelled> {
+        self.try_postprocess_lines_with(&input.before, &input.after, &input.interner, check)
+    }
+
+    /// Controlled line sliders over explicit views (for example, a shared-tail
+    /// trimmed view), while retaining the complete immutable token dictionary.
+    pub fn try_postprocess_lines_with<T: AsRef<[u8]>>(
+        self,
+        before: &[Token],
+        after: &[Token],
+        interner: &Interner<T>,
+        check: &mut control::Check<'_>,
+    ) -> Result<Self, control::Cancelled> {
+        let mut indents = Vec::new();
+        control::try_reserve(&mut indents, interner.num_tokens() as usize, check)?;
+        for id in 0..interner.num_tokens() {
+            indents.push(IndentLevel::try_for_ascii_line(interner[Token(id)].as_ref(), 8, check)?);
+            control::poll(check, control::Stage::Postprocess, id as usize + 1)?;
+        }
+        self.try_postprocess_with(
+            before,
+            after,
+            IndentHeuristic::new(|token: Token| indents[token.0 as usize]),
+            check,
+        )
+    }
+
+    /// Compute a complete diff with request-local fallible checks inside all
+    /// algorithms. The input must already contain numeric tokens; arbitrary
+    /// generic `Hash`/`Eq` callbacks are not made cancellable by this method.
+    /// Use [`byte_input::ByteInput`] for controlled byte-line preparation.
+    /// No partially computed `Diff` is returned on cancellation.
+    pub fn try_compute_with(
+        algorithm: Algorithm,
+        mut before: &[Token],
+        mut after: &[Token],
+        num_tokens: u32,
+        check: &mut control::Check<'_>,
+    ) -> Result<Self, control::Cancelled> {
+        assert!(before.len() < i32::MAX as usize && after.len() < i32::MAX as usize);
+        let mut diff = Self::default();
+        for (out, len) in [(&mut diff.removed, before.len()), (&mut diff.added, after.len())] {
+            control::try_reserve(out, len, check)?;
+            while out.len() < len {
+                out.resize((out.len() + 1024).min(len), false);
+                control::poll(check, control::Stage::Preprocess, out.len())?;
+            }
+        }
+        match algorithm {
+            Algorithm::Histogram => {
+                let prefix = util::try_common_prefix(before, after, check)? as usize;
+                before = &before[prefix..];
+                after = &after[prefix..];
+                let suffix = util::try_common_postfix(before, after, check)? as usize;
+                before = &before[..before.len() - suffix];
+                after = &after[..after.len() - suffix];
+                let removed_end = diff.removed.len() - suffix;
+                let added_end = diff.added.len() - suffix;
+                histogram::try_diff(
+                    before,
+                    after,
+                    &mut diff.removed[prefix..removed_end],
+                    &mut diff.added[prefix..added_end],
+                    num_tokens,
+                    check,
+                )?;
+            }
+            Algorithm::Myers | Algorithm::MyersMinimal => {
+                myers::try_diff(
+                    before,
+                    after,
+                    &mut diff.removed,
+                    &mut diff.added,
+                    algorithm == Algorithm::MyersMinimal,
+                    check,
+                )?;
+            }
+        }
+        control::poll(check, control::Stage::Output, diff.removed.len() + diff.added.len())?;
+        Ok(diff)
+    }
+
     /// Computes an edit-script that transforms `input.before` into `input.after` using
     /// the specified `algorithm`
     pub fn compute<T>(algorithm: Algorithm, input: &InternedInput<T>) -> Diff {

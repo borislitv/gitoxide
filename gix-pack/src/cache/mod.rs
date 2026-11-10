@@ -6,6 +6,47 @@ use gix_object::Kind;
 ///
 /// It is used to speed up [pack traversals][crate::index::File::traverse()].
 pub trait DecodeEntry {
+    /// Fetch with bounded copy checks. Unsupported caches safely behave as misses,
+    /// rather than invoking an uninterruptible legacy implementation.
+    fn get_controlled(
+        &mut self,
+        _pack_id: u32,
+        _offset: u64,
+        _out: &mut Vec<u8>,
+        _limit: usize,
+        check: &dyn Fn() -> gix_error::Result,
+    ) -> gix_error::Result<Option<(Kind, usize)>> {
+        check()?;
+        Ok(None)
+    }
+
+    /// Store with bounded copy checks. Unsupported caches skip the optional store.
+    fn put_controlled(
+        &mut self,
+        _pack_id: u32,
+        _offset: u64,
+        _data: &[u8],
+        _kind: Kind,
+        _compressed_size: usize,
+        check: &dyn Fn() -> gix_error::Result,
+    ) -> gix_error::Result {
+        check()
+    }
+
+    /// Whether single-delta decoding should append validated chunks instead of zero-initializing the result.
+    fn append_output(&self) -> bool {
+        false
+    }
+    /// Whether successfully decoded intermediate delta bases should also be cached.
+    fn cache_intermediate_objects(&self) -> bool {
+        false
+    }
+    /// Borrow decoded bytes for a cached object without copying them into an output buffer.
+    ///
+    /// Implementations that do not support borrowing return `None`, allowing callers to fall back to [`Self::get()`].
+    fn get_borrowed(&mut self, _pack_id: u32, _offset: u64) -> Option<(gix_object::Kind, &[u8])> {
+        None
+    }
     /// Store a fully decoded object at `offset` of `kind` with `compressed_size` and `data` in the cache.
     ///
     /// It is up to the cache implementation whether that actually happens or not.
@@ -27,6 +68,41 @@ impl DecodeEntry for Never {
 }
 
 impl<T: DecodeEntry + ?Sized> DecodeEntry for Box<T> {
+    fn get_controlled(
+        &mut self,
+        pack_id: u32,
+        offset: u64,
+        out: &mut Vec<u8>,
+        limit: usize,
+        check: &dyn Fn() -> gix_error::Result,
+    ) -> gix_error::Result<Option<(Kind, usize)>> {
+        (**self).get_controlled(pack_id, offset, out, limit, check)
+    }
+
+    fn put_controlled(
+        &mut self,
+        pack_id: u32,
+        offset: u64,
+        data: &[u8],
+        kind: Kind,
+        compressed_size: usize,
+        check: &dyn Fn() -> gix_error::Result,
+    ) -> gix_error::Result {
+        (**self).put_controlled(pack_id, offset, data, kind, compressed_size, check)
+    }
+
+    fn append_output(&self) -> bool {
+        (**self).append_output()
+    }
+
+    fn cache_intermediate_objects(&self) -> bool {
+        (**self).cache_intermediate_objects()
+    }
+
+    fn get_borrowed(&mut self, pack_id: u32, offset: u64) -> Option<(Kind, &[u8])> {
+        self.deref_mut().get_borrowed(pack_id, offset)
+    }
+
     fn put(&mut self, pack_id: u32, offset: u64, data: &[u8], kind: Kind, compressed_size: usize) {
         self.deref_mut().put(pack_id, offset, data, kind, compressed_size);
     }

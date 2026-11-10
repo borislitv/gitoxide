@@ -46,6 +46,7 @@ where
     let mut pop_path = false;
 
     loop {
+        delegate.check()?;
         if pop_path {
             delegate.pop_path_component();
         }
@@ -70,7 +71,9 @@ where
                         lhs_entries = peekable(objects.find_tree_iter(&lhs, &mut state.buf1)?);
                         relation = relation_to_propagate;
                     }
-                    Some((None, None, _)) => unreachable!("BUG: it makes no sense to fill the stack with empties"),
+                    Some((None, None, _)) => {
+                        unreachable!("BUG: it makes no sense to fill the stack with empties")
+                    }
                     None => return Ok(()),
                 }
                 pop_path = false;
@@ -78,7 +81,7 @@ where
             (Some(lhs), Some(rhs)) => {
                 use std::cmp::Ordering::*;
                 let (lhs, rhs) = (lhs?, rhs?);
-                match compare(&lhs, &rhs) {
+                match compare_with_control(&lhs, &rhs, delegate)? {
                     Equal => handle_lhs_and_rhs_with_equal_filenames(
                         lhs,
                         rhs,
@@ -119,8 +122,43 @@ where
     }
 }
 
+#[cfg(test)]
 fn compare(a: &EntryRef<'_>, b: &EntryRef<'_>) -> std::cmp::Ordering {
     gix_object::tree::name_order(a.filename, a.mode.is_tree(), b.filename, b.mode.is_tree())
+}
+
+fn compare_with_control(
+    a: &EntryRef<'_>,
+    b: &EntryRef<'_>,
+    delegate: &mut impl Visit,
+) -> Result<std::cmp::Ordering, Error> {
+    let common = a.filename.len().min(b.filename.len());
+    for (a, b) in a.filename[..common].chunks(4096).zip(b.filename[..common].chunks(4096)) {
+        let order = a.cmp(b);
+        delegate.check()?;
+        if !order.is_eq() {
+            return Ok(order);
+        }
+    }
+    Ok(gix_object::tree::name_order(
+        &a.filename[common..],
+        a.mode.is_tree(),
+        &b.filename[common..],
+        b.mode.is_tree(),
+    ))
+}
+
+fn enqueue(queue: &mut VecDeque<TreeInfoTuple>, item: TreeInfoTuple, delegate: &mut impl Visit) -> Result<(), Error> {
+    delegate.check()?;
+    if queue.len() == queue.capacity() {
+        let capacity = queue.capacity().saturating_mul(2).max(8);
+        delegate.admit(capacity.saturating_mul(std::mem::size_of::<TreeInfoTuple>()))?;
+        queue
+            .try_reserve_exact(capacity - queue.len())
+            .map_err(|_| gix_error::message("tree diff queue allocation failed"))?;
+    }
+    queue.push_back(item);
+    Ok(())
 }
 
 fn delete_entry_schedule_recursion(
@@ -150,7 +188,7 @@ fn delete_entry_schedule_recursion(
     if entry.mode.is_tree() {
         delegate.pop_path_component();
         delegate.push_back_tracked_path_component(entry.filename);
-        queue.push_back((Some(entry.oid.to_owned()), None, to_child(relation)));
+        enqueue(queue, (Some(entry.oid.to_owned()), None, to_child(relation)), delegate)?;
     }
     Ok(())
 }
@@ -182,7 +220,7 @@ fn add_entry_schedule_recursion(
     if entry.mode.is_tree() {
         delegate.pop_path_component();
         delegate.push_back_tracked_path_component(entry.filename);
-        queue.push_back((None, Some(entry.oid.to_owned()), to_child(relation)));
+        enqueue(queue, (None, Some(entry.oid.to_owned()), to_child(relation)), delegate)?;
     }
     Ok(())
 }
@@ -199,8 +237,9 @@ fn catchup_rhs_with_lhs(
     use std::cmp::Ordering::*;
     add_entry_schedule_recursion(rhs, queue, change_id, relation_to_propagate, delegate)?;
     loop {
+        delegate.check()?;
         match rhs_entries.peek() {
-            Some(Ok(rhs)) => match compare(&lhs, rhs) {
+            Some(Ok(rhs)) => match compare_with_control(&lhs, rhs, delegate)? {
                 Equal => {
                     let rhs = rhs_entries.next().transpose()?.expect("the peeked item to be present");
                     delegate.pop_path_component();
@@ -253,8 +292,9 @@ fn catchup_lhs_with_rhs(
     use std::cmp::Ordering::*;
     delete_entry_schedule_recursion(lhs, queue, change_id, relation_to_propagate, delegate)?;
     loop {
+        delegate.check()?;
         match lhs_entries.peek() {
-            Some(Ok(lhs)) => match compare(lhs, &rhs) {
+            Some(Ok(lhs)) => match compare_with_control(lhs, &rhs, delegate)? {
                 Equal => {
                     let lhs = lhs_entries.next().expect("the peeked item to be present")?;
                     delegate.pop_path_component();
@@ -323,11 +363,15 @@ fn handle_lhs_and_rhs_with_equal_filenames(
                 {
                     return Err(Error::Cancelled);
                 }
-                queue.push_back((
-                    Some(lhs.oid.to_owned()),
-                    Some(rhs.oid.to_owned()),
-                    relation_to_propagate,
-                ));
+                enqueue(
+                    queue,
+                    (
+                        Some(lhs.oid.to_owned()),
+                        Some(rhs.oid.to_owned()),
+                        relation_to_propagate,
+                    ),
+                    delegate,
+                )?;
             }
         }
         (_, true) => {
@@ -357,7 +401,7 @@ fn handle_lhs_and_rhs_with_equal_filenames(
             {
                 return Err(Error::Cancelled);
             }
-            queue.push_back((None, Some(rhs.oid.to_owned()), to_child(relation)));
+            enqueue(queue, (None, Some(rhs.oid.to_owned()), to_child(relation)), delegate)?;
         }
         (true, _) => {
             delegate.push_back_tracked_path_component(lhs.filename);
@@ -385,7 +429,7 @@ fn handle_lhs_and_rhs_with_equal_filenames(
             {
                 return Err(Error::Cancelled);
             }
-            queue.push_back((Some(lhs.oid.to_owned()), None, to_child(relation)));
+            enqueue(queue, (Some(lhs.oid.to_owned()), None, to_child(relation)), delegate)?;
         }
         (false, false) => {
             delegate.push_path_component(lhs.filename);

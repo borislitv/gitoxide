@@ -1,8 +1,9 @@
 //! Compression state and a [`std::io::Write`] adapter for producing zlib streams.
 
 use crate::{Compression, Status};
-use gix_error::{ErrorExt, ResourceExhaustionKind, message};
+use gix_error::{ErrorExt, ResourceExhaustionKind, ResultExt, message};
 use gix_error::{Result, resource_exhaustion};
+use std::io::Write as _;
 use zlib_rs::DeflateError;
 
 const BUF_SIZE: usize = 4096 * 8;
@@ -35,6 +36,50 @@ where
 pub struct Compress(zlib_rs::Deflate);
 
 impl Compress {
+    /// Compress a complete stream with bounded input/output work between checks.
+    /// The caller's sink must enforce its own I/O deadline and memory admission.
+    /// No successful result is returned until the zlib trailer has been written.
+    pub fn write_all_controlled(
+        &mut self,
+        input: &[u8],
+        output: &mut impl std::io::Write,
+        check: &dyn Fn() -> Result,
+    ) -> Result {
+        self.reset();
+        let mut output = crate::stream::ControlledWrite::new(output, check);
+        let mut position = 0;
+        let mut buffer = [0; BUF_SIZE];
+        loop {
+            check()?;
+            let end = input.len().min(position + BUF_SIZE);
+            let flush = if end == input.len() {
+                FlushCompress::Finish
+            } else {
+                FlushCompress::None
+            };
+            let before_in = self.total_in();
+            let before_out = self.total_out();
+            let status = self.compress(&input[position..end], &mut buffer, flush)?;
+            let consumed = (self.total_in() - before_in) as usize;
+            let produced = (self.total_out() - before_out) as usize;
+            position += consumed;
+            check()?;
+            output
+                .write_all(&buffer[..produced])
+                .or_raise(|| message("Could not write compressed stream"))?;
+            check()?;
+            if status == Status::StreamEnd {
+                if position != input.len() {
+                    return Err(message("Deflate stopped before consuming input").into());
+                }
+                return Ok(());
+            }
+            if consumed == 0 && produced == 0 {
+                return Err(message("Deflate made no progress").into());
+            }
+        }
+    }
+
     /// The number of bytes that were read from the input.
     pub fn total_in(&self) -> u64 {
         self.0.total_in()
@@ -179,7 +224,9 @@ mod impls {
                 }
 
                 match status {
-                    Status::StreamEnd => return Ok((self.compressor.total_in() - total_in_when_start) as usize),
+                    Status::StreamEnd => {
+                        return Ok((self.compressor.total_in() - total_in_when_start) as usize);
+                    }
                     Status::Ok | Status::BufError => {
                         let consumed = self.compressor.total_in() - last_total_in;
                         buf = &buf[consumed as usize..];

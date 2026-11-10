@@ -115,6 +115,20 @@ fn is_sclass_max_length(len: u32) -> bool {
 }
 
 impl ListPool {
+    /// A list push can allocate at most one block, bounded by MAX_CHAIN_LEN.
+    /// Reserve before the infallible fixed-size pool operation is invoked.
+    pub(super) fn try_reserve_push(
+        &mut self,
+        check: &mut crate::control::Check<'_>,
+    ) -> Result<(), crate::control::Cancelled> {
+        let required = self.data.len().saturating_add(2 * super::MAX_CHAIN_LEN as usize);
+        if required > self.data.capacity() {
+            let target = required.max(self.data.capacity().saturating_mul(2));
+            let additional = target - self.data.len();
+            crate::control::try_reserve(&mut self.data, additional, check)?;
+        }
+        Ok(())
+    }
     /// Create a new list pool.
     pub fn new(capacity: u32) -> Self {
         Self {

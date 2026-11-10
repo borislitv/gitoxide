@@ -10,6 +10,41 @@ use crate::{data, data::output, find};
 pub mod iter_from_counts;
 pub use iter_from_counts::function::iter_from_counts;
 
+/// Generate controlled base entries lazily without sorting or nested workers.
+/// The provider must enforce the same request's limits/checks on object lookup.
+/// Unlike the legacy optimizing iterator this does not copy existing packed
+/// deltas; it emits equivalent full objects, one bounded entry per iteration.
+pub fn iter_from_counts_controlled<'a, Find: gix_object::Find, Counts>(
+    counts: Counts,
+    db: &'a Find,
+    compression: gix_zlib::Compression,
+    max_compressed_bytes: usize,
+    check: &'a dyn Fn() -> Result,
+) -> impl Iterator<Item = Result<Vec<output::Entry>>> + 'a
+where
+    Counts: IntoIterator<Item = output::Count>,
+    Counts::IntoIter: 'a,
+{
+    let mut buffer = Vec::new();
+    let mut failed = false;
+    counts.into_iter().scan((), move |_, count| {
+        if failed {
+            return None;
+        }
+        let result = (|| {
+            check()?;
+            let obj = db
+                .try_find(&count.id, &mut buffer)?
+                .ok_or_else(|| gix_error::Error::from(gix_error::not_found("Object missing while generating pack")))?;
+            check()?;
+            let entry = output::Entry::from_data_controlled(&count, &obj, compression, max_compressed_bytes, check)?;
+            Ok(vec![entry])
+        })();
+        failed = result.is_err();
+        Some(result)
+    })
+}
+
 /// The kind of pack entry to be written
 #[derive(PartialEq, Eq, Debug, Hash, Ord, PartialOrd, Clone, Copy)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -34,6 +69,51 @@ pub enum Kind {
 }
 
 impl output::Entry {
+    /// Encode a base object with request-local checks inside compression. The
+    /// compressed buffer cannot exceed `max_compressed_bytes`. Object data is
+    /// borrowed; its allocation and lifetime remain owned by the caller.
+    pub fn from_data_controlled(
+        count: &output::Count,
+        obj: &gix_object::Data<'_>,
+        compression: gix_zlib::Compression,
+        max_compressed_bytes: usize,
+        check: &dyn Fn() -> Result,
+    ) -> Result<Self> {
+        struct BoundedOutput {
+            data: Vec<u8>,
+            limit: usize,
+        }
+        impl std::io::Write for BoundedOutput {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if bytes.len() > self.limit.saturating_sub(self.data.len()) {
+                    return Err(std::io::Error::other("Compressed pack entry exceeds output limit"));
+                }
+                self.data
+                    .try_reserve_exact(bytes.len())
+                    .map_err(std::io::Error::other)?;
+                self.data.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        check()?;
+        let mut out = BoundedOutput {
+            data: Vec::new(),
+            limit: max_compressed_bytes,
+        };
+        let mut compressor = gix_zlib::stream::deflate::Compress::new(compression);
+        compressor.write_all_controlled(obj.data, &mut out, check)?;
+        check()?;
+        Ok(Self {
+            id: count.id.to_owned(),
+            kind: Kind::Base(obj.kind),
+            decompressed_size: obj.data.len(),
+            compressed_data: out.data,
+        })
+    }
+
     /// An object which can be identified as invalid easily which happens if objects didn't exist even if they were referred to.
     pub fn invalid() -> output::Entry {
         output::Entry {

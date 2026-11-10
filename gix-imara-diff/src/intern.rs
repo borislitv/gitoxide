@@ -1,6 +1,7 @@
 // Modified for gitoxide from the upstream imara-diff crate.
 // Upstream source: git cat-file -p 32d1e45d3df061e6ccba6db7fdce92db29e345d8:src/intern.rs
 
+use std::borrow::Borrow;
 use std::hash::{BuildHasher as _, Hash};
 use std::ops::Index;
 
@@ -158,9 +159,26 @@ pub struct Interner<T> {
     tokens: Vec<T>,
     table: HashTable<Token>,
     hasher: RandomState,
+    // Separate byte-only index: cached hashes avoid calling generic Hash/Eq in
+    // checked numeric rehashes. Generic operations use their own legacy table.
+    byte_index: crate::byte_input::ByteIndex,
+    byte_indexed: usize,
 }
 
 impl<T> Interner<T> {
+    /// Clear owned token allocations in bounded batches. Controlled byte
+    /// insertion never populates the legacy generic hash table; callers mixing
+    /// generic insertion must not claim that table's cleanup is controlled.
+    pub fn clear_with_control(&mut self, check: &mut crate::control::Check<'_>) {
+        crate::control::clear_with(&mut self.tokens, check);
+        self.byte_index.clear();
+        let _ = check(crate::control::Checkpoint {
+            stage: crate::control::Stage::Cleanup,
+            processed: 0,
+        });
+        self.byte_indexed = 0;
+        self.table.clear();
+    }
     /// Create an Interner with an initial capacity calculated by summing the results of calling
     /// [`estimate_tokens`](TokenSource::estimate_tokens) methods of `before` and `after`.
     pub fn new_for_token_source<S: TokenSource<Token = T>>(before: &S, after: &S) -> Self {
@@ -173,11 +191,15 @@ impl<T> Interner<T> {
             tokens: Vec::with_capacity(capacity),
             table: HashTable::with_capacity(capacity),
             hasher: RandomState::default(),
+            byte_index: Default::default(),
+            byte_indexed: 0,
         }
     }
 
     /// Remove all interned tokens.
     pub fn clear(&mut self) {
+        self.byte_index.clear();
+        self.byte_indexed = 0;
         self.table.clear();
         self.tokens.clear();
     }
@@ -189,6 +211,45 @@ impl<T> Interner<T> {
 }
 
 impl<T: Hash + Eq> Interner<T> {
+    // Generic operations are intentionally uncontrolled. If byte insertion was
+    // used, materialize their ordinary hash table only on this explicit path.
+    fn sync_generic_table(&mut self) {
+        if self.table.len() != self.tokens.len() {
+            self.table.clear();
+            for (i, token) in self.tokens.iter().enumerate() {
+                self.table
+                    .insert_unique(self.hasher.hash_one(token), Token(i as u32), |&t| {
+                        self.hasher.hash_one(&self.tokens[t.0 as usize])
+                    });
+            }
+        }
+    }
+    /// Intern a borrowed token, acquiring ownership only when it is new.
+    ///
+    /// The borrowed and owned forms must have matching hash and equality
+    /// implementations, as required by [`Borrow`].
+    pub fn intern_ref<Q>(&mut self, token: &Q) -> Token
+    where
+        T: Borrow<Q>,
+        Q: Hash + Eq + ToOwned<Owned = T> + ?Sized,
+    {
+        self.sync_generic_table();
+        let hash = self.hasher.hash_one(token);
+        match self.table.entry(
+            hash,
+            |&it| self.tokens[it.0 as usize].borrow() == token,
+            |&it| self.hasher.hash_one(&self.tokens[it.0 as usize]),
+        ) {
+            Entry::Occupied(entry) => *entry.get(),
+            Entry::Vacant(entry) => {
+                let interned = Token(self.tokens.len() as u32);
+                entry.insert(interned);
+                self.tokens.push(token.to_owned());
+                interned
+            }
+        }
+    }
+
     /// Create an Interner with an initial capacity calculated by calling
     /// [`estimate_tokens`](TokenSource::estimate_tokens) methods of `before` and `after`
     pub fn reserve_for_token_source<S: TokenSource<Token = T>>(&mut self, before: &S, after: &S) {
@@ -201,6 +262,7 @@ impl<T: Hash + Eq> Interner<T> {
     ///
     /// * `capacity` - The number of additional tokens to reserve space for
     pub fn reserve(&mut self, capacity: usize) {
+        self.sync_generic_table();
         self.table
             .reserve(capacity, |&token| self.hasher.hash_one(&self.tokens[token.0 as usize]));
         self.tokens.reserve(capacity);
@@ -208,6 +270,7 @@ impl<T: Hash + Eq> Interner<T> {
 
     /// Intern `token` and return the interned integer.
     pub fn intern(&mut self, token: T) -> Token {
+        self.sync_generic_table();
         let hash = self.hasher.hash_one(&token);
         match self.table.entry(
             hash,
@@ -226,6 +289,9 @@ impl<T: Hash + Eq> Interner<T> {
 
     /// Erases `first_erased_token` and any tokens interned afterward from the interner.
     pub fn erase_tokens_after(&mut self, first_erased_token: Token) {
+        self.sync_generic_table();
+        self.byte_index.clear();
+        self.byte_indexed = 0;
         assert!(first_erased_token.0 <= self.tokens.len() as u32);
         let retained = first_erased_token.0 as usize;
         let erased = self.tokens.len() - retained;
@@ -254,5 +320,29 @@ impl<T> Index<Token> for Interner<T> {
     type Output = T;
     fn index(&self, index: Token) -> &Self::Output {
         &self.tokens[index.0 as usize]
+    }
+}
+
+impl Interner<Vec<u8>> {
+    /// Intern bytes with checks inside hashing, collision equality and ownership
+    /// copies. Unlike `intern_ref`, no generic Hash/Eq/ToOwned callback is used.
+    /// A cancelled insertion does not publish a new token. Existing generic
+    /// tokens are indexed incrementally, also using controlled byte hashes.
+    pub fn try_intern_bytes(
+        &mut self,
+        bytes: &[u8],
+        check: &mut crate::control::Check<'_>,
+    ) -> Result<Token, crate::control::Cancelled> {
+        while self.byte_indexed < self.tokens.len() {
+            let id = self.byte_indexed;
+            let hash = crate::byte_input::hash_bytes(&self.tokens[id], check)?;
+            self.byte_index.prepare(check)?;
+            self.byte_index.insert_prepared(hash, id as u32);
+            self.byte_indexed += 1;
+            crate::control::poll(check, crate::control::Stage::Hash, 0)?;
+        }
+        let token = crate::byte_input::intern(bytes, &mut self.tokens, &mut self.byte_index, check)?;
+        self.byte_indexed = self.tokens.len();
+        Ok(token)
     }
 }

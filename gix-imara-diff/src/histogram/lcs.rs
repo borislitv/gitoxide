@@ -1,20 +1,26 @@
 // Modified for gitoxide from the upstream imara-diff crate.
 // Upstream source: git cat-file -p 32d1e45d3df061e6ccba6db7fdce92db29e345d8:src/histogram/lcs.rs
 
+use crate::control::{Cancelled, Check, Stage, poll};
 use crate::histogram::{Histogram, MAX_CHAIN_LEN};
 use crate::intern::Token;
 
 /// Finds the longest common subsequence (LCS) using a histogram-based approach.
 ///
 /// Returns `None` if the sequences are highly repetitive and should fall back to Myers.
-pub(super) fn find_lcs(before: &[Token], after: &[Token], histogram: &mut Histogram) -> Option<Lcs> {
+pub(super) fn find_lcs(
+    before: &[Token],
+    after: &[Token],
+    histogram: &mut Histogram,
+    check: &mut Check<'_>,
+) -> Result<Option<Lcs>, Cancelled> {
     let mut search = LcsSearch {
         lcs: Lcs::default(),
         min_occurrences: MAX_CHAIN_LEN + 1,
         found_cs: false,
     };
-    search.run(before, after, histogram);
-    if search.success() { Some(search.lcs) } else { None }
+    search.run(before, after, histogram, check)?;
+    Ok(if search.success() { Some(search.lcs) } else { None })
 }
 
 /// Represents a longest common subsequence found by the histogram algorithm.
@@ -39,13 +45,20 @@ pub struct LcsSearch {
 }
 
 impl LcsSearch {
-    fn run(&mut self, before: &[Token], after: &[Token], histogram: &mut Histogram) {
+    fn run(
+        &mut self,
+        before: &[Token],
+        after: &[Token],
+        histogram: &mut Histogram,
+        check: &mut Check<'_>,
+    ) -> Result<(), Cancelled> {
         let mut pos = 0;
         while let Some(&token) = after.get(pos as usize) {
+            poll(check, Stage::Preprocess, pos as usize)?;
             if histogram.num_token_occurrences(token) != 0 {
                 self.found_cs = true;
                 if histogram.num_token_occurrences(token) <= self.min_occurrences {
-                    pos = self.update_lcs(pos, token, histogram, before, after);
+                    pos = self.update_lcs(pos, token, histogram, before, after, check)?;
                     continue;
                 }
             }
@@ -54,6 +67,7 @@ impl LcsSearch {
         }
 
         histogram.clear();
+        Ok(())
     }
 
     fn success(&mut self) -> bool {
@@ -67,16 +81,19 @@ impl LcsSearch {
         histogram: &Histogram,
         before: &[Token],
         after: &[Token],
-    ) -> u32 {
+        check: &mut Check<'_>,
+    ) -> Result<u32, Cancelled> {
         let mut next_token_idx2 = after_pos + 1;
         let mut occurrences_iter = histogram.token_occurrences(token).iter().copied();
         let mut token_idx1 = occurrences_iter.next().unwrap();
 
         'occurrences_iter: loop {
+            poll(check, Stage::Common, token_idx1 as usize)?;
             let mut occurrences = histogram.num_token_occurrences(token);
             let mut start1 = token_idx1;
             let mut start2 = after_pos;
             loop {
+                poll(check, Stage::Common, start1 as usize)?;
                 if start1 == 0 || start2 == 0 {
                     break;
                 }
@@ -95,6 +112,7 @@ impl LcsSearch {
             let mut end1 = token_idx1 + 1;
             let mut end2 = after_pos + 1;
             loop {
+                poll(check, Stage::Common, end1 as usize)?;
                 let token1 = before.get(end1 as usize);
                 let token2 = after.get(end2 as usize);
                 if matches!((token1, token2), (Some(token1), Some(token2)) if token1 == token2) {
@@ -134,6 +152,6 @@ impl LcsSearch {
             }
         }
 
-        next_token_idx2
+        Ok(next_token_idx2)
     }
 }

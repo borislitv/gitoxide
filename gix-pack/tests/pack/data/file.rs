@@ -138,7 +138,10 @@ mod method {
 mod decode_entry {
     use bstr::ByteSlice;
     use gix_error::Result;
-    use gix_pack::{cache, data::decode::entry::ResolvedBase};
+    use gix_pack::{
+        cache,
+        data::{self, decode::entry::ResolvedBase},
+    };
 
     use crate::{SMALL_PACK, data::file::pack_at, fixture_path, fixup};
 
@@ -185,6 +188,323 @@ mod decode_entry {
             buf.as_bstr(),
             content_of("objects/f139391424a8c623adadf2388caec73e5e90865b.txt").as_bstr()
         );
+    }
+
+    #[test]
+    fn intermediate_cache_reuses_a_shared_base_without_changing_sibling_bytes() -> gix_testtools::TestResult {
+        // Native verify-pack identifies offsets 3033 and 3094 as two-link
+        // siblings whose shared, one-link base is at offset 3009.
+        for retain_intermediates in [false, true] {
+            let pack = pack_at(SMALL_PACK);
+            let mut cache = cache::lru::MemoryCappedHashmap::new(16 * 1024);
+            if retain_intermediates {
+                cache = cache.with_intermediate_objects();
+            }
+            let mut buffer = Vec::new();
+            let mut inflate = Default::default();
+            for (offset, expected_id, expected_deltas) in [
+                (3033, "b8aa61be84b78d7fcff788e8d844406cc97132bf", 2),
+                (
+                    3094,
+                    "56e9f55deff1ffc20cf0cc66b866cba6b6886577",
+                    if retain_intermediates { 1 } else { 2 },
+                ),
+            ] {
+                let outcome = pack.decode_entry(
+                    pack.entry(offset)?,
+                    &mut buffer,
+                    &mut inflate,
+                    &|_, _| Ok(None),
+                    &mut cache,
+                )?;
+                assert_eq!(
+                    gix_object::compute_hash(gix_hash::Kind::Sha1, gix_object::Kind::Blob, &buffer)?,
+                    gix_hash::ObjectId::from_hex(expected_id.as_bytes())?,
+                    "cached bases must preserve the object identity reported by native verify-pack"
+                );
+                assert_eq!(
+                    outcome.num_deltas, expected_deltas,
+                    "the second sibling must reuse the decoded shared base only in the enabled mode"
+                );
+                assert_eq!(outcome.kind, gix_object::Kind::Blob);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn borrowed_cached_base_avoids_a_second_full_object_buffer() -> gix_testtools::TestResult {
+        // Native verify-pack identifies the one-link base at 3009 and its
+        // siblings at 3033 and 3094. Native cat-file reports an 847-byte base.
+        // A 1024-byte cap fits either base or result,
+        // but not the original decoder's two full-size working buffers.
+        for (borrow_cached_base, append_output, limit) in [
+            (false, false, 1024),
+            (true, false, 0),
+            (true, false, 846),
+            (true, false, 847),
+            (true, false, 1024),
+            (true, true, 0),
+            (true, true, 846),
+            (true, true, 847),
+            (true, true, 1024),
+        ] {
+            for (offset, expected_id) in [
+                (3033, "b8aa61be84b78d7fcff788e8d844406cc97132bf"),
+                (3094, "56e9f55deff1ffc20cf0cc66b866cba6b6886577"),
+            ] {
+                let pack = pack_at(SMALL_PACK);
+                let mut lru = cache::lru::MemoryCappedHashmap::new(16 * 1024);
+                if borrow_cached_base {
+                    lru = lru.with_borrowed_objects();
+                }
+                if append_output {
+                    lru = lru.with_appended_output();
+                }
+                let mut cache: Box<dyn cache::DecodeEntry> = Box::new(lru);
+                let mut base = Vec::new();
+                let mut inflate = Default::default();
+                pack.decode_entry(pack.entry(3009)?, &mut base, &mut inflate, &|_, _| Ok(None), &mut cache)?;
+                assert_eq!(
+                    gix_object::compute_hash(gix_hash::Kind::Sha1, gix_object::Kind::Blob, &base)?,
+                    gix_hash::ObjectId::from_hex(b"e0dc2c78d3bd3d14d20906ad7905a32f0f0918a8")?,
+                    "the unlimited decode must seed the native shared base"
+                );
+
+                assert_eq!(base.len(), 847, "the seeded base has the native expanded size");
+                let pack = pack.with_alloc_limit_bytes(Some(limit));
+                let mut buffer = Vec::new();
+                let result = pack.decode_entry(
+                    pack.entry(offset)?,
+                    &mut buffer,
+                    &mut inflate,
+                    &|_, _| Ok(None),
+                    &mut cache,
+                );
+                if !borrow_cached_base || limit < 847 {
+                    let err = result.expect_err("the decoder enforces both base-size and working-buffer caps");
+                    assert_eq!(
+                        err.classify().find_map(|classification| match classification.class() {
+                            gix_error::Class::ResourceExhaustion(kind) => Some(kind),
+                            _ => None,
+                        }),
+                        Some(gix_error::ResourceExhaustionKind::AllocationLimit)
+                    );
+                    continue;
+                }
+                let outcome = result?;
+                assert_eq!(outcome.num_deltas, 1, "the cached base cuts both sibling chains short");
+                assert_eq!(outcome.kind, gix_object::Kind::Blob);
+                assert!(
+                    buffer.capacity() <= limit,
+                    "the decoder respects the configured allocation cap"
+                );
+                assert_eq!(
+                    gix_object::compute_hash(gix_hash::Kind::Sha1, outcome.kind, &buffer)?,
+                    gix_hash::ObjectId::from_hex(expected_id.as_bytes())?,
+                    "borrowing the base must retain the native object identity"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn borrowed_cached_base_rejects_corruption_before_caching_the_result() -> gix_testtools::TestResult {
+        let native = pack_at(SMALL_PACK);
+        let entry = native.entry(3033)?;
+        let mut original_delta = vec![0; entry.decompressed_size as usize];
+        native.decompress_entry(&entry, &mut Default::default(), &mut original_delta)?;
+
+        for (scenario, append_output) in [
+            "short-stream",
+            "long-stream",
+            "wrong-base",
+            "truncated-copy",
+            "combined-cap",
+            "missing-base-size",
+            "missing-result-size",
+        ]
+        .into_iter()
+        .flat_map(|scenario| [false, true].map(move |append_output| (scenario, append_output)))
+        {
+            let mut delta = original_delta.clone();
+            let mut declared_size = delta.len() as u64;
+            let mut limit = 1024;
+            let expected_message = match scenario {
+                "short-stream" => {
+                    declared_size += 1;
+                    "decompressed size does not match entry header"
+                }
+                "long-stream" => {
+                    declared_size -= 1;
+                    "decompressed size does not match entry header"
+                }
+                "wrong-base" => {
+                    delta[0] ^= 1;
+                    "delta base size does not match base object size"
+                }
+                "truncated-copy" => {
+                    delta.pop();
+                    declared_size -= 1;
+                    "delta copy instruction is truncated"
+                }
+                "combined-cap" => {
+                    // The native base is 847 bytes. Declaring an equally large
+                    // result fits individually, but result + instructions do not.
+                    delta.copy_within(..2, 2);
+                    limit = 847;
+                    "Entry too large to fit in memory"
+                }
+                "missing-base-size" => {
+                    delta.clear();
+                    declared_size = 0;
+                    "delta header size is truncated"
+                }
+                "missing-result-size" => {
+                    delta.truncate(2);
+                    declared_size = 2;
+                    "delta header size is truncated"
+                }
+                _ => unreachable!("all scenarios are enumerated above"),
+            };
+            let damaged = pack_with_replaced_sibling_delta(&delta, declared_size)?;
+            let mut lru = cache::lru::MemoryCappedHashmap::new(16 * 1024).with_borrowed_objects();
+            if append_output {
+                lru = lru.with_appended_output();
+            }
+            let mut cache: Box<dyn cache::DecodeEntry> = Box::new(lru);
+            let mut buffer = Vec::new();
+            let mut inflate = Default::default();
+            damaged.decode_entry(
+                damaged.entry(3009)?,
+                &mut buffer,
+                &mut inflate,
+                &|_, _| Ok(None),
+                &mut cache,
+            )?;
+            let damaged = damaged.with_alloc_limit_bytes(Some(limit));
+            let mut result = vec![0xa5; limit];
+            let err = damaged
+                .decode_entry(
+                    damaged.entry(3033)?,
+                    &mut result,
+                    &mut inflate,
+                    &|_, _| Ok(None),
+                    &mut cache,
+                )
+                .expect_err("malformed deltas must not produce a cached object");
+            assert!(err.to_string().contains(expected_message), "{scenario}: {err}");
+            assert!(
+                result.capacity() <= limit,
+                "{scenario}: no allocation may bypass the cap"
+            );
+            if scenario == "combined-cap" {
+                assert!(err.classify().any(|classification| classification.class()
+                    == gix_error::Class::ResourceExhaustion(gix_error::ResourceExhaustionKind::AllocationLimit)));
+            } else {
+                assert!(
+                    err.is_corrupted(),
+                    "{scenario}: the malformed delta remains classified as corruption"
+                );
+            }
+
+            let clean = data::File::from_data(
+                std::fs::read(fixture_path(SMALL_PACK))?,
+                "borrowed-base-validation.pack".into(),
+                gix_hash::Kind::Sha1,
+            )?
+            .with_alloc_limit_bytes(Some(1024));
+            let outcome = clean.decode_entry(
+                clean.entry(3033)?,
+                &mut result,
+                &mut inflate,
+                &|_, _| Ok(None),
+                &mut cache,
+            )?;
+            assert_eq!(
+                outcome.num_deltas, 1,
+                "{scenario}: an error must not cache the target entry"
+            );
+            assert_eq!(
+                gix_object::compute_hash(gix_hash::Kind::Sha1, outcome.kind, &result)?,
+                gix_hash::ObjectId::from_hex(b"b8aa61be84b78d7fcff788e8d844406cc97132bf")?,
+                "{scenario}: the same cache remains usable for a valid native object"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn reused_buffers_preserve_native_siblings_and_weighted_lru_boundaries() -> gix_testtools::TestResult {
+        let base_id = "e0dc2c78d3bd3d14d20906ad7905a32f0f0918a8";
+        let left_id = "b8aa61be84b78d7fcff788e8d844406cc97132bf";
+        let right_id = "56e9f55deff1ffc20cf0cc66b866cba6b6886577";
+        // Native expanded sizes are base=847, left=173 and right=302.
+        // Base + right + two key weights fit at 1151 bytes, but not 1150.
+        for reuse_buffers in [false, true] {
+            for limit in [1150, 1151] {
+                let pack = pack_at(SMALL_PACK);
+                let mut cache = cache::lru::MemoryCappedHashmap::new(limit).with_borrowed_objects();
+                if reuse_buffers {
+                    cache = cache.with_reused_buffers();
+                }
+                let deltas = if limit == 1150 { [2, 0, 0] } else { [1, 1, 1] };
+                let mut buffer = Vec::new();
+                let mut inflate = Default::default();
+                for (offset, expected_id, expected_deltas) in [
+                    (3009, base_id, 1),
+                    (3033, left_id, 1),
+                    (3094, right_id, 1),
+                    (3033, left_id, deltas[0]),
+                    (3094, right_id, deltas[1]),
+                    (3033, left_id, deltas[2]),
+                ] {
+                    let outcome = pack.decode_entry(
+                        pack.entry(offset)?,
+                        &mut buffer,
+                        &mut inflate,
+                        &|_, _| Ok(None),
+                        &mut cache,
+                    )?;
+                    assert_eq!(outcome.kind, gix_object::Kind::Blob);
+                    assert_eq!(
+                        outcome.num_deltas, expected_deltas,
+                        "buffer reuse must preserve weighted-LRU residency at the key-plus-data boundary"
+                    );
+                    assert_eq!(
+                        gix_object::compute_hash(gix_hash::Kind::Sha1, outcome.kind, &buffer)?,
+                        gix_hash::ObjectId::from_hex(expected_id.as_bytes())?,
+                        "eviction and buffer reuse must retain the native sibling object identities"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn pack_with_replaced_sibling_delta(
+        delta: &[u8],
+        declared_size: u64,
+    ) -> gix_testtools::TestResult<data::File<Vec<u8>>> {
+        use std::io::Write;
+
+        let native = pack_at(SMALL_PACK);
+        let entry = native.entry(3033)?;
+        let mut original = vec![0; entry.decompressed_size as usize];
+        let compressed_size = native.decompress_entry(&entry, &mut Default::default(), &mut original)?;
+        let mut replacement = Vec::new();
+        entry.header.write_to(declared_size, &mut replacement)?;
+        let mut deflate = gix_zlib::stream::deflate::Write::new(replacement, gix_zlib::Compression::BEST_SPEED);
+        deflate.write_all(delta)?;
+        deflate.flush()?;
+        let mut bytes = std::fs::read(fixture_path(SMALL_PACK))?;
+        bytes.splice(3033..entry.data_offset as usize + compressed_size, deflate.into_inner());
+        Ok(data::File::from_data(
+            bytes,
+            "borrowed-base-validation.pack".into(),
+            gix_hash::Kind::Sha1,
+        )?)
     }
 
     fn decode_entry_at_offset(offset: u64) -> Vec<u8> {

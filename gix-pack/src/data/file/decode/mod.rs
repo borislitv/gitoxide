@@ -5,8 +5,25 @@ pub mod entry;
 ///
 pub mod header;
 
+/// Per-job limits for controlled delta-chain decoding. The file's allocation
+/// limit must additionally be set to bound object and combined work buffers.
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    /// Maximum number of delta instructions streams traversed for one object.
+    pub max_delta_depth: usize,
+    /// Maximum total uncompressed delta instruction bytes in one chain.
+    pub max_delta_bytes: u64,
+}
+
 /// Check the whole buffer size before growing it, avoiding amortized growth beyond a configured cap.
 pub(crate) fn resize_with_limit(out: &mut Vec<u8>, len: usize, alloc_limit_bytes: Option<usize>) -> Result {
+    reserve_with_limit(out, len, alloc_limit_bytes)?;
+    out.resize(len, 0);
+    Ok(())
+}
+
+/// Reserve checked output storage without initializing bytes that will be appended by the decoder.
+pub(crate) fn reserve_with_limit(out: &mut Vec<u8>, len: usize, alloc_limit_bytes: Option<usize>) -> Result {
     if alloc_limit_bytes.is_some_and(|limit| len > limit) {
         bail!(allocation_error(ResourceExhaustionKind::AllocationLimit));
     }
@@ -17,7 +34,6 @@ pub(crate) fn resize_with_limit(out: &mut Vec<u8>, len: usize, alloc_limit_bytes
         out.try_reserve(additional)
     }
     .or_raise(|| allocation_error(ResourceExhaustionKind::AllocationFailure))?;
-    out.resize(len, 0);
     Ok(())
 }
 

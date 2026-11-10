@@ -1,6 +1,7 @@
 // Modified for gitoxide from the upstream imara-diff crate.
 // Upstream source: git cat-file -p 32d1e45d3df061e6ccba6db7fdce92db29e345d8:src/myers/preprocess.rs
 
+use crate::control::{Cancelled, Check, Stage, poll};
 use crate::intern::Token;
 use crate::myers::sqrt;
 
@@ -28,59 +29,82 @@ impl TokenCounts {
     ///
     /// If `minimal` is set, no token is ever common, just like git's `XDF_NEED_MINIMAL` sets its
     /// limits to infinity.
-    pub fn new(before: &[Token], after: &[Token], minimal: bool) -> TokenCounts {
+    pub fn try_new(
+        before: &[Token],
+        after: &[Token],
+        minimal: bool,
+        check: &mut Check<'_>,
+    ) -> Result<TokenCounts, Cancelled> {
         const MAX_EQLIMIT: u32 = 1024;
 
         let eqlimit = |len: usize| {
             if minimal { u32::MAX } else { sqrt(len).min(MAX_EQLIMIT) }
         };
-        TokenCounts {
-            in_before: count_tokens(before),
-            in_after: count_tokens(after),
+        Ok(TokenCounts {
+            in_before: count_tokens(before, check)?,
+            in_after: count_tokens(after, check)?,
             eqlimit_before: eqlimit(before.len()),
             eqlimit_after: eqlimit(after.len()),
-        }
+        })
     }
 }
 
-fn count_tokens(file: &[Token]) -> Vec<u32> {
+fn count_tokens(file: &[Token], check: &mut Check<'_>) -> Result<Vec<u32>, Cancelled> {
     let mut occurrences = Vec::new();
+    let mut buckets = 0;
+    for token in file {
+        buckets = buckets.max(token.0 as usize + 1);
+        poll(check, Stage::Preprocess, buckets)?;
+    }
+    crate::control::try_reserve(&mut occurrences, buckets, check)?;
     for token in file {
         let bucket = token.0 as usize;
         if bucket >= occurrences.len() {
-            occurrences.resize(bucket + 1, 0u32);
+            while bucket >= occurrences.len() {
+                occurrences.resize((bucket + 1).min(occurrences.len() + 1024), 0u32);
+                poll(check, Stage::Preprocess, occurrences.len())?;
+            }
         }
         occurrences[bucket] += 1;
+        poll(check, Stage::Preprocess, bucket)?;
     }
-    occurrences
+    Ok(occurrences)
 }
 
 /// Preprocesses token sequences by removing tokens that don't appear in the other sequence.
 ///
 /// This optimization reduces the problem size for the Myers algorithm, improving performance
 /// for files with many unique tokens.
-pub fn preprocess<'a>(
+pub(crate) fn try_preprocess(
     counts: &TokenCounts,
     before: &[Token],
     after: &[Token],
-    removed: &'a mut [bool],
-    added: &'a mut [bool],
-) -> (PreprocessedFile, PreprocessedFile) {
-    let occurrences_before = token_occurrences(before, &counts.in_after, counts.eqlimit_before);
-    let occurrences_after = token_occurrences(after, &counts.in_before, counts.eqlimit_after);
-    let file1 = PreprocessedFile::new(&occurrences_before, before, removed);
-    let file2 = PreprocessedFile::new(&occurrences_after, after, added);
-    (file1, file2)
+    removed: &mut [bool],
+    added: &mut [bool],
+    check: &mut Check<'_>,
+) -> Result<(PreprocessedFile, PreprocessedFile), Cancelled> {
+    let occurrences_before = token_occurrences(before, &counts.in_after, counts.eqlimit_before, check)?;
+    let occurrences_after = token_occurrences(after, &counts.in_before, counts.eqlimit_after, check)?;
+    let file1 = PreprocessedFile::try_new(&occurrences_before, before, removed, check)?;
+    let file2 = PreprocessedFile::try_new(&occurrences_after, after, added, check)?;
+    Ok((file1, file2))
 }
 
 /// Classify each token of `file` by how often it occurs in the other file, as given by `other_counts`.
-fn token_occurrences(file: &[Token], other_counts: &[u32], eqlimit: u32) -> Vec<Occurrences> {
-    file.iter()
-        .map(|token| {
-            let occurrences = other_counts.get(token.0 as usize).copied().unwrap_or(0);
-            Occurrences::from_occurrences(occurrences, eqlimit)
-        })
-        .collect()
+fn token_occurrences(
+    file: &[Token],
+    other_counts: &[u32],
+    eqlimit: u32,
+    check: &mut Check<'_>,
+) -> Result<Vec<Occurrences>, Cancelled> {
+    let mut result = Vec::new();
+    crate::control::try_reserve(&mut result, file.len(), check)?;
+    for token in file {
+        let occurrences = other_counts.get(token.0 as usize).copied().unwrap_or(0);
+        poll(check, Stage::Preprocess, token.0 as usize)?;
+        result.push(Occurrences::from_occurrences(occurrences, eqlimit));
+    }
+    Ok(result)
 }
 
 /// Categorizes how frequently a token appears in a file.
@@ -117,9 +141,14 @@ pub struct PreprocessedFile {
 }
 
 impl PreprocessedFile {
-    fn new(token_occurrences: &[Occurrences], tokens: &[Token], changed: &mut [bool]) -> PreprocessedFile {
-        let (tokens, indices) = prune_unmatched_tokens(tokens, token_occurrences, changed);
-        PreprocessedFile { indices, tokens }
+    fn try_new(
+        token_occurrences: &[Occurrences],
+        tokens: &[Token],
+        changed: &mut [bool],
+        check: &mut Check<'_>,
+    ) -> Result<PreprocessedFile, Cancelled> {
+        let (tokens, indices) = prune_unmatched_tokens(tokens, token_occurrences, changed, check)?;
+        Ok(PreprocessedFile { indices, tokens })
     }
 }
 
@@ -127,25 +156,28 @@ fn prune_unmatched_tokens(
     file: &[Token],
     token_status: &[Occurrences],
     changed: &mut [bool],
-) -> (Vec<Token>, Vec<u32>) {
+    check: &mut Check<'_>,
+) -> Result<(Vec<Token>, Vec<u32>), Cancelled> {
     assert_eq!(token_status.len(), file.len());
-    file.iter()
-        .zip(token_status)
-        .enumerate()
-        .filter_map(|(i, (&token, &status))| {
-            let prune = match status {
-                Occurrences::None => true,
-                Occurrences::Some => false,
-                Occurrences::Common => should_prune_common_line(token_status, i),
-            };
-            if prune {
-                changed[i] = true;
-                None
-            } else {
-                Some((token, i as u32))
-            }
-        })
-        .unzip()
+    let mut tokens = Vec::new();
+    let mut indices = Vec::new();
+    crate::control::try_reserve(&mut tokens, file.len(), check)?;
+    crate::control::try_reserve(&mut indices, file.len(), check)?;
+    for (i, (&token, &status)) in file.iter().zip(token_status).enumerate() {
+        let prune = match status {
+            Occurrences::None => true,
+            Occurrences::Some => false,
+            Occurrences::Common => should_prune_common_line(token_status, i),
+        };
+        if prune {
+            changed[i] = true;
+        } else {
+            tokens.push(token);
+            indices.push(i as u32);
+        }
+        poll(check, Stage::Preprocess, i + 1)?;
+    }
+    Ok((tokens, indices))
 }
 
 // TODO do not unnecessarily rescan lines

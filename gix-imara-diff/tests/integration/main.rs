@@ -11,6 +11,9 @@ use gix_imara_diff::{Algorithm, Diff, UnifiedDiffConfig};
 
 const ALL_ALGORITHMS: [Algorithm; 2] = [Algorithm::Histogram, Algorithm::Myers];
 
+mod controlled;
+mod interner;
+
 mod fuzzed {
     use std::time::{Duration, Instant};
 
@@ -771,6 +774,23 @@ fn an_expensive_split_gives_up_after_as_many_rounds_as_git() -> gix_testtools::T
 #[test]
 fn an_expensive_minimal_split_keeps_searching_until_the_optimum_is_found() -> gix_testtools::TestResult {
     assert_myers_matches_git("expensive-minimal-split", Algorithm::MyersMinimal, (271, 271))
+}
+
+/// The large shared anchor keeps the search limit above 256, allowing the good-snake
+/// heuristic to run. Repeated blocks on either side expose incorrect diagonal scores
+/// and comparisons that align prefix starts instead of their candidate ends.
+#[test]
+fn good_snake_heuristics_match_gits_exact_edits_in_both_directions() -> gix_testtools::TestResult {
+    for (case, expected, reversed) in [
+        ("snake-7", (768, 1056), (1056, 768)),
+        ("snake-15", (576, 1536), (1568, 608)),
+        ("snake-18", (800, 800), (800, 800)),
+        ("snake-19", (672, 1152), (1152, 672)),
+    ] {
+        assert_myers_matches_git(case, Algorithm::Myers, expected)?;
+        assert_myers_matches_git(&format!("{case}-reversed"), Algorithm::Myers, reversed)?;
+    }
+    Ok(())
 }
 
 #[test]

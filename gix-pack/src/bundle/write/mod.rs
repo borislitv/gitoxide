@@ -21,6 +21,11 @@ mod types;
 use types::{LockWriter, PassThrough};
 pub use types::{Options, Outcome};
 
+#[cfg(feature = "generate")]
+mod controlled;
+#[cfg(feature = "generate")]
+pub use controlled::{Options as ControlledOptions, Outcome as ControlledOutcome};
+
 use crate::bundle::write::types::SharedTempFile;
 
 /// The progress ids used in [`write_to_directory()`][crate::Bundle::write_to_directory()].

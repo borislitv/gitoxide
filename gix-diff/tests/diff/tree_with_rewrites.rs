@@ -1955,6 +1955,8 @@ mod util {
         options: gix_diff::tree_with_rewrites::Options,
     ) -> gix_testtools::Result<(Vec<gix_diff::tree_with_rewrites::Change>, Option<rewrites::Outcome>)> {
         let (from, to, mut cache, odb) = repo_with_trees(lhs, rhs)?;
+        let mut controlled_cache = cache.clone();
+        controlled_cache.filter_mode = gix_diff::blob::pipeline::Mode::ToGit;
         let mut out = Vec::new();
         let hash_kind = fixture_hash_kind();
         let rewrites_info = gix_diff::tree_with_rewrites(
@@ -1967,9 +1969,30 @@ mod util {
                 out.push(change.into_owned());
                 Ok(std::ops::ControlFlow::Continue(()))
             },
-            options,
+            options.clone(),
         )?;
-        Ok((out, rewrites_info))
+        let mut controlled_out = Vec::new();
+        let controlled_info = gix_diff::tree_with_rewrites::diff_with_control(
+            TreeRefIter::from_bytes(&from, hash_kind),
+            TreeRefIter::from_bytes(&to, hash_kind),
+            &mut controlled_cache,
+            &mut Default::default(),
+            &odb,
+            |change| {
+                controlled_out.push(change.into_owned());
+                Ok(std::ops::ControlFlow::Continue(()))
+            },
+            options,
+            &mut |_| Ok(()),
+        )?;
+        assert_eq!(
+            controlled_out, out,
+            "controlled traversal must preserve all rewrite fields and ordering"
+        );
+        assert_eq!(controlled_info, rewrites_info);
+        // The original independently specified snapshots/assertions now also
+        // qualify the controlled rename, fuzzy copy and exhaustive-source paths.
+        Ok((controlled_out, controlled_info))
     }
 
     fn read_tree(odb: &dyn gix_object::Find, root: &Path, tree: Option<&str>) -> gix_testtools::Result<Vec<u8>> {

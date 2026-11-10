@@ -131,6 +131,50 @@ for case in "${cases[@]}"; do
   cp "$case/old" "$case-reversed/new"
 done
 
+# A 40,000-line shared anchor raises the expensive-split limit above 256, so
+# Git's good-snake heuristic can run before it gives up. Deterministic block
+# insertions/deletions around it exercise forward and backward search, including
+# candidates whose two coordinates and corner diagonals differ.
+next_choice() {
+  state=$((state * 6364136223846793005 + 1442695040888963407))
+  value=$(((state >> 32) & 4294967295))
+}
+rows() {
+  local row
+  for ((row = $1; row < $2; row++)); do
+    printf 'row-%06d\n' "$row"
+  done
+}
+for seed in 7 15 18 19; do
+  case="snake-$seed"
+  mkdir "$case" "$case-reversed"
+  width=$((48 + seed % 4 * 16))
+  for ((block = 0; block < 32; block++)); do
+    if ((block == 16)); then
+      rows 100000 140000
+    fi
+    rows "$((block * width))" "$(((block + 1) * width))"
+  done >"$case/old"
+  state=$((seed + 1))
+  for ((block = 0; block < 32; block++)); do
+    if ((block == 16)); then
+      rows 100000 140000
+    fi
+    next_choice
+    if ((value % 5 != 0)); then
+      rows "$((block * width))" "$(((block + 1) * width))"
+    fi
+    next_choice
+    if ((value % 3 == 0)); then
+      next_choice
+      other=$((value % 32))
+      rows "$((other * width))" "$(((other + 1) * width))"
+    fi
+  done >"$case/new"
+  cp "$case/new" "$case-reversed/old"
+  cp "$case/old" "$case-reversed/new"
+done
+
 baseline() {
   local name=$1
   shift

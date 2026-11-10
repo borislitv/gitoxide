@@ -37,6 +37,29 @@ pub fn diff_with_slider_heuristics<T: AsRef<[u8]>>(algorithm: Algorithm, input: 
     diff
 }
 
+/// Prepare byte lines and compute a complete diff using request-local fallible
+/// checks within long-line hashing/equality/copying, diff search and line sliders.
+/// The owned input is returned for token lookup. No partial result escapes an error.
+/// This does not invoke external drivers, conversion pipelines or filters.
+pub fn try_diff_bytes(
+    algorithm: Algorithm,
+    before: &[u8],
+    after: &[u8],
+    check: &mut control::Check<'_>,
+) -> Result<(byte_input::ByteInput, Diff), control::Cancelled> {
+    let mut input = byte_input::ByteInput::try_new(before, after, check)?;
+    let view = input.as_input();
+    let result = Diff::try_compute_with(algorithm, &view.before, &view.after, view.interner.num_tokens(), check)
+        .and_then(|diff| diff.try_postprocess_lines(view, check));
+    match result {
+        Ok(diff) => Ok((input, diff)),
+        Err(error) => {
+            input.clear_with_control(check);
+            Err(error)
+        }
+    }
+}
+
 ///
 pub mod pipeline;
 
@@ -149,6 +172,8 @@ pub struct Platform {
     /// That way, expensive rewrite-checks with NxM matrix checks would be as fast as possible,
     /// avoiding duplicate work.
     diff_cache: HashMap<platform::CacheKey, platform::CacheValue>,
+    /// Nonempty controlled caches contain only bypassed raw-object resources.
+    controlled_raw: bool,
     /// A list of previously used buffers, ready for re-use.
     free_list: Vec<Vec<u8>>,
 }
