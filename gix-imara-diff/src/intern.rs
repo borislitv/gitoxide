@@ -8,6 +8,8 @@ use std::ops::Index;
 use hashbrown::DefaultHashBuilder as RandomState;
 use hashbrown::hash_table::{Entry, HashTable};
 
+use crate::control::{Cancelled, Check, Stage, poll};
+
 /// A token represented as an interned integer.
 ///
 /// A token represents the smallest possible unit of change during a diff.
@@ -360,5 +362,104 @@ impl Interner<Vec<u8>> {
         let token = crate::byte_input::intern(bytes, &mut self.tokens, &mut self.byte_index, check)?;
         self.byte_indexed = self.tokens.len();
         Ok(token)
+    }
+}
+
+/// Exclusive controlled token storage for repeated prepared-input censuses.
+///
+/// The interner is exposed read-only: no generic insertion, erase, clear or
+/// mutable token access can bypass the owned-backing protocol. Numeric input
+/// sequences remain mutable and must still be censused. Every fresh nonempty
+/// token transfers its actual admitted capacity with `BackingOwned`; clearing
+/// frees each Vec before `BackingFreed`, including after a persistent stop.
+/// Adapters must route these events to the same job's `Allocations`. Call
+/// `clear_with_control` before dropping this owner or starting trace pinning.
+/// During panic unwind the enclosing job must destroy this owner before its
+/// registry; conservative leases may then be released by registry destruction.
+/// There is intentionally no mutable generic-interner escape hatch:
+///
+/// ```compile_fail
+/// use gix_imara_diff::byte_input::OwnedByteInput;
+/// let mut input = OwnedByteInput::default();
+/// input.interner.intern(vec![b'x']);
+/// ```
+#[derive(Default)]
+pub struct OwnedByteInput {
+    input: InternedInput<Vec<u8>>,
+}
+
+impl std::ops::Deref for OwnedByteInput {
+    type Target = InternedInput<Vec<u8>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.input
+    }
+}
+
+impl OwnedByteInput {
+    /// Mutable numeric sequences, never mutable token storage.
+    pub fn sequences_mut(&mut self) -> (&mut Vec<Token>, &mut Vec<Token>) {
+        (&mut self.input.before, &mut self.input.after)
+    }
+
+    /// Intern a line, registering only newly owned nonempty backing. A failed
+    /// insertion or ownership transfer clears the private input before return.
+    pub fn try_intern(&mut self, bytes: &[u8], check: &mut Check<'_>) -> Result<Token, Cancelled> {
+        let previous = self.input.interner.num_tokens();
+        let result = self.input.interner.try_intern_bytes(bytes, check).and_then(|token| {
+            if token.0 == previous {
+                let data = &self.input.interner[token];
+                if data.capacity() != 0 {
+                    poll(
+                        check,
+                        Stage::BackingOwned {
+                            address: data.as_ptr() as usize,
+                        },
+                        data.capacity(),
+                    )?;
+                }
+            }
+            Ok(token)
+        });
+        if result.is_err() {
+            self.clear_with_control(check);
+        }
+        result
+    }
+
+    /// Enumerate mutable outer storage and index arrays, not immutable tokens.
+    /// The private byte-only insertion path is the ownership proof, not an
+    /// arbitrary boolean saying a generic interner is controlled.
+    pub fn retain_backings(&self, check: &mut Check<'_>) -> Result<(), Cancelled> {
+        crate::control::retain_vec(&self.input.before, check)?;
+        crate::control::retain_vec(&self.input.after, check)?;
+        crate::control::retain_vec(&self.input.interner.tokens, check)?;
+        self.input.interner.byte_index.retain_backings(check)
+    }
+
+    /// Free nested storage before returning its charge. Checks after at most
+    /// 32 token destructions continue after stop; live tokens remain charged.
+    pub fn clear_with_control(&mut self, check: &mut Check<'_>) {
+        self.input.before.clear();
+        self.input.after.clear();
+        let mut cleared = 0;
+        while let Some(token) = self.input.interner.tokens.pop() {
+            let address = if token.capacity() == 0 {
+                0
+            } else {
+                token.as_ptr() as usize
+            };
+            drop(token);
+            if address != 0 {
+                let _ = poll(check, Stage::BackingFreed { address }, 0);
+            }
+            cleared += 1;
+            if cleared % 32 == 0 {
+                let _ = poll(check, Stage::Cleanup, cleared);
+            }
+        }
+        self.input.interner.byte_index.clear();
+        self.input.interner.byte_indexed = 0;
+        let _ = poll(check, Stage::Cleanup, cleared);
     }
 }

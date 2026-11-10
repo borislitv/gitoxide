@@ -217,6 +217,11 @@ fn file_admitted(
             }
             Stage::RetainEnd => return allocations.end_retention(check),
             Stage::RetainPinned { address } => return allocations.pin(address),
+            Stage::BackingOwned { address } => return allocations.own(address, check),
+            Stage::BackingFreed { address } => {
+                allocations.freed(address);
+                return Ok(());
+            }
             Stage::RetainScopeBegin => return allocations.begin_pinned_scope(check),
             Stage::RetainScopeEnd => {
                 allocations.end_pinned_scope();
@@ -647,6 +652,7 @@ fn file_controlled(
     if file_path.len() > super::bounded::METADATA_LIMIT {
         return Err(message("controlled blame path exceeds 64 KiB metadata limit").into());
     }
+    let resource_owner = super::bounded::UnwindResources(resource_cache);
     let shared = std::cell::RefCell::new(check);
     let objects = super::bounded::Objects {
         inner: odb,
@@ -657,7 +663,7 @@ fn file_controlled(
         objects,
         start,
         cache,
-        resource_cache,
+        &mut *resource_owner.0,
         file_path,
         options,
         tuning,
@@ -665,7 +671,9 @@ fn file_controlled(
         true,
         &mut memo,
     );
-    resource_cache.clear_controlled_raw(&mut |event| (**shared.borrow_mut())(event));
+    resource_owner
+        .0
+        .clear_controlled_raw(&mut |event| (**shared.borrow_mut())(event));
     let statistics = memo.as_ref().map(|state| state.statistics).unwrap_or_default();
     // The wire slot is scratch, not an output owner. Drop it before any later
     // provenance/final-output census can refund its charge.

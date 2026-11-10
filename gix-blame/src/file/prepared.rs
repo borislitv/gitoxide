@@ -1,4 +1,5 @@
 use gix_diff::blob::InternedInput;
+use gix_diff::blob::byte_input::OwnedByteInput;
 use gix_diff::blob::control::{BYTE_CHUNK, Cancelled, Check, Checkpoint, Stage, try_line_ranges};
 #[cfg(test)]
 use gix_diff::blob::sources::byte_lines;
@@ -44,7 +45,7 @@ type PreparedView<'a> = (&'a InternedInput<Vec<u8>>, (usize, usize));
 #[derive(Default)]
 pub(super) struct PreparedInput {
     parent_id: Option<ObjectId>,
-    input: InternedInput<Vec<u8>>,
+    input: OwnedByteInput,
     offsets: Vec<usize>,
     spare_offsets: Vec<usize>,
     retained_bytes: usize,
@@ -58,17 +59,12 @@ pub(super) struct PreparedInput {
 
 impl PreparedInput {
     pub(super) fn retain_backings(&self, check: &mut Check<'_>) -> Result<(), Cancelled> {
-        for data in [&self.input.before, &self.input.after] {
-            gix_diff::blob::control::retain_vec(data, check)?;
-        }
         gix_diff::blob::control::retain_vec(&self.offsets, check)?;
         gix_diff::blob::control::retain_vec(&self.spare_offsets, check)?;
-        self.input.interner.retain_byte_backings(check)
+        self.input.retain_backings(check)
     }
     pub(super) fn clear_with_control(&mut self, check: &mut Check<'_>) {
-        self.input.before.clear();
-        self.input.after.clear();
-        self.input.interner.clear_with_control(check);
+        self.input.clear_with_control(check);
         self.parent_id = None;
     }
     pub(super) fn with_current_input_credit(mut self) -> Self {
@@ -148,13 +144,14 @@ impl PreparedInput {
             for range in try_line_ranges(suspect, check)? {
                 let line = &suspect[range];
                 let token = self.try_intern(line, check)?;
-                gix_diff::blob::control::try_push(&mut self.input.after, token, check)?;
+                gix_diff::blob::control::try_push(self.input.sequences_mut().1, token, check)?;
                 position += line.len();
                 gix_diff::blob::control::try_push(&mut self.offsets, position, check)?;
             }
         } else {
             // The last parent is the current suspect in a linear traversal.
-            std::mem::swap(&mut self.input.before, &mut self.input.after);
+            let (before, after) = self.input.sequences_mut();
+            std::mem::swap(before, after);
         }
 
         let common = try_common_prefix(parent, suspect, check)?;
@@ -186,8 +183,9 @@ impl PreparedInput {
             parent_suffix = parent.len() - (suspect.len() - self.offsets[suffix_line]);
         }
 
-        self.input.before.clear();
-        extend(&mut self.input.before, &self.input.after[..prefix_lines], check)?;
+        let (before, after) = self.input.sequences_mut();
+        before.clear();
+        extend(before, &after[..prefix_lines], check)?;
         self.spare_offsets.clear();
         extend(&mut self.spare_offsets, &self.offsets[..=prefix_lines], check)?;
         let mut position = prefix_bytes;
@@ -224,7 +222,8 @@ impl PreparedInput {
                     {
                         end -= 1;
                     }
-                    extend(&mut self.input.before, &self.input.after[first..end], check)?;
+                    let (before, after) = self.input.sequences_mut();
+                    extend(before, &after[first..end], check)?;
                     let ends = &self.offsets[first + 1..=end];
                     gix_diff::blob::control::try_reserve(&mut self.spare_offsets, ends.len(), check)?;
                     for chunk in ends.chunks(1024) {
@@ -252,11 +251,12 @@ impl PreparedInput {
             } else {
                 self.try_intern(line, check)?
             };
-            gix_diff::blob::control::try_push(&mut self.input.before, token, check)?;
+            gix_diff::blob::control::try_push(self.input.sequences_mut().0, token, check)?;
             position += line.len();
             gix_diff::blob::control::try_push(&mut self.spare_offsets, position, check)?;
         }
-        extend(&mut self.input.before, &self.input.after[suffix_line..], check)?;
+        let (before, after) = self.input.sequences_mut();
+        extend(before, &after[suffix_line..], check)?;
         let suspect_suffix = self.offsets[suffix_line];
         let ends = &self.offsets[suffix_line + 1..];
         gix_diff::blob::control::try_reserve(&mut self.spare_offsets, ends.len(), check)?;
@@ -304,7 +304,14 @@ impl PreparedInput {
 
     fn try_intern(&mut self, line: &[u8], check: &mut Check<'_>) -> Result<gix_diff::blob::Token, Cancelled> {
         let previous_count = self.input.interner.num_tokens();
-        let token = self.input.interner.try_intern_bytes(line, check)?;
+        let token = match self.input.try_intern(line, check) {
+            Ok(token) => token,
+            Err(error) => {
+                self.parent_id = None;
+                self.retained_bytes = 0;
+                return Err(error);
+            }
+        };
         if token.0 == previous_count {
             // Account for owned line data, its Vec, allocator and table entry.
             self.retained_bytes = self

@@ -72,6 +72,19 @@ pub enum Stage {
     /// End immutable-root protection. The next complete census must enumerate
     /// all surviving roots normally; this event itself never refunds a charge.
     RetainScopeEnd,
+    /// Transfer an admitted immutable byte-token backing to its exclusive owner.
+    /// Unlike trace pins, this lease survives censuses without a phase scope.
+    /// Only the sealed byte-input owner may issue this event, after insertion.
+    BackingOwned {
+        /// Opaque backing identity, never dereferenced.
+        address: usize,
+    },
+    /// The exclusive byte-token owner physically freed this backing. Cleanup
+    /// must issue this even after cancellation, never before dropping storage.
+    BackingFreed {
+        /// Opaque identity captured before freeing storage, never dereferenced.
+        address: usize,
+    },
     /// Before a commit-processing step; processed counts previously visited commits.
     /// This is independent of live-memory admission.
     Commit,
@@ -125,6 +138,7 @@ pub struct Allocations {
     pending: Vec<Box<dyn Allocation>>,
     backings: std::collections::HashMap<usize, (Box<dyn Allocation>, u64)>,
     pinned: std::collections::HashMap<usize, (Box<dyn Allocation>, u64)>,
+    owned: std::collections::HashMap<usize, (Box<dyn Allocation>, u64)>,
     pinned_scope: bool,
     epoch: u64,
     metadata: Box<dyn Allocation>,
@@ -143,7 +157,7 @@ impl Allocations {
         }
         drop(std::mem::take(&mut self.pending));
         let mut count = 0;
-        for map in [&mut self.backings, &mut self.pinned] {
+        for map in [&mut self.backings, &mut self.pinned, &mut self.owned] {
             for entry in std::mem::take(map) {
                 drop(entry);
                 count += 1;
@@ -161,6 +175,7 @@ impl Allocations {
             pending: Vec::new(),
             backings: Default::default(),
             pinned: Default::default(),
+            owned: Default::default(),
             pinned_scope: false,
             epoch: 0,
             metadata: allocator.reserve(0)?,
@@ -172,14 +187,14 @@ impl Allocations {
     /// caller must emit an Allocate event for every controlled backing growth
     /// and associate persistent backing with an allocated event.
     pub fn admit(&mut self, bytes: usize) -> Result<(), Cancelled> {
-        let live = self.pending.len() + self.backings.len() + self.pinned.len();
+        let live = self.pending.len() + self.backings.len() + self.pinned.len() + self.owned.len();
         if live >= 131072 {
             return Err(Cancelled);
         }
         let target = (live + 1).next_power_of_two().max(32);
         // Admit both old and replacement metadata while either can be live.
         self.metadata.resize(
-            (target * 4 + self.backings.capacity() * 2 + self.pinned.capacity() * 2)
+            (target * 4 + self.backings.capacity() * 2 + self.pinned.capacity() * 2 + self.owned.capacity() * 2)
                 * std::mem::size_of::<(usize, (Box<dyn Allocation>, u64))>()
                 + (target + self.pending.capacity()) * std::mem::size_of::<Box<dyn Allocation>>()
                 + 128,
@@ -193,6 +208,11 @@ impl Allocations {
     /// Associate a completed allocation with its backing, after relocation freed
     /// the previous storage. No address is dereferenced or used as an object ID.
     pub fn allocated(&mut self, old: usize, new: usize, bytes: usize) -> Result<(), Cancelled> {
+        // Exclusive token storage is immutable until physically freed. It must
+        // never be relocated by a mutable-vector growth event.
+        if old != 0 && self.owned.contains_key(&old) {
+            return Err(Cancelled);
+        }
         let mut lease = self.pending.pop().ok_or(Cancelled)?;
         if let Err(error) = lease.resize(bytes) {
             self.pending.push(lease);
@@ -237,7 +257,7 @@ impl Allocations {
         if self.pinned.len() == self.pinned.capacity() {
             let target = (self.pinned.len() + 1).next_power_of_two().max(32);
             self.metadata.resize(
-                (target * 4 + self.backings.capacity() * 2 + self.pinned.capacity() * 2)
+                (target * 4 + self.backings.capacity() * 2 + self.pinned.capacity() * 2 + self.owned.capacity() * 2)
                     * std::mem::size_of::<(usize, (Box<dyn Allocation>, u64))>()
                     + self.pending.capacity() * std::mem::size_of::<Box<dyn Allocation>>()
                     + 128,
@@ -249,17 +269,76 @@ impl Allocations {
         Ok(())
     }
 
+    /// Register the exclusive immutable token owner after physical allocation.
+    /// Admission failure leaves the original backing charge intact. No epoch or
+    /// progress event is ownership evidence: each backing is transferred once.
+    pub fn own(&mut self, address: usize, check: &mut Check<'_>) -> Result<(), Cancelled> {
+        if self.pinned_scope || self.owned.contains_key(&address) || !self.backings.contains_key(&address) {
+            return Err(Cancelled);
+        }
+        if self.owned.len() == self.owned.capacity() {
+            poll(check, Stage::Index, 0)?;
+            let target = (self.owned.len() + 1).next_power_of_two().max(32);
+            self.metadata.resize(
+                (target * 4 + self.backings.capacity() * 2 + self.pinned.capacity() * 2 + self.owned.capacity() * 2)
+                    * std::mem::size_of::<(usize, (Box<dyn Allocation>, u64))>()
+                    + self.pending.capacity() * std::mem::size_of::<Box<dyn Allocation>>()
+                    + 128,
+            )?;
+            // Reserve empty replacement storage, then move leases explicitly.
+            // Do not let HashMap growth perform an unchecked full rehash of all
+            // immutable owners. A stop must finish relocation before returning.
+            let mut replacement = std::collections::HashMap::new();
+            replacement.try_reserve(target).map_err(|_| Cancelled)?;
+            let mut stopped = false;
+            let mut panic = None;
+            for (index, entry) in self.owned.drain().enumerate() {
+                replacement.insert(entry.0, entry.1);
+                if (index + 1) % 32 == 0 && panic.is_none() {
+                    // Dropping a partially drained map on callback unwind would
+                    // refund leases before their token owners unwind. Finish
+                    // moving first, without calling a panicking callback again.
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        poll(check, Stage::Index, index + 1)
+                    })) {
+                        Ok(result) => stopped |= result.is_err(),
+                        Err(payload) => panic = Some(payload),
+                    }
+                }
+            }
+            self.owned = replacement;
+            if let Some(payload) = panic {
+                std::panic::resume_unwind(payload);
+            }
+            if stopped {
+                return Err(Cancelled);
+            }
+            poll(check, Stage::Index, 0)?;
+        }
+        let entry = self.backings.remove(&address).ok_or(Cancelled)?;
+        self.owned.insert(address, entry);
+        Ok(())
+    }
+
+    /// A sealed token owner has already freed storage. Also release an ordinary
+    /// lease if ownership-transfer admission failed before the move. This must
+    /// not check cancellation before refunding already-freed backing.
+    pub fn freed(&mut self, address: usize) {
+        self.owned.remove(&address);
+        self.backings.remove(&address);
+    }
+
     /// Start one nonnested immutable-owner scope after a complete census. Rebuild
     /// only the remaining mutable registry so dead historical capacity is not
     /// scanned once per immutable output row. Peak old/new metadata is admitted.
     pub fn begin_pinned_scope(&mut self, check: &mut Check<'_>) -> Result<(), Cancelled> {
         poll(check, Stage::Cleanup, 0)?;
-        if self.pinned_scope || !self.pending.is_empty() {
+        if self.pinned_scope || !self.pending.is_empty() || !self.owned.is_empty() {
             return Err(Cancelled);
         }
         let target = self.backings.len().next_power_of_two().max(32);
         self.metadata.resize(
-            (target * 4 + self.backings.capacity() * 2 + self.pinned.capacity() * 2)
+            (target * 4 + self.backings.capacity() * 2 + self.pinned.capacity() * 2 + self.owned.capacity() * 2)
                 * std::mem::size_of::<(usize, (Box<dyn Allocation>, u64))>()
                 + self.pending.capacity() * std::mem::size_of::<Box<dyn Allocation>>()
                 + 128,
@@ -312,7 +391,7 @@ impl Allocations {
             self.pinned.retain(&mut retain);
         }
         self.metadata.resize(
-            (self.backings.capacity() + self.pinned.capacity())
+            (self.backings.capacity() + self.pinned.capacity() + self.owned.capacity())
                 * 2
                 * std::mem::size_of::<(usize, (Box<dyn Allocation>, u64))>()
                 + self.pending.capacity() * std::mem::size_of::<Box<dyn Allocation>>()

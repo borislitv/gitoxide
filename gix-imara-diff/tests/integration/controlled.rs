@@ -11,6 +11,364 @@ use gix_imara_diff::{
     control::{BYTE_CHUNK, Cancelled, Stage},
 };
 
+mod owned_tokens {
+    use super::*;
+    use gix_imara_diff::{
+        Interner, Token,
+        byte_input::OwnedByteInput,
+        control::{Allocation, Allocations, Allocator, Checkpoint, try_copy_bytes, try_push},
+    };
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct State {
+        leases: Vec<usize>,
+        deny: bool,
+    }
+    #[derive(Clone, Default)]
+    struct Budget(Arc<Mutex<State>>);
+    struct Lease(Budget, usize);
+    impl Allocation for Lease {
+        fn resize(&mut self, bytes: usize) -> Result<(), Cancelled> {
+            let mut state = self.0.0.lock().unwrap();
+            if state.deny {
+                return Err(Cancelled);
+            }
+            state.leases[self.1] = bytes;
+            Ok(())
+        }
+    }
+    impl Drop for Lease {
+        fn drop(&mut self) {
+            self.0.0.lock().unwrap().leases[self.1] = 0;
+        }
+    }
+    impl Allocator for Budget {
+        fn reserve(&self, bytes: usize) -> Result<Box<dyn Allocation>, Cancelled> {
+            let mut state = self.0.lock().unwrap();
+            if state.deny {
+                return Err(Cancelled);
+            }
+            let id = state.leases.len();
+            state.leases.push(bytes);
+            Ok(Box::new(Lease(self.clone(), id)))
+        }
+    }
+    impl Budget {
+        fn count(&self, size: usize) -> usize {
+            self.0
+                .lock()
+                .unwrap()
+                .leases
+                .iter()
+                .filter(|&&bytes| bytes == size)
+                .count()
+        }
+        fn total(&self) -> usize {
+            self.0.lock().unwrap().leases.iter().sum()
+        }
+    }
+
+    struct Harness {
+        arena: Allocations,
+        budget: Budget,
+        retained: usize,
+        stop_owned_move: bool,
+        panic_owned_move: bool,
+        move_stopped: bool,
+    }
+    impl Harness {
+        fn new() -> Self {
+            let budget = Budget::default();
+            Self {
+                arena: Allocations::new(Arc::new(budget.clone())).unwrap(),
+                budget,
+                retained: 0,
+                stop_owned_move: false,
+                panic_owned_move: false,
+                move_stopped: false,
+            }
+        }
+        // This adapter is the public allocation/ownership protocol under test.
+        // Nonprotocol checkpoints are controlled separately by each scenario.
+        fn check(&mut self, event: Checkpoint) -> Result<(), Cancelled> {
+            match event.stage {
+                Stage::Allocate => self.arena.admit(event.processed),
+                Stage::Backing { old, new } => self.arena.allocated(old, new, event.processed),
+                Stage::BackingOwned { address } => {
+                    let mut reached = false;
+                    let stop = self.stop_owned_move;
+                    let panic = self.panic_owned_move;
+                    let budget = self.budget.clone();
+                    let live_tokens = budget.count(65);
+                    let mut previous = 0;
+                    let result = self.arena.own(address, &mut |event| {
+                        assert!(
+                            event.processed.saturating_sub(previous) <= 32,
+                            "owned registry relocation exceeded its work quantum"
+                        );
+                        previous = event.processed;
+                        assert_eq!(
+                            budget.count(65),
+                            live_tokens,
+                            "relocation must not refund any still-owned token backing"
+                        );
+                        if event.processed >= 32 {
+                            assert!(!panic, "owned lease relocation callback panic");
+                            if stop {
+                                reached = true;
+                                return Err(Cancelled);
+                            }
+                        }
+                        Ok(())
+                    });
+                    self.move_stopped |= reached;
+                    result
+                }
+                Stage::BackingFreed { address } => {
+                    self.arena.freed(address);
+                    Ok(())
+                }
+                Stage::Retain { address } => {
+                    self.retained += 1;
+                    self.arena.retain(address);
+                    Ok(())
+                }
+                _ => Ok(()),
+            }
+        }
+    }
+
+    #[test]
+    fn active_20000_token_pair_has_constant_censuses_and_exact_reset_charges() {
+        let mut harness = Harness::new();
+        let mut input = OwnedByteInput::default();
+        for id in 0..20_000 {
+            let line = format!("{id:064}\n");
+            let token = input.try_intern(line.as_bytes(), &mut |e| harness.check(e)).unwrap();
+            assert_eq!(input.interner[token].as_slice(), line.as_bytes());
+            let (before, after) = input.sequences_mut();
+            try_push(before, token, &mut |e| harness.check(e)).unwrap();
+            try_push(after, token, &mut |e| harness.check(e)).unwrap();
+        }
+        // Token capacity 65 cannot be mistaken for the numeric Vec/index or
+        // registry metadata allocations, all of which have wider element sizes.
+        assert_eq!(harness.budget.count(65), 20_000);
+        for _ in 0..32 {
+            let scratch = try_copy_bytes(&[0; 96], &mut |e| harness.check(e)).unwrap();
+            drop(scratch);
+            harness.arena.begin_retention().unwrap();
+            input.retain_backings(&mut |e| harness.check(e)).unwrap();
+            harness.arena.end_retention(&mut |_| Ok(())).unwrap();
+            assert_eq!(
+                harness.budget.count(65),
+                20_000,
+                "all active token storage must remain charged"
+            );
+            assert_eq!(harness.budget.count(96), 0, "dead scratch must not be protected");
+        }
+        assert_eq!(
+            harness.retained,
+            32 * 5,
+            "census work must not enumerate immutable tokens"
+        );
+        assert_eq!(
+            input.interner[Token(19_999)].as_slice(),
+            format!("{:064}\n", 19_999).as_bytes()
+        );
+        assert!(
+            harness.arena.begin_pinned_scope(&mut |_| Ok(())).is_err(),
+            "trace scope must reject an overlapping prepared-token phase"
+        );
+
+        let output = try_copy_bytes(&[b'o'; 67], &mut |e| harness.check(e)).unwrap();
+        let mut freed_since_check = 0;
+        let mut stopped = false;
+        input.clear_with_control(&mut |event| {
+            harness.check(event)?;
+            match event.stage {
+                Stage::BackingFreed { .. } => freed_since_check += 1,
+                Stage::Cleanup => {
+                    assert!(
+                        freed_since_check <= 32,
+                        "token destruction exceeded its cleanup quantum"
+                    );
+                    freed_since_check = 0;
+                    stopped = true;
+                    return Err(Cancelled);
+                }
+                _ => {}
+            }
+            Ok(())
+        });
+        assert!(stopped);
+        assert_eq!(
+            harness.budget.count(65),
+            0,
+            "reset must refund all physically freed tokens"
+        );
+        assert_eq!(input.interner.num_tokens(), 0);
+        harness.arena.begin_retention().unwrap();
+        input.retain_backings(&mut |e| harness.check(e)).unwrap();
+        gix_imara_diff::control::retain_vec(&output, &mut |e| harness.check(e)).unwrap();
+        harness.arena.end_retention(&mut |_| Ok(())).unwrap();
+        assert_eq!(
+            harness.budget.count(67),
+            1,
+            "unrelated surviving output must stay charged"
+        );
+        assert_eq!(output, [b'o'; 67]);
+        harness.arena.begin_pinned_scope(&mut |_| Ok(())).unwrap();
+        assert_eq!(
+            input.try_intern(b"no overlapping token phase\n", &mut |e| harness.check(e)),
+            Err(Cancelled)
+        );
+        assert_eq!(input.interner.num_tokens(), 0);
+        harness.arena.end_pinned_scope();
+
+        // Reuse the actual retained outer/index capacity after a history reset.
+        let token = input.try_intern(b"after reset\n", &mut |e| harness.check(e)).unwrap();
+        assert_eq!(token, Token(0));
+        assert_eq!(input.interner[token].as_slice(), b"after reset\n");
+        input.clear_with_control(&mut |e| harness.check(e));
+        drop(input);
+        drop(output);
+        harness.arena.clear_with_control(&mut |_| Err(Cancelled));
+        assert_eq!(harness.budget.total(), 0);
+    }
+
+    #[test]
+    fn ownership_transfer_denial_and_copy_stop_destroy_private_tokens() {
+        let mut harness = Harness::new();
+        let mut input = OwnedByteInput::default();
+        let mut denied_transfer = false;
+        let result = input.try_intern(&[b'x'; 65], &mut |event| {
+            if matches!(event.stage, Stage::BackingOwned { .. }) {
+                assert_eq!(
+                    harness.budget.count(65),
+                    1,
+                    "the still-live owner must already be charged"
+                );
+                harness.budget.0.lock().unwrap().deny = true;
+                let result = harness.check(event);
+                harness.budget.0.lock().unwrap().deny = false;
+                denied_transfer = result.is_err();
+                return result;
+            }
+            harness.check(event)
+        });
+        assert_eq!(result, Err(Cancelled));
+        assert!(
+            denied_transfer,
+            "must deny real registry metadata admission before moving a lease"
+        );
+        assert_eq!(input.interner.num_tokens(), 0);
+        assert_eq!(harness.budget.count(65), 0);
+
+        input.try_intern(&[b'a'; 65], &mut |e| harness.check(e)).unwrap();
+        let mut reached = false;
+        let result = input.try_intern(&vec![b'b'; 2 * BYTE_CHUNK], &mut |event| {
+            harness.check(event)?;
+            if event.stage == Stage::Copy && event.processed == BYTE_CHUNK {
+                reached = true;
+                return Err(Cancelled);
+            }
+            Ok(())
+        });
+        assert!(reached && result == Err(Cancelled));
+        assert_eq!(input.interner.num_tokens(), 0);
+        assert_eq!(
+            harness.budget.count(65),
+            0,
+            "prior tokens must not leak on a later insertion stop"
+        );
+        drop(input);
+        harness.arena.clear_with_control(&mut |_| Err(Cancelled));
+        assert_eq!(harness.budget.total(), 0);
+    }
+
+    #[test]
+    fn generic_interner_compatibility_does_not_grant_exclusive_ownership() {
+        let mut interner = Interner::new(0);
+        let first = interner.intern(b"generic\n".to_vec());
+        assert_eq!(interner.try_intern_bytes(b"generic\n", &mut |_| Ok(())).unwrap(), first);
+        assert_eq!(interner.retain_byte_backings(&mut |_| Ok(())), Err(Cancelled));
+        interner.erase_tokens_after(first);
+        assert_eq!(interner.num_tokens(), 0);
+        interner.intern(b"another\n".to_vec());
+        interner.clear();
+        assert_eq!(interner.num_tokens(), 0);
+    }
+
+    #[test]
+    fn stop_during_owned_registry_growth_finishes_move_before_freeing_tokens() {
+        let mut harness = Harness::new();
+        harness.stop_owned_move = true;
+        let mut input = OwnedByteInput::default();
+        let mut stopped = false;
+        for id in 0..256 {
+            let line = format!("{id:064}\n");
+            if input.try_intern(line.as_bytes(), &mut |e| harness.check(e)).is_err() {
+                stopped = true;
+                break;
+            }
+        }
+        assert!(
+            stopped && harness.move_stopped,
+            "must stop in actual lease relocation, not allocation setup"
+        );
+        assert_eq!(input.interner.num_tokens(), 0);
+        assert_eq!(
+            harness.budget.count(65),
+            0,
+            "stopped relocation must preserve leases until owner cleanup"
+        );
+        drop(input);
+        harness.arena.clear_with_control(&mut |_| Err(Cancelled));
+        assert_eq!(harness.budget.total(), 0);
+    }
+
+    #[test]
+    fn relocation_panic_never_refunds_storage_whose_owner_is_still_alive() {
+        let mut harness = Harness::new();
+        harness.panic_owned_move = true;
+        let mut input = OwnedByteInput::default();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            for id in 0..256 {
+                let line = format!("{id:064}\n");
+                input.try_intern(line.as_bytes(), &mut |e| harness.check(e)).unwrap();
+            }
+        }));
+        let payload = result.expect_err("must reach a callback panic inside actual lease relocation");
+        let message = payload
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| payload.downcast_ref::<String>().map(String::as_str));
+        assert_eq!(message, Some("owned lease relocation callback panic"));
+        let count = input.interner.num_tokens();
+        assert!(count > 32);
+        // The public owner is intentionally outside catch_unwind. Its physical
+        // storage is demonstrably still accessible: no lease may be refunded
+        // merely because a registry move or its callback unwound. This is not a
+        // private call-order assertion. Production immediately destroys the
+        // enclosing owner on unwind; this test observes the state before that.
+        for id in 0..count {
+            assert_eq!(input.interner[Token(id)].as_slice(), format!("{id:064}\n").as_bytes());
+        }
+        assert_eq!(
+            harness.budget.count(65),
+            count as usize,
+            "all surviving token owners must stay charged"
+        );
+        harness.panic_owned_move = false;
+        input.clear_with_control(&mut |e| harness.check(e));
+        assert_eq!(harness.budget.count(65), 0);
+        drop(input);
+        harness.arena.clear_with_control(&mut |_| Err(Cancelled));
+        assert_eq!(harness.budget.total(), 0);
+    }
+}
+
 #[test]
 fn large_distinct_token_diff_batches_numeric_work_without_losing_inner_stops() {
     use gix_imara_diff::Token;

@@ -143,6 +143,18 @@ pub(super) struct PreparedOwner<'a, 'b, 'c> {
     pub shared: &'a Shared<'b, 'c>,
 }
 
+/// The external platform can outlive the request arena. On panic it must free
+/// raw request storage before that arena unwinds, without re-entering a possibly
+/// panicking application callback. Normal exits use the checked cleanup path.
+pub(super) struct UnwindResources<'a>(pub &'a mut gix_diff::blob::Platform);
+impl Drop for UnwindResources<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.clear_controlled_raw(&mut |_| Ok(()));
+        }
+    }
+}
+
 pub(super) struct ByteOwner<'a, 'b, 'c> {
     pub data: gix_diff::blob::byte_input::ByteInput,
     pub shared: &'a Shared<'b, 'c>,
@@ -166,7 +178,14 @@ impl std::ops::DerefMut for PreparedOwner<'_, '_, '_> {
 impl Drop for PreparedOwner<'_, '_, '_> {
     fn drop(&mut self) {
         if let Some(input) = self.data.as_mut() {
-            input.clear_with_control(&mut **self.shared.borrow_mut());
+            if std::thread::panicking() {
+                // Do not invoke a possibly panicking application callback twice.
+                // The arena outlives this owner, so unwind releases its leases
+                // only after all token storage is physically destroyed here.
+                input.clear_with_control(&mut |_| Ok(()));
+            } else {
+                input.clear_with_control(&mut **self.shared.borrow_mut());
+            }
         }
     }
 }

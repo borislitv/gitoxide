@@ -1,5 +1,76 @@
 # Request-local controls
 
+## Prepared exclusive token leases
+
+The prepared-input path uses a sealed `OwnedByteInput`: its private interner owns
+immutable `Vec<u8>` token backings, not shared references. Only numeric before/
+after sequences can be mutated externally. Generic `Interner` insertion, clear,
+erase and mixed-input behavior remain unchanged; generic storage cannot be
+converted into this exclusive owner or receive its census exemption.
+
+Each newly inserted nonempty token emits `BackingOwned` with its actual backing
+identity and capacity. The admitted adapter transfers the already charged lease
+to a separate owner registry; failed metadata admission leaves the old charge
+intact. Admission includes all three registries, their actual capacities, pending
+leases and old/new metadata peaks under the unchanged aggregate reservation cap.
+Registry growth reserves empty replacement storage, then explicitly relocates
+leases with checks every 32 entries. After stop it finishes the move before
+propagating the error; no still-owned lease is destroyed by an interrupted move.
+Callback panic during relocation is likewise deferred until the complete map
+has been restored, then resumed without invoking that callback again. A test
+keeps the public token owner outside the unwind boundary, reads its live bytes
+after catching the panic, and requires every surviving backing still charged.
+The owner registry is not swept or re-marked at each commit: its only removals
+are explicit notifications after physical token destruction or ordered arena
+destruction after all owners. This is a per-backing ownership protocol, not a
+global controlled-input flag or inferred proof from progress.
+
+Prepared censuses still enumerate the mutable token Vec, both numeric sequences,
+both byte-index arrays and offset buffers. History reset/clear drops each token
+Vec before `BackingFreed` refunds its charge, with cleanup checks after at most
+32 token destructions. A stop cannot skip remaining frees/refunds. Reused outer
+Vec/index capacity remains allocated and charged. Insertion/transfer errors clear
+private tokens and invalidate the sequential hint before returning an error.
+The optional history quota remains 1024 tokens / 64 MiB plus complete active-pair
+credit; no token, line, object, mapping or registry limits are raised.
+
+`PreparedOwner` provides ordered cleanup for normal return, early error and
+cancellation. On panic unwind it frees token storage without invoking a possibly
+panicking callback again; the enclosing arena releases conservative leases only
+after the owner is destroyed. The external raw-resource platform has an unwind
+guard so request storage cannot outlive that arena during this path. No panic is
+converted into successful output. Explicit owner releases precede native-trace
+construction; the existing nonnested trace scope rejects a still-live exclusive
+token phase, and token transfer rejects an active trace scope.
+
+For C commit censuses and U fresh token allocations (including resets), token
+ownership maintenance is expected O(C + U), rather than O(C times all interned
+tokens). Mutable scratch census/registry work and actual diff, hashing, indexing
+and attribution costs remain separate. The owner hash-table capacity is retained
+and charged until reuse or arena destruction; its entries are not scanned per
+commit. No application latency improvement is claimed from this bound.
+
+Qualification with Rust 1.99.1 and genuine ELF Git 2.56.0 passes all 306 non-doc
+tests and six doc tests in both debug and optimized builds, including both actual
+160000-commit histories and the unchanged native/default/all/memo suites. Strict
+all-target Clippy passes. The active 20000-token pair keeps all live token charges,
+refunds dead scratch, and emits 160 mutable-root marks across 32 censuses. Restoring
+the full token census emits 640160 marks and fails the intended work assertion.
+Seven other compiled faults fail intended behavioral assertions: missing owner
+protection, premature refund, interrupted relocation dropping live charges,
+missing after-free release, overlong cleanup/relocation quanta and missing external
+raw-resource unwind cleanup. All faults are restored before final verification.
+These are ownership and work bounds, not prepared/hosted latency acceptance.
+
+Existing blame entrypoint signatures, `Outcome`, statistics, `Tuning`, allocation
+traits and generic interner APIs are unchanged. `OwnedByteInput` is an additional
+byte-input API, not a replacement public output type. Direct allocation-protocol
+adapters must route `BackingOwned` to `Allocations::own(address, check)` and
+`BackingFreed` to `Allocations::freed(address)` before ordinary stop handling;
+admitted blame entrypoints already do this internally. No new statistics fields
+or memo wire changes are required. Exhaustive `Stage` matches must account for the
+two new variants. Earlier qualification results below remain historical.
+
 ## Opt-in completed mappings
 
 `file_with_allocations_trace_and_memo` adds a final `memo::MappingRequest`

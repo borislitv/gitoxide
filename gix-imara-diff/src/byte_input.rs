@@ -3,6 +3,7 @@
 use std::hash::{DefaultHasher, Hasher};
 
 use crate::control::{BYTE_CHUNK, Cancelled, Check, Stage, poll};
+pub use crate::intern::OwnedByteInput;
 use crate::{InternedInput, Interner, Token};
 
 #[derive(Clone, Copy)]

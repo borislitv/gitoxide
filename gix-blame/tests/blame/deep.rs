@@ -188,8 +188,95 @@ fn complete_160000_changed_history_reuses_live_scratch_with_selected_tuning() ->
     assert_eq!(result.outcome().entries[1].start_in_blamed_file, 1);
     assert_eq!(result.outcome().entries[1].len.get(), 1);
     assert_eq!(result.outcome().blob, b"anchor\nvalue-159999\n");
+    let (live, peak) = *state.lock().unwrap();
+    assert!(
+        live >= result.outcome().blob.capacity(),
+        "surviving output must stay charged"
+    );
+    assert!(
+        peak < 4 * 1024 * 1024,
+        "two active lines plus the 1024-token optional history must reset, not accumulate 160000 token leases: {peak}"
+    );
     drop(result);
     assert_eq!(state.lock().unwrap().0, 0);
+    Ok(())
+}
+
+#[test]
+fn prepared_token_owners_are_destroyed_on_later_cancel_and_panic() -> gix_testtools::TestResult {
+    for panic in [false, true] {
+        let mut history = History(HashMap::new());
+        let mut parent = None;
+        for revision in 0..8 {
+            let blob = history.insert(Kind::Blob, format!("anchor\nvalue-{revision}\n").into_bytes());
+            let mut tree = b"100644 file.txt\0".to_vec();
+            tree.extend_from_slice(blob.as_bytes());
+            let tree = history.insert(Kind::Tree, tree);
+            let parent_header = parent.map_or(String::new(), |id: gix_hash::ObjectId| format!("parent {id}\n"));
+            let body = format!(
+                "tree {tree}\n{parent_header}author Fixture <fixture@example.invalid> {} +0000\ncommitter Fixture <fixture@example.invalid> {} +0000\n\nChanged history\n",
+                revision + 1,
+                revision + 1
+            );
+            parent = Some(history.insert(Kind::Commit, body.into_bytes()));
+        }
+        let mut platform = super::Fixture::new()?.resource_cache;
+        let state = Arc::new(Mutex::new((0, 0)));
+        let mut reached = false;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            gix_blame::file_with_allocations(
+                history,
+                gix_blame::Start::Commit(parent.unwrap()),
+                None,
+                &mut platform,
+                "file.txt".into(),
+                gix_blame::Options {
+                    diff_algorithm: gix_diff::blob::Algorithm::Myers,
+                    rewrites: Some(gix_diff::Rewrites::default()),
+                    ..Default::default()
+                },
+                gix_blame::Tuning {
+                    reuse_line_tokens: true,
+                    retain_current_input_tokens: true,
+                    reuse_unchanged_runs: true,
+                    bounded_resource_cache: true,
+                    index_changes: true,
+                },
+                Arc::new(Budget(state.clone(), 4 * 1024 * 1024)),
+                &mut |event| {
+                    if event.stage == gix_diff::blob::control::Stage::Commit && event.processed == 3 {
+                        reached = true;
+                        assert!(!panic, "application callback panic after actual prepared-token reuse");
+                        return Err(Cancelled);
+                    }
+                    Ok(())
+                },
+            )
+        }));
+        assert!(reached, "must reach a later real traversal step");
+        if panic {
+            assert!(
+                result.is_err(),
+                "callback panic must unwind rather than become successful output"
+            );
+        } else {
+            assert!(result.unwrap().is_err(), "a later stop must not return partial output");
+        }
+        let mut platform_roots = 0;
+        platform.retain_controlled_backings(&mut |_| {
+            platform_roots += 1;
+            Ok(())
+        })?;
+        assert_eq!(
+            platform_roots, 0,
+            "external raw storage must not outlive the failed job arena"
+        );
+        assert_eq!(
+            state.lock().unwrap().0,
+            0,
+            "all owned storage must be released on either exit"
+        );
+    }
     Ok(())
 }
 
