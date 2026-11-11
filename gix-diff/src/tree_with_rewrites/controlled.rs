@@ -1,5 +1,8 @@
 //! Raw-object, request-controlled tree and rewrite traversal.
-use std::{cell::RefCell, collections::VecDeque};
+use std::{
+    cell::{Cell, RefCell},
+    collections::VecDeque,
+};
 
 use bstr::{BStr, ByteSlice};
 use gix_error::{ErrorExt, Result, message};
@@ -14,11 +17,26 @@ use crate::{
 
 type Shared<'a, 'b> = RefCell<&'a mut Check<'b>>;
 
+struct RawResources<'a>(&'a mut crate::blob::Platform);
+impl Drop for RawResources<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            // The caller's arena can unwind before its external platform does.
+            // Free raw owners first without re-entering a panicking callback.
+            self.0.clear_controlled_raw(&mut |_| Ok(()));
+        }
+    }
+}
+
 /// Like the ordinary tree/rewrite diff, but only raw immutable resources may be
 /// used. All callbacks and the object provider must themselves honour control.
 /// Partial emissions must be discarded if this function returns an error.
 /// Root iterators and trees returned by the provider must have had their record
 /// sizes validated before the ordinary object parser is invoked.
+/// Successful no-rewrite discovery preserves the caller's bounded raw pair,
+/// including an intentional consumer break. Reuse requires the same immutable
+/// provider and raw options; callers must clear on a request/source change.
+/// Rewrite phases and failures clear raw resources; cleanup cannot be stopped.
 #[expect(clippy::too_many_arguments)]
 pub fn diff_with_control(
     lhs: TreeRefIter<'_>,
@@ -31,8 +49,25 @@ pub fn diff_with_control(
     check: &mut Check<'_>,
 ) -> std::result::Result<Option<rewrites::Outcome>, tree::Error> {
     resource_cache.validate_controlled_raw()?;
-    let shared = RefCell::new(check);
+    let owner = RawResources(resource_cache);
+    let resource_cache = &mut *owner.0;
+    let stopped = Cell::new(false);
+    let mut forwarding = |event| {
+        let result = check(event);
+        if result.is_err() {
+            stopped.set(true);
+        }
+        result
+    };
+    let shared = RefCell::new(&mut forwarding as &mut Check<'_>);
     let mut tracked = options.rewrites.map(rewrites::Tracker::new);
+    if tracked.is_some() {
+        resource_cache.clear_controlled_raw(&mut |e| (**shared.borrow_mut())(e));
+        if stopped.get() {
+            return Err(tree::Error::Failure(control::Cancelled.raise()));
+        }
+    }
+    let mut consumer_break = false;
     let result = walk(
         lhs,
         rhs,
@@ -43,11 +78,19 @@ pub fn diff_with_control(
         &mut |change, path| match tracked.as_mut() {
             Some(tracked) => {
                 match tracked.push_change_with_control(change, path, &mut |e| (**shared.borrow_mut())(e))? {
-                    Some(change) => for_each(attach(change, path)),
+                    Some(change) => {
+                        let action = for_each(attach(change, path))?;
+                        consumer_break = action.is_break();
+                        Ok(action)
+                    }
                     None => Ok(Action::Continue(())),
                 }
             }
-            None => for_each(attach(change, path)),
+            None => {
+                let action = for_each(attach(change, path))?;
+                consumer_break = action.is_break();
+                Ok(action)
+            }
         },
     );
     let mut callback_error = None;
@@ -80,7 +123,10 @@ pub fn diff_with_control(
                     // Preserve callback failures rather than turning them into an
                     // intentional early-stop action.
                     match for_each(change) {
-                        Ok(action) => action,
+                        Ok(action) => {
+                            consumer_break = action.is_break();
+                            action
+                        }
                         Err(error) => {
                             callback_error = Some(error);
                             Action::Break(())
@@ -127,11 +173,29 @@ pub fn diff_with_control(
     if let Some(tracked) = tracked.as_mut() {
         tracked.clear_with_control(&mut |e| (**shared.borrow_mut())(e));
     }
-    resource_cache.clear_controlled_raw(&mut |e| (**shared.borrow_mut())(e));
-    match callback_error {
+    let result = match callback_error {
         Some(error) => Err(tree::Error::Failure(error)),
         None => result,
+    };
+    // The tree API reports consumer Break as Cancelled. Never mistake a
+    // callback/provider/control failure for that successful early discovery.
+    let discovered = result.is_ok() || (consumer_break && matches!(result, Err(tree::Error::Cancelled)));
+    if tracked.is_some() || !discovered {
+        resource_cache.clear_controlled_raw(&mut |e| (**shared.borrow_mut())(e));
     }
+    if discovered {
+        let final_check = (**shared.borrow_mut())(Checkpoint {
+            stage: Stage::Graph,
+            processed: 0,
+        });
+        // Cleanup checks intentionally finish freeing paths after an error;
+        // even a one-shot failure there must veto successful preservation.
+        if final_check.is_err() || stopped.get() {
+            resource_cache.clear_controlled_raw(&mut |e| (**shared.borrow_mut())(e));
+            return Err(tree::Error::Failure(control::Cancelled.raise()));
+        }
+    }
+    result
 }
 
 fn attach(change: tree::visit::Change, location: &BStr) -> ChangeRef<'_> {

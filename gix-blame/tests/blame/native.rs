@@ -328,6 +328,124 @@ impl gix_blame::memo::MappingMemo for MemoryMemo {
 }
 
 #[test]
+fn request_local_raw_pair_reuses_each_intermediate_blob_across_modified_edges() {
+    struct Reads<T> {
+        inner: T,
+        blobs: std::cell::RefCell<std::collections::HashMap<ObjectId, usize>>,
+    }
+    impl<T: gix_object::FindHeader> gix_object::FindHeader for Reads<T> {
+        fn try_header(&self, id: &gix_hash::oid) -> gix_error::Result<Option<gix_object::Header>> {
+            self.inner.try_header(id)
+        }
+    }
+    impl<T: gix_object::Find + gix_object::FindHeader> gix_object::Find for Reads<T> {
+        fn try_find<'a>(
+            &self,
+            id: &gix_hash::oid,
+            buffer: &'a mut Vec<u8>,
+        ) -> gix_error::Result<Option<gix_object::Data<'a>>> {
+            if self
+                .inner
+                .try_header(id)?
+                .is_some_and(|header| header.kind == gix_object::Kind::Blob)
+            {
+                *self.blobs.borrow_mut().entry(id.to_owned()).or_default() += 1;
+            }
+            self.inner.try_find(id, buffer)
+        }
+    }
+    let repo = Repo::new();
+    let contents = [
+        b"anchor\nzero\n".as_slice(),
+        b"anchor\none\n",
+        b"anchor\ntwo\n",
+        b"anchor\nthree\n",
+    ];
+    let mut tip = None;
+    let mut root = None;
+    let mut blobs = Vec::new();
+    for (index, bytes) in contents.iter().enumerate() {
+        blobs.push(repo.object("blob", bytes));
+        let id = repo.commit(
+            &[(b"f", bytes, "100644")],
+            &tip.into_iter().collect::<Vec<_>>(),
+            index as u32 + 1,
+        );
+        root.get_or_insert(id);
+        tip = Some(id);
+    }
+    let tip = tip.unwrap();
+    let native = repo.assert_blame(tip, b"f");
+    assert_eq!(
+        native.iter().map(|line| line.commit).collect::<Vec<_>>(),
+        vec![root.unwrap(), tip]
+    );
+    for tuning in [
+        gix_blame::Tuning::default(),
+        gix_blame::Tuning {
+            reuse_line_tokens: true,
+            retain_current_input_tokens: true,
+            reuse_unchanged_runs: true,
+            bounded_resource_cache: true,
+            index_changes: true,
+        },
+    ] {
+        let source = Reads {
+            inner: gix_odb::at(repo.0.path().join("objects"), super::fixture_hash_kind()).unwrap(),
+            blobs: Default::default(),
+        };
+        let mut platform = super::Fixture::new().unwrap().resource_cache;
+        let state = Arc::new(Mutex::new((0, 0)));
+        let output = gix_blame::file_with_allocations(
+            &source,
+            gix_blame::Start::Commit(tip),
+            None,
+            &mut platform,
+            "f".into(),
+            gix_blame::Options {
+                diff_algorithm: gix_diff::blob::Algorithm::Myers,
+                rewrites: Some(Default::default()),
+                ..Default::default()
+            },
+            tuning,
+            Arc::new(super::deep::Budget(state.clone(), 4 * 1024 * 1024)),
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(output.outcome().blob, contents[3]);
+        assert_eq!(
+            output
+                .outcome()
+                .entries
+                .iter()
+                .map(|entry| entry.commit_id)
+                .collect::<Vec<_>>(),
+            vec![root.unwrap(), tip]
+        );
+        // Three edges acquire four raw resources. The initial output reads the
+        // tip once separately; debug invariants read each non-root suspect once.
+        let expected = if cfg!(debug_assertions) {
+            [1, 2, 2, 3]
+        } else {
+            [1, 1, 1, 2]
+        };
+        let actual = blobs.iter().map(|id| source.blobs.borrow()[id]).collect::<Vec<_>>();
+        assert_eq!(actual, expected, "intermediate raw inputs must not be reacquired");
+        eprintln!("RAW_PAIR_3 blob_reads={actual:?}");
+        drop(output);
+        assert_eq!(state.lock().unwrap().0, 0);
+        let mut roots = 0;
+        platform
+            .retain_controlled_backings(&mut |_| {
+                roots += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(roots, 0, "the pair must not escape the request");
+    }
+}
+
+#[test]
 fn unrenamed_fragmented_history_bounds_path_work_and_stops_inside_origin_guard() {
     use gix_diff::blob::control::{BYTE_CHUNK, Cancelled, Stage};
     const REVISIONS: usize = 256;

@@ -1,5 +1,54 @@
 # Request-local controls
 
+## Request-local raw pair reuse
+
+Controlled blame clears a borrowed raw platform at request entry before reading
+objects, establishing provider provenance and new-job admission. A successful
+no-tracker tree discovery then preserves its existing bounded pair. An explicit
+consumer Break is also a successful discovery: the tree API reports that as
+`tree::Error::Cancelled`, so it must be distinguished from callback, provider and
+control failures. No error is treated as a cache hit or partial successful blame.
+
+Raw blob selection sets the actual target before the actual parent. In reverse
+history, this protects the previous parent as the next target instead of evicting
+it while loading a new parent. This is opportunistic byte reuse, not a sequential
+ancestry assumption: parent order, deferred origins, exact raw paths, tree modes,
+native trace and mapping identity remain authoritative and unchanged.
+
+Reuse is limited to the same immutable provider and fixed raw options. Object ID
+and link distinction identify raw bytes, not snapshot membership or authorization.
+The public controlled tree entrypoint documents that callers must clear when
+changing request/source context. No new entrypoint, option, Stage variant, output
+field or cache key is introduced. Worktree/filter/driver paths remain rejected.
+All actual acquisitions still use the existing provider and physical verification.
+
+Rewrite-enabled discovery clears raw resources both before and after its phase;
+its similarity candidates are never promoted to the caller's selected pair.
+Failures clear all raw storage. A strict final Graph checkpoint and remembered
+control failures, including one-shot cleanup failures, veto preservation. Cleanup
+finishes despite stop; panic frees the external platform without re-entering the
+panicking callback. Existing request-exit cleanup, admission and complete backing
+censuses remain in place. There is no new cache, budget, lifetime exemption,
+early lease refund, token-quota change or polling relaxation.
+
+Rust 1.99.1 / genuine Git 2.56.0 qualification passes 317 non-doc and six doc tests
+in each of debug and release, including both actual 160000-commit histories,
+all native/default/all/memo cases, strict all-target Clippy and formatting.
+Seven new public-interface tests cover both full-walk and normal Break reuse,
+provider-context reset, late provider/admission failure, callback/control/cleanup
+failure, panic, rewrite isolation and actual live-backing census charges.
+
+For three modified edges, the raw traversal test acquires four resources versus
+six on the original code. Public native-checked blame reads each intermediate
+blob once in release, with the separately required initial tip read retained;
+debug adds its existing invariant reads. Ten compiled fault controls fail intended
+behavioral assertions before restoration, including unconditional clearing,
+preserve-only-Ok, old source ordering, missing request reset, failure preservation,
+forgotten cleanup stop, missing final control, panic cleanup, rewrite reset and
+census marking. These are correctness and call-count results, not application
+latency measurements or prepared/hosted acceptance. Earlier results below are
+historical qualifications of preceding revisions.
+
 ## Guarded in-place origin selection
 
 A conservative hunk-selection guard can leave the existing hunk Vec in place

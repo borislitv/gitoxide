@@ -74,6 +74,142 @@ impl gix_object::Find for History {
 }
 
 #[test]
+fn raw_pair_entry_discards_another_providers_prepopulated_resources() -> gix_testtools::TestResult {
+    let mut source_a = History(HashMap::new());
+    let parent_blob = source_a.insert(Kind::Blob, b"anchor\nold\n".to_vec());
+    let tip_blob = source_a.insert(Kind::Blob, b"anchor\nnew\n".to_vec());
+    let mut commit = |blob: gix_hash::ObjectId, parent: Option<gix_hash::ObjectId>, time| {
+        let mut tree = b"100644 f\0".to_vec();
+        tree.extend_from_slice(blob.as_bytes());
+        let tree = source_a.insert(Kind::Tree, tree);
+        let parent = parent.map_or(String::new(), |id| format!("parent {id}\n"));
+        source_a.insert(Kind::Commit, format!("tree {tree}\n{parent}author Fixture <fixture@example.invalid> {time} +0000\ncommitter Fixture <fixture@example.invalid> {time} +0000\n\nPhysical history\n").into_bytes())
+    };
+    let parent = commit(parent_blob, None, 1);
+    let tip = commit(tip_blob, Some(parent), 2);
+    let mut platform = super::Fixture::new()?.resource_cache;
+    for (id, side) in [
+        (parent_blob, gix_diff::blob::ResourceKind::OldOrSource),
+        (tip_blob, gix_diff::blob::ResourceKind::NewOrDestination),
+    ] {
+        platform.set_resource_controlled_raw(
+            id,
+            gix_object::tree::EntryKind::Blob,
+            "f".into(),
+            side,
+            &source_a,
+            &mut |_| Ok(()),
+        )?;
+    }
+    assert_eq!(platform.controlled_raw_buffers()?.0, b"anchor\nold\n");
+    // B contains the physical commits/trees and tip, but not the parent blob.
+    // A's valid bytes cannot manufacture membership in B's source context.
+    let mut source_b = source_a;
+    source_b.0.remove(&parent_blob);
+    let state = Arc::new(Mutex::new((0, 0)));
+    let result = gix_blame::file_with_allocations(
+        source_b,
+        gix_blame::Start::Commit(tip),
+        None,
+        &mut platform,
+        "f".into(),
+        Default::default(),
+        Default::default(),
+        Arc::new(Budget(state.clone(), 4 * 1024 * 1024)),
+        &mut |_| Ok(()),
+    );
+    assert!(
+        result.is_err(),
+        "another provider's pair cannot satisfy a missing physical input"
+    );
+    let mut roots = 0;
+    platform.retain_controlled_backings(&mut |_| {
+        roots += 1;
+        Ok(())
+    })?;
+    assert_eq!(roots, 0);
+    assert_eq!(state.lock().unwrap().0, 0);
+    Ok(())
+}
+
+#[test]
+fn raw_pair_later_provider_and_admission_failures_release_storage_and_charges() -> gix_testtools::TestResult {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    struct LaterDenial {
+        budget: Budget,
+        deny: Arc<AtomicBool>,
+    }
+    impl Allocator for LaterDenial {
+        fn reserve(&self, bytes: usize) -> Result<Box<dyn Allocation>, Cancelled> {
+            if self.deny.load(Ordering::Relaxed) {
+                Err(Cancelled)
+            } else {
+                self.budget.reserve(bytes)
+            }
+        }
+    }
+    for missing_blob in [false, true] {
+        let mut history = History(HashMap::new());
+        let mut parent = None;
+        let mut root_blob = None;
+        for revision in 0..8 {
+            let blob = history.insert(Kind::Blob, format!("anchor\nvalue-{revision}\n").into_bytes());
+            root_blob.get_or_insert(blob);
+            let mut tree = b"100644 f\0".to_vec();
+            tree.extend_from_slice(blob.as_bytes());
+            let tree = history.insert(Kind::Tree, tree);
+            let parent_header = parent.map_or(String::new(), |id| format!("parent {id}\n"));
+            parent = Some(history.insert(Kind::Commit, format!("tree {tree}\n{parent_header}author Fixture <fixture@example.invalid> {} +0000\ncommitter Fixture <fixture@example.invalid> {} +0000\n\nChanged history\n", revision + 1, revision + 1).into_bytes()));
+        }
+        if missing_blob {
+            history.0.remove(&root_blob.unwrap());
+        }
+        let mut platform = super::Fixture::new()?.resource_cache;
+        let state = Arc::new(Mutex::new((0, 0)));
+        let deny = Arc::new(AtomicBool::new(false));
+        let mut reached = false;
+        let result = gix_blame::file_with_allocations(
+            history,
+            gix_blame::Start::Commit(parent.unwrap()),
+            None,
+            &mut platform,
+            "f".into(),
+            Default::default(),
+            gix_blame::Tuning {
+                reuse_line_tokens: true,
+                retain_current_input_tokens: true,
+                reuse_unchanged_runs: true,
+                bounded_resource_cache: true,
+                index_changes: true,
+            },
+            Arc::new(LaterDenial {
+                budget: Budget(state.clone(), 4 * 1024 * 1024),
+                deny: deny.clone(),
+            }),
+            &mut |event| {
+                if event.stage == gix_diff::blob::control::Stage::Commit && event.processed == 3 {
+                    reached = true;
+                    if !missing_blob {
+                        deny.store(true, Ordering::Relaxed);
+                    }
+                }
+                Ok(())
+            },
+        );
+        assert!(reached, "must perform actual pair reuse before failure");
+        assert!(result.is_err(), "failure cannot return a partial blame");
+        let mut roots = 0;
+        platform.retain_controlled_backings(&mut |_| {
+            roots += 1;
+            Ok(())
+        })?;
+        assert_eq!(roots, 0);
+        assert_eq!(state.lock().unwrap().0, 0);
+    }
+    Ok(())
+}
+
+#[test]
 fn complete_160000_commit_history_has_a_small_live_capacity_budget() -> gix_testtools::TestResult {
     let mut history = History(HashMap::new());
     let blob = history.insert(Kind::Blob, b"one\n".to_vec());

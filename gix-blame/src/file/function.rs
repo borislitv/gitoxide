@@ -653,6 +653,17 @@ fn file_controlled(
         return Err(message("controlled blame path exceeds 64 KiB metadata limit").into());
     }
     let resource_owner = super::bounded::UnwindResources(resource_cache);
+    // A borrowed platform can have been populated by another request/provider.
+    // Its OID-only byte keys are not source membership or admission authority.
+    let mut stopped = false;
+    resource_owner.0.clear_controlled_raw(&mut |event| {
+        let result = check(event);
+        stopped |= result.is_err();
+        result
+    });
+    if stopped {
+        return Err(gix_diff::blob::control::Cancelled.raise());
+    }
     let shared = std::cell::RefCell::new(check);
     let objects = super::bounded::Objects {
         inner: odb,
@@ -1863,19 +1874,21 @@ fn blob_changes(
 ) -> Result<Vec<Change>> {
     poll(check, Stage::Preprocess, 0)?;
     if raw {
-        resource_cache.set_resource_controlled_raw(
-            previous_oid,
-            gix_object::tree::EntryKind::Blob,
-            previous_file_path,
-            gix_diff::blob::ResourceKind::OldOrSource,
-            &odb,
-            check,
-        )?;
+        // In reverse history the previous source is the next target. Select it
+        // first so source acquisition protects it instead of the stale target.
         resource_cache.set_resource_controlled_raw(
             oid,
             gix_object::tree::EntryKind::Blob,
             file_path,
             gix_diff::blob::ResourceKind::NewOrDestination,
+            &odb,
+            check,
+        )?;
+        resource_cache.set_resource_controlled_raw(
+            previous_oid,
+            gix_object::tree::EntryKind::Blob,
+            previous_file_path,
+            gix_diff::blob::ResourceKind::OldOrSource,
             &odb,
             check,
         )?;
