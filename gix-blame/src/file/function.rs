@@ -887,6 +887,16 @@ fn file_impl(
             continue 'outer;
         };
 
+        let all_current = all_hunks_for_origin(
+            &hunks_to_blame,
+            suspect,
+            file_path.as_ref(),
+            first_hunk_for_suspect
+                .source_file_name
+                .as_ref()
+                .map(|path| path.as_slice()),
+            check,
+        )?;
         let current_file_path: BString = try_copy_bytes(
             first_hunk_for_suspect
                 .source_file_name
@@ -897,27 +907,29 @@ fn file_impl(
         .into();
 
         let mut deferred = VecOwner::new(Vec::new(), &shared);
-        let mut selected = VecOwner::new(Vec::new(), &shared);
         let mut another_origin = false;
-        for hunk in hunks_to_blame.take_iter() {
-            let same = hunk.has_suspect(&suspect)
-                && gix_diff::blob::control::try_cmp_bytes(
-                    hunk.source_file_name
-                        .as_ref()
-                        .map_or(file_path.as_ref(), |p| p.as_slice()),
-                    &current_file_path,
-                    check,
-                )
-                .map_err(|e| e.raise())?
-                .is_eq();
-            if same {
-                gix_diff::blob::control::try_push(&mut selected, hunk, check).map_err(|e| e.raise())?;
-            } else {
-                another_origin |= hunk.has_suspect(&suspect);
-                gix_diff::blob::control::try_push(&mut deferred, hunk, check).map_err(|e| e.raise())?;
+        if !all_current {
+            let mut selected = VecOwner::new(Vec::new(), &shared);
+            for hunk in hunks_to_blame.take_iter() {
+                let same = hunk.has_suspect(&suspect)
+                    && gix_diff::blob::control::try_cmp_bytes(
+                        hunk.source_file_name
+                            .as_ref()
+                            .map_or(file_path.as_ref(), |p| p.as_slice()),
+                        &current_file_path,
+                        check,
+                    )
+                    .map_err(|e| e.raise())?
+                    .is_eq();
+                if same {
+                    gix_diff::blob::control::try_push(&mut selected, hunk, check).map_err(|e| e.raise())?;
+                } else {
+                    another_origin |= hunk.has_suspect(&suspect);
+                    gix_diff::blob::control::try_push(&mut deferred, hunk, check).map_err(|e| e.raise())?;
+                }
             }
+            *hunks_to_blame = selected.take();
         }
-        *hunks_to_blame = selected.take();
         'origin: {
             let commit = find_commit(cache.as_ref(), &odb, &suspect, &mut buf)?;
             let commit_time = commit.commit_time()?;
@@ -1311,6 +1323,54 @@ fn file_impl(
         statistics: stats,
         blame_path: options.debug_track_path.then(|| blame_path.take()),
     })
+}
+
+/// A conservative proof for retaining the existing hunk Vec. Multiple suspects
+/// always use the general partition, even if the current suspect is among them.
+/// No timestamp, cached path, first-parent or traversal-shape inference is used.
+fn all_hunks_for_origin(
+    hunks: &[UnblamedHunk],
+    suspect: ObjectId,
+    default_path: &[u8],
+    selected_path: Option<&[u8]>,
+    check: &mut Check<'_>,
+) -> Result<bool> {
+    // One fixed-width ObjectId comparison per hunk. Weight each by its complete
+    // representation and check within 4 KiB of fixed-ID work. Explicit paths
+    // retain their independent variable-byte comparison checks.
+    const ID_WEIGHT: usize = std::mem::size_of::<ObjectId>();
+    const HUNKS_PER_POLL: usize = BYTE_CHUNK / ID_WEIGHT;
+    poll(check, Stage::Attribution, 0)?;
+    let mut processed = 0;
+    for chunk in hunks.chunks(HUNKS_PER_POLL) {
+        for hunk in chunk {
+            processed += ID_WEIGHT;
+            if hunk.suspects.len() != 1 || hunk.suspects[0].0 != suspect {
+                poll(check, Stage::Attribution, processed)?;
+                return Ok(false);
+            }
+            if hunk.source_file_name.is_none() && selected_path.is_none() {
+                // Both refer to this call's exact original raw path; no bytes
+                // need to be re-compared for each unrenamed hunk.
+                continue;
+            }
+            if !gix_diff::blob::control::try_cmp_bytes(
+                hunk.source_file_name
+                    .as_ref()
+                    .map_or(default_path, |path| path.as_slice()),
+                selected_path.unwrap_or(default_path),
+                check,
+            )
+            .map_err(|error| error.raise())?
+            .is_eq()
+            {
+                poll(check, Stage::Attribution, processed)?;
+                return Ok(false);
+            }
+        }
+        poll(check, Stage::Attribution, processed)?;
+    }
+    Ok(true)
 }
 
 /// Pass ownership of each unblamed hunk of `from` to `to`.

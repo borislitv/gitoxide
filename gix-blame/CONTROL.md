@@ -1,5 +1,48 @@
 # Request-local controls
 
+## Guarded in-place origin selection
+
+A conservative hunk-selection guard can leave the existing hunk Vec in place
+only when every hunk has exactly one suspect, that ID is the current suspect,
+and its raw source path equals the selected origin's path. Two absent source-path
+overrides refer to the same original call path and need no byte comparison.
+Explicit overrides still use the existing chunk-checked raw-byte comparison.
+Any different suspect/path or multiple suspects selects the unchanged general
+partition and deferred-origin handling. No commit ordering, timestamp, cached
+identity, linear-history or root-origin shortcut supplies the proof.
+
+The guard polls at entry and after chunks weighted by the complete fixed-width
+ObjectId representation, within 4 KiB of ID work. Variable path comparisons keep
+their own byte checkpoints. It still scans all H hunks in the successful case;
+the intended reduction is partition rebuilding/pushes and redundant path work,
+not a claim that whole-query attribution becomes linear. Public APIs, counters,
+tuning, budgets, token quotas and resource-cache behavior are unchanged.
+
+Qualification with Rust 1.99.1 and genuine ELF Git 2.56.0 passes all 310 non-doc
+tests and six doc tests in both debug and optimized builds, plus strict all-target
+Clippy and formatting. Both actual 160000-commit histories and all existing
+native/default/all/memo/control cases pass. Four new public-entrypoint cases cover
+fragmented history, unrelated renamed roots, convergent paths on a modified shared
+ancestor, and explicit raw paths longer than 4 KiB. The latter retain native
+owner/path/trace parity and stop inside byte work with no partial output or charge.
+
+The 257-commit, 513-line fragmented fixture observes 1026 short-path equality
+checks, versus 34179 when forced through the original partition. Cancellation at
+visited commit 254 reaches 4092 weighted ID units and leaves no output or charge.
+These are fixture work counts, not an application latency measurement. Five
+compiled fault classes fail intended behavioral assertions: suspect equality
+removal, path-guard removal, restored partition rebuilding, missing inner polls
+and an overlong work quantum. Suspect removal corrupts native paths or loses an
+unrelated-root line; path removal misattributes a convergent-path line to an older
+commit. Both semantic faults are detected in debug and optimized builds. The old
+fixtures alone did not detect path-guard removal; the modified-ancestor case closes
+that demonstrated gap. All faults are restored before final qualification.
+
+No application latency, root-cause or acceptance improvement is claimed. Raw
+resource-cache lifetime and load ordering are unchanged and require separate
+ownership/error-cleanup qualification before any future optimization. Earlier
+qualified results below remain historical.
+
 ## Prepared exclusive token leases
 
 The prepared-input path uses a sealed `OwnedByteInput`: its private interner owns

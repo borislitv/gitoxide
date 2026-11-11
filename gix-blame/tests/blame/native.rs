@@ -328,6 +328,133 @@ impl gix_blame::memo::MappingMemo for MemoryMemo {
 }
 
 #[test]
+fn unrenamed_fragmented_history_bounds_path_work_and_stops_inside_origin_guard() {
+    use gix_diff::blob::control::{BYTE_CHUNK, Cancelled, Stage};
+    const REVISIONS: usize = 256;
+    let repo = Repo::new();
+    let mut lines: Vec<_> = (0..2 * REVISIONS + 1)
+        .map(|line| format!("original-{line:04}-distinct-content\n"))
+        .collect();
+    let mut tip = repo.commit(&[(b"file.txt", lines.concat().as_bytes(), "100644")], &[], 1);
+    for revision in 0..REVISIONS {
+        lines[2 * revision + 1] = format!("replacement-{revision:04}-distinct-content\n");
+        tip = repo.commit(
+            &[(b"file.txt", lines.concat().as_bytes(), "100644")],
+            &[tip],
+            revision as u32 + 2,
+        );
+    }
+    let native = repo.native_blame(tip, b"file.txt");
+    let odb = gix_odb::at(repo.0.path().join("objects"), super::fixture_hash_kind()).unwrap();
+    let mut platform = super::Fixture::new().unwrap().resource_cache;
+    let state = Arc::new(Mutex::new((0, 0)));
+    let tuning = gix_blame::Tuning {
+        reuse_line_tokens: true,
+        retain_current_input_tokens: true,
+        reuse_unchanged_runs: true,
+        bounded_resource_cache: true,
+        index_changes: true,
+    };
+    let mut path_checks = 0;
+    let result = gix_blame::file_with_allocations(
+        &odb,
+        gix_blame::Start::Commit(tip),
+        None,
+        &mut platform,
+        "file.txt".into(),
+        gix_blame::Options {
+            diff_algorithm: gix_diff::blob::Algorithm::Myers,
+            rewrites: None,
+            ..Default::default()
+        },
+        tuning,
+        Arc::new(super::deep::Budget(state.clone(), 4 * 1024 * 1024)),
+        &mut |event| {
+            if event.stage == Stage::Equal && event.processed == b"file.txt".len() {
+                path_checks += 1;
+            }
+            Ok(())
+        },
+    )
+    .unwrap();
+    let actual: Vec<_> = result
+        .outcome()
+        .entries
+        .iter()
+        .flat_map(|entry| {
+            (0..entry.len.get()).map(move |offset| {
+                (
+                    entry.commit_id,
+                    entry.start_in_source_file + offset + 1,
+                    entry.start_in_blamed_file + offset + 1,
+                    entry
+                        .source_file_name
+                        .as_ref()
+                        .map_or(b"file.txt".as_slice(), |path| path.as_slice())
+                        .to_vec(),
+                )
+            })
+        })
+        .collect();
+    assert_eq!(
+        actual,
+        native
+            .iter()
+            .map(|line| (line.commit, line.source, line.final_line, line.filename.clone()))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(result.outcome().blob.as_slice(), lines.concat().as_bytes());
+    // Other path lookups remain bounded per revision. Re-comparing the eight
+    // path bytes separately for every surviving hunk exceeds this allowance.
+    assert!(
+        path_checks <= 32 * (REVISIONS + 1),
+        "fragmented history repeated path work: {path_checks}"
+    );
+    eprintln!("ORIGIN_257 path_equal_checks={path_checks}");
+    drop(result);
+    assert_eq!(state.lock().unwrap().0, 0);
+
+    let mut visited = 0;
+    let mut stopped = false;
+    let mut guard_work = 0;
+    let result = gix_blame::file_with_allocations(
+        &odb,
+        gix_blame::Start::Commit(tip),
+        None,
+        &mut platform,
+        "file.txt".into(),
+        gix_blame::Options {
+            diff_algorithm: gix_diff::blob::Algorithm::Myers,
+            rewrites: None,
+            ..Default::default()
+        },
+        tuning,
+        Arc::new(super::deep::Budget(state.clone(), 4 * 1024 * 1024)),
+        &mut |event| {
+            if event.stage == Stage::Commit {
+                visited = event.processed;
+            }
+            if visited == REVISIONS - 2 && event.stage == Stage::Attribution && event.processed > BYTE_CHUNK / 2 {
+                assert!(
+                    event.processed <= BYTE_CHUNK,
+                    "origin guard exceeded its fixed-ID work budget"
+                );
+                guard_work = event.processed;
+                stopped = true;
+            }
+            if stopped { Err(Cancelled) } else { Ok(()) }
+        },
+    );
+    assert!(
+        stopped,
+        "must reach positive bounded origin-guard work in a fragmented real traversal"
+    );
+    assert!(result.is_err(), "guard stop must not return partial blame");
+    assert_eq!(state.lock().unwrap().0, 0);
+    eprintln!("ORIGIN_257 stopped_commit={visited} fixed_id_work={guard_work}");
+}
+
+#[test]
 fn many_native_groups_have_linear_trace_root_work_and_stop_with_no_retained_charges() {
     use gix_diff::blob::control::{Cancelled, Stage};
     let repo = Repo::new();
@@ -1480,6 +1607,24 @@ fn a_later_renamed_whole_parent_wins_before_partial_parent_diffing() {
 }
 
 #[test]
+fn unrelated_renamed_roots_keep_deferred_paths_when_one_origin_is_processed() {
+    let repo = Repo::new();
+    let left_root = repo.commit(&[(b"a", b"one\nx\n", "100644")], &[], 5);
+    let right_root = repo.commit(&[(b"b", b"y\ntwo\n", "100644")], &[], 5);
+    let left = repo.commit(&[(b"f", b"one\nx\n", "100644")], &[left_root], 10);
+    let right = repo.commit(&[(b"f", b"y\ntwo\n", "100644")], &[right_root], 10);
+    let merge = repo.commit(&[(b"f", b"one\ntwo\n", "100644")], &[left, right], 15);
+    let native = repo.assert_blame(merge, b"f");
+    assert_eq!(
+        native
+            .iter()
+            .map(|line| (line.commit, line.filename.as_slice(), line.source, line.final_line))
+            .collect::<Vec<_>>(),
+        vec![(left_root, b"a".as_slice(), 1, 1), (right_root, b"b".as_slice(), 2, 2)]
+    );
+}
+
+#[test]
 fn unrelated_roots_retain_each_selected_origin() {
     let repo = Repo::new();
     let left = repo.commit(&[(b"f", b"left\n", "100644")], &[], 5);
@@ -1494,6 +1639,111 @@ fn same_bytes_across_a_file_symlink_type_change_are_not_the_same_origin() {
     let root = repo.commit(&[(b"f", b"same", "100644")], &[], 5);
     let changed = repo.commit(&[(b"f", b"same", "120000")], &[root], 10);
     repo.assert_blame(changed, b"f");
+}
+
+#[test]
+fn explicit_long_origin_paths_keep_inner_byte_stops_without_partial_output() {
+    use gix_diff::blob::control::{BYTE_CHUNK, Cancelled, Stage};
+    let repo = Repo::new();
+    // Bare tree entries do not require a working-tree file. These valid raw
+    // names exercise the supported metadata boundary beyond one byte quantum.
+    let mut a = vec![b'p'; BYTE_CHUNK + 64];
+    a.push(b'a');
+    let mut b = vec![b'p'; BYTE_CHUNK + 64];
+    b.push(b'b');
+    let before = repo.commit(
+        &[
+            (a.as_slice(), b"old-one\nx\n", "100644"),
+            (b.as_slice(), b"y\nold-two\n", "100644"),
+        ],
+        &[],
+        5,
+    );
+    let changed = repo.commit(
+        &[
+            (a.as_slice(), b"one\nx\n", "100644"),
+            (b.as_slice(), b"y\ntwo\n", "100644"),
+        ],
+        &[before],
+        10,
+    );
+    let left = repo.commit(
+        &[(b"f", b"one\nx\n", "100644"), (b.as_slice(), b"y\ntwo\n", "100644")],
+        &[changed],
+        20,
+    );
+    let right = repo.commit(
+        &[(a.as_slice(), b"one\nx\n", "100644"), (b"f", b"y\ntwo\n", "100644")],
+        &[changed],
+        20,
+    );
+    let merge = repo.commit(&[(b"f", b"one\ntwo\n", "100644")], &[left, right], 30);
+    repo.assert_blame(merge, b"f");
+    let odb = gix_odb::at(repo.0.path().join("objects"), super::fixture_hash_kind()).unwrap();
+    let mut platform = super::Fixture::new().unwrap().resource_cache;
+    let state = Arc::new(Mutex::new((0, 0)));
+    let mut visited = 0;
+    let mut stopped = false;
+    let result = gix_blame::file_with_allocations_and_trace(
+        odb,
+        gix_blame::Start::Commit(merge),
+        None,
+        &mut platform,
+        "f".into(),
+        gix_blame::Options {
+            diff_algorithm: gix_diff::blob::Algorithm::Myers,
+            rewrites: Some(gix_diff::Rewrites::default()),
+            ..Default::default()
+        },
+        Default::default(),
+        Arc::new(super::deep::Budget(state.clone(), 4 * 1024 * 1024)),
+        &mut |event| {
+            if event.stage == Stage::Commit {
+                visited = event.processed;
+            }
+            if visited == 3 && event.stage == Stage::Equal && event.processed == BYTE_CHUNK {
+                stopped = true;
+            }
+            if stopped { Err(Cancelled) } else { Ok(()) }
+        },
+    );
+    assert!(stopped, "must reach inner raw-path work at the common ancestor");
+    assert!(result.is_err(), "path stop must not return output or trace");
+    assert_eq!(state.lock().unwrap().0, 0);
+}
+
+#[test]
+fn convergent_paths_on_a_modified_shared_ancestor_keep_distinct_origins() {
+    let repo = Repo::new();
+    let before = repo.commit(
+        &[(b"a", b"old-one\nx\n", "100644"), (b"b", b"y\nold-two\n", "100644")],
+        &[],
+        5,
+    );
+    let changed = repo.commit(
+        &[(b"a", b"one\nx\n", "100644"), (b"b", b"y\ntwo\n", "100644")],
+        &[before],
+        10,
+    );
+    let left = repo.commit(
+        &[(b"f", b"one\nx\n", "100644"), (b"b", b"y\ntwo\n", "100644")],
+        &[changed],
+        20,
+    );
+    let right = repo.commit(
+        &[(b"a", b"one\nx\n", "100644"), (b"f", b"y\ntwo\n", "100644")],
+        &[changed],
+        20,
+    );
+    let merge = repo.commit(&[(b"f", b"one\ntwo\n", "100644")], &[left, right], 30);
+    let native = repo.assert_blame(merge, b"f");
+    assert_eq!(
+        native
+            .iter()
+            .map(|line| (line.commit, line.filename.as_slice(), line.source, line.final_line))
+            .collect::<Vec<_>>(),
+        vec![(changed, b"a".as_slice(), 1, 1), (changed, b"b".as_slice(), 2, 2)]
+    );
 }
 
 #[test]
