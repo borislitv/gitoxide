@@ -83,6 +83,9 @@ impl Repo {
         parse(&output)
     }
     fn assert_blame(&self, commit: ObjectId, path: &[u8]) -> Vec<Line> {
+        self.assert_blame_with_mapping_work(commit, path, None)
+    }
+    fn assert_blame_with_mapping_work(&self, commit: ObjectId, path: &[u8], edges: Option<u64>) -> Vec<Line> {
         let expected = self.native_blame(commit, path);
         for tuning in [
             gix_blame::Tuning::default(),
@@ -113,6 +116,20 @@ impl Repo {
                 &mut |_| Ok(()),
             )
             .unwrap();
+            let hook_free = outcome.mapping_statistics();
+            assert_eq!(
+                hook_free,
+                gix_blame::memo::MappingStatistics {
+                    edges_visited: outcome.outcome().statistics.blobs_diffed as u64,
+                    computations: outcome.outcome().statistics.blobs_diffed as u64,
+                    ..Default::default()
+                },
+                "hook-free counters describe actual raw mapping work, not optional callbacks"
+            );
+            if let Some(edges) = edges {
+                assert_eq!(hook_free.edges_visited, edges);
+                assert!(state.lock().unwrap().1 < gix_blame::memo::UNIT_BYTES);
+            }
             let mut actual = Vec::new();
             let contents: Vec<_> = outcome.outcome().blob.split_inclusive(|b| *b == b'\n').collect();
             for entry in &outcome.outcome().entries {
@@ -201,6 +218,10 @@ impl Repo {
                 let stats = replay.mapping_statistics();
                 assert_eq!(stats.computations, replay.outcome().statistics.blobs_diffed as u64);
                 if run == 0 {
+                    assert_eq!(
+                        stats, hook_free,
+                        "reuse-off and absent hooks perform the same mapping work"
+                    );
                     assert_eq!((memo.loads, memo.writes), (0, 0));
                     assert_eq!(stats.hits, 0);
                 } else if run == 1 {
@@ -324,6 +345,153 @@ impl gix_blame::memo::MappingMemo for MemoryMemo {
             }
         }
         Ok(())
+    }
+}
+
+#[test]
+fn mapping_work_without_hooks_counts_modified_merge_and_unchanged_edges_not_commits() {
+    let repo = Repo::new();
+    let root = repo.commit(&[(b"f", b"anchor\na0\nb0\nc0\n", "100644")], &[], 1);
+    let first = repo.commit(&[(b"f", b"anchor\na1\nb0\nc0\n", "100644")], &[root], 2);
+    let unchanged = repo.commit(&[(b"f", b"anchor\na1\nb0\nc0\n", "100644")], &[first], 3);
+    let second = repo.commit(&[(b"f", b"anchor\na1\nb2\nc0\n", "100644")], &[unchanged], 4);
+    let tip = repo.commit(&[(b"f", b"anchor\na1\nb2\nc3\n", "100644")], &[second], 5);
+    let native = repo.assert_blame_with_mapping_work(tip, b"f", Some(3));
+    assert_eq!(
+        native.iter().map(|line| line.commit).collect::<Vec<_>>(),
+        [root, first, second, tip]
+    );
+
+    // The non-traced admitted API uses the same real seam without installing a
+    // MappingRequest, a producer identity or a 4 MiB memo wire slot.
+    let job = Arc::new(Mutex::new((0, 0)));
+    let mut platform = super::Fixture::new().unwrap().resource_cache;
+    let owner = gix_blame::file_with_allocations(
+        gix_odb::at(repo.0.path().join("objects"), super::fixture_hash_kind()).unwrap(),
+        gix_blame::Start::Commit(tip),
+        None,
+        &mut platform,
+        "f".into(),
+        gix_blame::Options {
+            diff_algorithm: gix_diff::blob::Algorithm::Myers,
+            ..Default::default()
+        },
+        Default::default(),
+        Arc::new(super::deep::Budget(job.clone(), 1024 * 1024)),
+        &mut |_| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(
+        owner.mapping_statistics(),
+        gix_blame::memo::MappingStatistics {
+            edges_visited: 3,
+            computations: 3,
+            ..Default::default()
+        }
+    );
+    assert!(owner.native_trace().is_none());
+    assert_eq!(owner.outcome().statistics.blobs_diffed, 3);
+    drop(owner);
+    assert_eq!(job.lock().unwrap().0, 0);
+
+    let root = repo.commit(&[(b"f", b"anchor\nleft0\nright0\n", "100644")], &[], 10);
+    let left = repo.commit(&[(b"f", b"anchor\nLEFT\nright0\n", "100644")], &[root], 11);
+    let right = repo.commit(&[(b"f", b"anchor\nleft0\nRIGHT\n", "100644")], &[root], 12);
+    let merge = repo.commit(&[(b"f", b"anchor\nLEFT\nRIGHT\n", "100644")], &[left, right], 13);
+    // Four real mappings in a four-commit DAG, not commits minus one.
+    let native = repo.assert_blame_with_mapping_work(merge, b"f", Some(4));
+    assert_eq!(
+        native.iter().map(|line| line.commit).collect::<Vec<_>>(),
+        [root, left, right]
+    );
+
+    let same = repo.commit(&[(b"f", b"anchor\nleft0\nright0\n", "100644")], &[root], 14);
+    let same_again = repo.commit(&[(b"f", b"anchor\nleft0\nright0\n", "100644")], &[same], 15);
+    repo.assert_blame_with_mapping_work(same_again, b"f", Some(0));
+    let binary = repo.commit(&[(b"f", b"anchor\0\nold\n", "100644")], &[], 20);
+    let binary_tip = repo.commit(&[(b"f", b"anchor\0\nnew\n", "100644")], &[binary], 21);
+    // Raw byte-line diffing still reaches the seam for NUL-bearing data.
+    repo.assert_blame_with_mapping_work(binary_tip, b"f", Some(1));
+    let empty = repo.commit(&[(b"f", b"", "100644")], &[], 30);
+    repo.assert_blame_with_mapping_work(empty, b"f", Some(0));
+}
+
+#[test]
+fn mapping_work_snapshots_distinguish_cold_warm_and_mixed_real_units() {
+    use gix_blame::memo::{MappingBoundary, MappingStatistics};
+    use gix_diff::blob::control::Cancelled;
+    #[derive(Default)]
+    struct Boundary(Vec<MappingStatistics>);
+    impl MappingBoundary for Boundary {
+        fn completed(&mut self, statistics: MappingStatistics) -> Result<(), Cancelled> {
+            self.0.push(statistics);
+            Ok(())
+        }
+    }
+    let repo = Repo::new();
+    let root = repo.commit(&[(b"f", b"anchor\na0\nb0\nc0\n", "100644")], &[], 1);
+    let first = repo.commit(&[(b"f", b"anchor\na1\nb0\nc0\n", "100644")], &[root], 2);
+    let second = repo.commit(&[(b"f", b"anchor\na1\nb2\nc0\n", "100644")], &[first], 3);
+    let tip = repo.commit(&[(b"f", b"anchor\na1\nb2\nc3\n", "100644")], &[second], 4);
+    repo.assert_blame_with_mapping_work(tip, b"f", Some(3));
+    let mut memo = MemoryMemo::default();
+    let expected = [
+        [(1, 0, 1, 0, 1), (2, 0, 2, 0, 2), (3, 0, 3, 0, 3)],
+        [(1, 1, 0, 0, 0), (2, 2, 0, 0, 0), (3, 3, 0, 0, 0)],
+        [(1, 1, 0, 0, 0), (2, 1, 1, 1, 1), (3, 1, 2, 1, 2)],
+    ];
+    for (run, expected) in expected.into_iter().enumerate() {
+        if run == 2 {
+            assert_eq!(memo.entries.len(), 3);
+            memo.entries.pop(); // A genuine miss on the oldest modified edge.
+            *memo.entries[1].1.last_mut().unwrap() ^= 1; // A real checksum rejection.
+        }
+        let loads = memo.loads;
+        let writes = memo.writes;
+        let job = Arc::new(Mutex::new((0, 0)));
+        let mut boundary = Boundary::default();
+        let mut platform = super::Fixture::new().unwrap().resource_cache;
+        let owner = gix_blame::file_with_allocations_trace_and_memo(
+            gix_odb::at(repo.0.path().join("objects"), super::fixture_hash_kind()).unwrap(),
+            gix_blame::Start::Commit(tip),
+            None,
+            &mut platform,
+            "f".into(),
+            gix_blame::Options {
+                diff_algorithm: gix_diff::blob::Algorithm::Myers,
+                rewrites: Some(gix_diff::Rewrites::default()),
+                ..Default::default()
+            },
+            Default::default(),
+            Arc::new(super::deep::Budget(job.clone(), 32 * 1024 * 1024)),
+            &mut |_| Ok(()),
+            gix_blame::memo::MappingRequest {
+                options: gix_blame::memo::MappingOptions {
+                    reuse: true,
+                    producer: [1; 32],
+                    options: [2; 32],
+                },
+                memo: &mut memo,
+                boundary: Some(&mut boundary),
+            },
+        )
+        .unwrap();
+        let expected = expected.map(
+            |(edges_visited, hits, computations, rejected, completed)| MappingStatistics {
+                edges_visited,
+                hits,
+                computations,
+                rejected,
+                completed,
+            },
+        );
+        assert_eq!(boundary.0, expected, "complete-edge snapshots for run {run}");
+        assert_eq!(owner.mapping_statistics(), expected[2]);
+        assert_eq!(owner.outcome().statistics.blobs_diffed as u64, expected[2].computations);
+        assert_eq!(memo.loads - loads, 3);
+        assert_eq!((memo.writes - writes) as u64, expected[2].completed);
+        drop(owner);
+        assert_eq!(job.lock().unwrap().0, 0);
     }
 }
 

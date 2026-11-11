@@ -53,7 +53,8 @@ impl AdmittedOutcome {
     pub fn native_trace(&self) -> Option<&[crate::native::NativeOrigin]> {
         self.native_trace.as_deref()
     }
-    /// Actual mapping work for the opt-in memo seam; zero for existing APIs.
+    /// Actual raw mapping work, independently of optional memo hooks. Unchanged
+    /// edges bypassing raw mapping are not counted as computations.
     pub fn mapping_statistics(&self) -> crate::memo::MappingStatistics {
         self.mapping_statistics
     }
@@ -598,7 +599,7 @@ pub fn file_with_tuning(
         tuning,
         &mut |_| Ok(()),
         false,
-        &mut None,
+        &mut crate::memo::State::new(None, tuning),
     )
 }
 
@@ -669,7 +670,7 @@ fn file_controlled(
         inner: odb,
         check: &shared,
     };
-    let mut memo = memo.map(|request| crate::memo::State::new(request, tuning));
+    let mut memo = crate::memo::State::new(memo, tuning);
     let result = file_impl(
         objects,
         start,
@@ -685,7 +686,7 @@ fn file_controlled(
     resource_owner
         .0
         .clear_controlled_raw(&mut |event| (**shared.borrow_mut())(event));
-    let statistics = memo.as_ref().map(|state| state.statistics).unwrap_or_default();
+    let statistics = memo.statistics;
     // The wire slot is scratch, not an output owner. Drop it before any later
     // provenance/final-output census can refund its charge.
     drop(memo);
@@ -703,7 +704,7 @@ fn file_impl(
     tuning: crate::Tuning,
     check: &mut Check<'_>,
     raw: bool,
-    memo: &mut Option<crate::memo::State<'_>>,
+    memo: &mut crate::memo::State<'_>,
 ) -> Result<Outcome> {
     let shared = std::cell::RefCell::new(check);
     let mut forwarding = |event| (**shared.borrow_mut())(event);
@@ -807,9 +808,7 @@ fn file_impl(
                 gix_diff::blob::control::retain_vec(buffer, check).map_err(|e| e.raise())?;
             }
             queue.retain_backing(check)?;
-            if let Some(state) = memo.as_ref() {
-                state.retain(check).map_err(|e| e.raise())?;
-            }
+            memo.retain(check).map_err(|e| e.raise())?;
             if let Some((_, _, path)) = &previous_entry {
                 poll(
                     check,
@@ -1870,7 +1869,7 @@ fn blob_changes(
     prepared: &mut Option<PreparedInput>,
     check: &mut Check<'_>,
     raw: bool,
-    memo: &mut Option<crate::memo::State<'_>>,
+    memo: &mut crate::memo::State<'_>,
 ) -> Result<Vec<Change>> {
     poll(check, Stage::Preprocess, 0)?;
     if raw {
@@ -1913,19 +1912,19 @@ fn blob_changes(
 
     if raw {
         let (old_data, new_data) = resource_cache.controlled_raw_buffers()?;
-        let key = memo.as_ref().map(|state| state.key(previous_oid, oid, diff_algorithm));
-        if let (Some(state), Some(key)) = (memo.as_mut(), key.as_ref()) {
-            if let Some(changes) = state.load(key, old_data, new_data, check).map_err(|e| e.raise())? {
-                if let Some(prepared) = prepared.as_mut() {
-                    prepared.invalidate();
-                }
-                state
-                    .finish(key, old_data, new_data, &changes, true, check)
-                    .map_err(|e| e.raise())?;
-                return Ok(changes);
+        let key = memo.key(previous_oid, oid, diff_algorithm);
+        if let Some(changes) = memo
+            .load(key.as_ref(), old_data, new_data, check)
+            .map_err(|e| e.raise())?
+        {
+            if let Some(prepared) = prepared.as_mut() {
+                prepared.invalidate();
             }
-            state.computed();
+            memo.finish(key.as_ref(), old_data, new_data, &changes, true, check)
+                .map_err(|e| e.raise())?;
+            return Ok(changes);
         }
+        memo.computed();
         let changes = match prepared {
             Some(prepared) => {
                 let (input, limits) = prepared
@@ -1935,11 +1934,8 @@ fn blob_changes(
             }
             None => try_blob_changes_from_data(old_data, new_data, diff_algorithm, stats, check),
         }?;
-        if let (Some(state), Some(key)) = (memo.as_mut(), key.as_ref()) {
-            state
-                .finish(key, old_data, new_data, &changes, false, check)
-                .map_err(|e| e.raise())?;
-        }
+        memo.finish(key.as_ref(), old_data, new_data, &changes, false, check)
+            .map_err(|e| e.raise())?;
         return Ok(changes);
     }
     let outcome = resource_cache.prepare_diff()?;

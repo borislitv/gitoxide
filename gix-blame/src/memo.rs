@@ -45,7 +45,8 @@ pub struct MappingOptions {
 /// Actual edge work observed at the mapping seam, not callback-call estimates.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct MappingStatistics {
-    /// Mapping edges visited (does not replace commit/graph traversal statistics).
+    /// Raw mapping attempts after both blob buffers are acquired, with or without
+    /// memo hooks (does not replace commit/graph traversal statistics).
     pub edges_visited: u64,
     /// Trusted units consumed after structural/content checks instead of a diff.
     pub hits: u64,
@@ -96,7 +97,8 @@ pub struct MappingRequest<'a> {
 }
 
 pub(crate) struct State<'a> {
-    request: MappingRequest<'a>,
+    // Statistics belong to raw mapping work; only cache callbacks are optional.
+    request: Option<MappingRequest<'a>>,
     tuning: u8,
     // Length tracks initialized backing, not the last wire length. Encoding must
     // overwrite only a prefix so later edges never reinitialize the full slot.
@@ -105,7 +107,7 @@ pub(crate) struct State<'a> {
 }
 
 impl<'a> State<'a> {
-    pub fn new(request: MappingRequest<'a>, tuning: crate::Tuning) -> Self {
+    pub fn new(request: Option<MappingRequest<'a>>, tuning: crate::Tuning) -> Self {
         Self {
             request,
             tuning: u8::from(tuning.reuse_line_tokens)
@@ -122,26 +124,29 @@ impl<'a> State<'a> {
         control::retain_vec(&self.slot, check)
     }
 
-    pub fn key(&self, before: ObjectId, after: ObjectId, algorithm: gix_diff::blob::Algorithm) -> MappingKey {
-        MappingKey {
+    pub fn key(&self, before: ObjectId, after: ObjectId, algorithm: gix_diff::blob::Algorithm) -> Option<MappingKey> {
+        self.request.as_ref().map(|request| MappingKey {
             before,
             after,
             algorithm,
             tuning: self.tuning,
-            producer: self.request.options.producer,
-            options: self.request.options.options,
-        }
+            producer: request.options.producer,
+            options: request.options.options,
+        })
     }
 
     pub fn load(
         &mut self,
-        key: &MappingKey,
+        key: Option<&MappingKey>,
         before: &[u8],
         after: &[u8],
         check: &mut Check<'_>,
     ) -> Result<Option<Vec<Change>>, Cancelled> {
         self.statistics.edges_visited += 1;
-        if !self.request.options.reuse {
+        let Some((request, key)) = self.request.as_mut().zip(key) else {
+            return Ok(None);
+        };
+        if !request.options.reuse {
             return Ok(None);
         }
         let additional = UNIT_BYTES.saturating_sub(self.slot.len());
@@ -152,7 +157,7 @@ impl<'a> State<'a> {
             tick(check, end)?;
         }
         tick(check, 0)?;
-        let loaded = self.request.memo.load(key, &mut self.slot)?;
+        let loaded = request.memo.load(key, &mut self.slot)?;
         tick(check, 0)?;
         let Some(length) = loaded else {
             return Ok(None);
@@ -176,14 +181,17 @@ impl<'a> State<'a> {
 
     pub fn finish(
         &mut self,
-        key: &MappingKey,
+        key: Option<&MappingKey>,
         before: &[u8],
         after: &[u8],
         changes: &[Change],
         hit: bool,
         check: &mut Check<'_>,
     ) -> Result<(), Cancelled> {
-        if !self.request.options.reuse {
+        let Some((request, key)) = self.request.as_mut().zip(key) else {
+            return Ok(());
+        };
+        if !request.options.reuse {
             return Ok(());
         }
         // Validate before publication, not a partial vector or an opaque token-ID
@@ -192,11 +200,11 @@ impl<'a> State<'a> {
             && let Some(length) = encode(&mut self.slot, key, before, after, changes, check)?
             && validate(&self.slot[..length], key, before, after, check)?.is_some()
         {
-            self.request.memo.completed(key, &self.slot[..length])?;
+            request.memo.completed(key, &self.slot[..length])?;
             self.statistics.completed += 1;
             tick(check, length)?;
         }
-        if let Some(boundary) = self.request.boundary.as_mut() {
+        if let Some(boundary) = request.boundary.as_mut() {
             boundary.completed(self.statistics)?;
             tick(check, 0)?;
         }

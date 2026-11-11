@@ -1,5 +1,35 @@
 # Request-local controls
 
+## Mapping work statistics without memo hooks
+
+Admitted controlled outcomes report real raw mapping work independently of the
+optional `MappingRequest`. A lightweight request-local state always exists;
+only its cache request is optional. Each raw mapping attempt is counted after
+both buffers are acquired, and a cache miss or absent hook counts one fresh
+computation when entering the maintained preparation/diff path. Validated cache
+hits do not count as computations. These counters are not commit counts or
+estimates derived from history length.
+
+Without hooks, no mapping key or producer identity is constructed, the wire
+vector stays empty, and no memo load/store or complete-edge callback runs. Hits,
+rejections and completed units remain zero. Unchanged edges bypassing the raw
+mapping seam and empty-file early returns contribute no mapping work; raw
+NUL-bearing byte-line changes still reach that seam. Existing memo cold/warm/
+mixed hit, computation, rejection, publication and complete-edge snapshots keep
+their original meaning. Scratch destruction, census, admission and stop paths
+are unchanged.
+
+Rust 1.99.1 / genuine Git 2.56.0 qualification passes all 150 non-doc and one doc
+test in `gix-blame` in each of debug and release, including both actual
+160000-commit histories and 32 native cases, plus strict all-target Clippy and
+formatting. Public regressions reproduce the original hook-free zero counters,
+check a three-mapping chain with an unchanged commit, a four-mapping merge,
+unchanged/binary/empty histories, a non-traced job below the wire-slot budget,
+and exact cold/warm/mixed complete-edge snapshots. Six compiled faults detect
+omitted/duplicated edges or hits, optional-only computations and counting hits
+as fresh diffs. This is an accounting fix, not a new optimization or application
+performance qualification. Earlier qualifications below describe preceding revisions.
+
 ## Lazy controlled indentation preparation
 
 Controlled ASCII postprocessing prepares its existing full indentation table only
