@@ -1,5 +1,42 @@
 # Request-local controls
 
+## Lazy controlled indentation preparation
+
+Controlled ASCII postprocessing prepares its existing full indentation table only
+when the maintained postprocessor actually requests the slider heuristic. The
+same local table serves both passes and every subsequent request. Empty,
+unchanged and uniquely positioned edits require no dictionary byte views or
+indentation allocation. This is dispatch-local laziness, not a separate ambiguity
+detector, history shortcut, altered diff or alternative slider implementation.
+
+A crate-private fallible heuristic adapter shares the original postprocessing
+loop with the unchanged public `SliderHeuristic` / `try_postprocess_with` APIs.
+Entry, phase and final checks remain on the zero-heuristic path; heuristic calls
+have checked boundaries and failures consume the diff without exposing partial
+adjustments. ASCII preparation runs inside the fallible adapter, never as an
+unchecked byte scan in the public infallible callback. No mutable-borrow workaround,
+global cache, new public API, tuning default or sampler change is introduced.
+
+When requested, the whole dictionary still receives its original admitted vector
+and scan: short tokens share at most 4 KiB of charged input work or 1024 items,
+empty tokens cost one unit, and long CR/form-feed indentation keeps inner byte
+checks. The original 100-position / 20-context-line scoring, penalties and
+later-position tie preference are unchanged. Scratch destruction precedes lease
+refund; owned-byte cleanup still completes after cancellation/admission failure.
+
+Rust 1.99.1 / genuine Git 2.56.0 qualification passes 323 non-doc and six doc tests
+in each of debug and release, both actual 160000-commit histories, native default/
+all/memo parity, strict all-target Clippy and formatting. Public tests independently
+specify exact repeated-line hunk positions, observe zero dictionary work/admission
+without heuristic requests and one complete table for two requests, and stop in
+first-scan, full-table, later-callback and zero-heuristic final work. Native cases
+include unique edits, repeated/blank/indented ties and long CR/form-feed context.
+Seven compiled faults detect eager preparation, missing byte polls, overlong short-
+token work, changed tie preference, partial-success error handling, ignored callback
+stop and missing final control. All faults are restored before qualification.
+These are correctness/work/admission results, not application timing or prepared/
+hosted acceptance. Earlier qualifications below describe preceding revisions.
+
 ## Request-local raw pair reuse
 
 Controlled blame clears a borrowed raw platform at request entry before reading

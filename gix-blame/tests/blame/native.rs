@@ -328,6 +328,38 @@ impl gix_blame::memo::MappingMemo for MemoryMemo {
 }
 
 #[test]
+fn lazy_indentation_preserves_unique_edits_repeated_blank_and_long_context_origins() {
+    let mut long_before = b"head\n".to_vec();
+    for _ in 0..(3 * gix_diff::blob::control::BYTE_CHUNK / 2) {
+        long_before.extend_from_slice(b"\r\x0c");
+    }
+    long_before.extend_from_slice(b"context\nsame\ntail\n");
+    let mut long_after = long_before[..long_before.len() - b"tail\n".len()].to_vec();
+    long_after.extend_from_slice(b"same\ntail\n");
+    for (before, after) in [
+        (b"head\nold\ntail\n".as_slice(), b"head\nnew\ntail\n".as_slice()),
+        (b"head\nsame\ntail\n", b"head\nsame\nsame\ntail\n"),
+        (b"head\n\ntail\n", b"head\n\n\ntail\n"),
+        (
+            b"head\n    same\nmiddle\n\nlast\n",
+            b"head\n    same\n    same\nmiddle\n\n\nlast\n",
+        ),
+        (long_before.as_slice(), long_after.as_slice()),
+    ] {
+        let repo = Repo::new();
+        let root = repo.commit(&[(b"f", before, "100644")], &[], 1);
+        let tip = repo.commit(&[(b"f", after, "100644")], &[root], 2);
+        // This public helper checks all native porcelain fields and bytes,
+        // default/all tuning, and cold/warm admitted mapping replay.
+        let native = repo.assert_blame(tip, b"f");
+        assert_eq!(native.first().unwrap().commit, root);
+        assert_eq!(native.last().unwrap().commit, root);
+        assert!(native.iter().any(|line| line.commit == tip));
+        assert!(native.iter().all(|line| line.commit == root || line.commit == tip));
+    }
+}
+
+#[test]
 fn request_local_raw_pair_reuses_each_intermediate_blob_across_modified_edges() {
     struct Reads<T> {
         inner: T,

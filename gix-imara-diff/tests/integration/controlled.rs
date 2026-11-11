@@ -467,9 +467,13 @@ fn indentation_batches_short_tokens_but_stops_within_the_byte_work_budget() {
         });
     }
     let before: Vec<_> = (0..20_000).map(Token).collect();
-    let diff = Diff::try_compute_with(Algorithm::Myers, &before, &before, 20_000, &mut |_| Ok(())).unwrap();
+    // Make the first traversal actually request the maintained slider: a
+    // repeated-line insertion can be placed on either side of token 100.
+    let mut after = before.clone();
+    after.insert(101, Token(100));
+    let diff = Diff::try_compute_with(Algorithm::Myers, &before, &after, 20_000, &mut |_| Ok(())).unwrap();
     let mut positive = false;
-    let result = diff.try_postprocess_lines_with(&before, &before, &interner, &mut |event| {
+    let result = diff.try_postprocess_lines_with(&before, &after, &interner, &mut |event| {
         if event.stage == Stage::Postprocess {
             let bytes = accessed.replace(0);
             // One ten-byte view may have been obtained to size the next token
@@ -505,6 +509,7 @@ fn indentation_batches_short_tokens_but_stops_within_the_byte_work_budget() {
     let diff = diff
         .try_postprocess_lines_with(&before, &before, &interner, &mut check)
         .unwrap();
+    assert_eq!(accessed.get(), 0, "unchanged views need no dictionary indentation");
     assert!(diff.try_hunks(&mut check).unwrap().is_empty());
     assert!(
         postprocess < 512 && output < 128,

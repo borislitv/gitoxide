@@ -1,6 +1,8 @@
 // Modified for gitoxide from the upstream imara-diff crate.
 // Upstream source: git cat-file -p 32d1e45d3df061e6ccba6db7fdce92db29e345d8:src/postprocess.rs
 
+use std::ops::Range;
+
 use crate::control::{Cancelled, Check, Stage, poll};
 use crate::intern::{InternedInput, Token};
 use crate::slider_heuristic::SliderHeuristic;
@@ -19,19 +21,42 @@ impl Diff {
     /// * `before` - The token sequence from the first file, before changes
     /// * `after` - The token sequence from the second file, after changes
     /// * `heuristic` - The slider heuristic to use for positioning hunks
-    pub fn postprocess_with(&mut self, before: &[Token], after: &[Token], heuristic: impl SliderHeuristic) {
-        self.try_postprocess_in_place(before, after, heuristic, &mut |_| Ok(()))
-            .expect("uncontrolled check never fails");
+    pub fn postprocess_with(&mut self, before: &[Token], after: &[Token], mut heuristic: impl SliderHeuristic) {
+        self.try_postprocess_in_place(
+            before,
+            after,
+            |tokens, hunk, earliest, _| Ok(heuristic.best_slider_end(tokens, hunk, earliest)),
+            &mut |_| Ok(()),
+        )
+        .expect("uncontrolled check never fails");
     }
 
     /// Fallible postprocessing that consumes the diff so cancellation cannot
     /// expose a partially adjusted result. Custom heuristic callbacks must be
     /// bounded; use `try_postprocess_lines` for controlled byte indentation.
     pub fn try_postprocess_with(
+        self,
+        before: &[Token],
+        after: &[Token],
+        mut heuristic: impl SliderHeuristic,
+        check: &mut Check<'_>,
+    ) -> Result<Self, Cancelled> {
+        self.try_postprocess_with_fallible_heuristic(
+            before,
+            after,
+            |tokens, hunk, earliest, _| Ok(heuristic.best_slider_end(tokens, hunk, earliest)),
+            check,
+        )
+    }
+
+    // Shared control-aware dispatch, not another slider/scoring implementation.
+    // ASCII preparation may fail here; the public infallible heuristic API is
+    // adapted above without changing its signature or exposing partial diffs.
+    pub(crate) fn try_postprocess_with_fallible_heuristic(
         mut self,
         before: &[Token],
         after: &[Token],
-        heuristic: impl SliderHeuristic,
+        heuristic: impl FnMut(&[Token], Range<u32>, u32, &mut Check<'_>) -> Result<u32, Cancelled>,
         check: &mut Check<'_>,
     ) -> Result<Self, Cancelled> {
         self.try_postprocess_in_place(before, after, heuristic, check)?;
@@ -42,9 +67,10 @@ impl Diff {
         &mut self,
         before: &[Token],
         after: &[Token],
-        mut heuristic: impl SliderHeuristic,
+        mut heuristic: impl FnMut(&[Token], Range<u32>, u32, &mut Check<'_>) -> Result<u32, Cancelled>,
         check: &mut Check<'_>,
     ) -> Result<(), Cancelled> {
+        poll(check, Stage::Postprocess, 0)?;
         // Compact removals first so ambiguous additions align with them, as in Git.
         Postprocessor {
             added: &mut self.removed,
@@ -57,6 +83,7 @@ impl Diff {
             heuristic: &mut heuristic,
         }
         .run(check)?;
+        poll(check, Stage::Postprocess, before.len())?;
         Postprocessor {
             added: &mut self.added,
             removed: &mut self.removed,
@@ -67,7 +94,8 @@ impl Diff {
             },
             heuristic: &mut heuristic,
         }
-        .run(check)
+        .run(check)?;
+        poll(check, Stage::Postprocess, before.len() + after.len())
     }
 
     /// Postprocesses the diff using an `InternedInput` and a custom heuristic.
@@ -98,7 +126,10 @@ struct Postprocessor<'a, H> {
     heuristic: &'a mut H,
 }
 
-impl<H: SliderHeuristic> Postprocessor<'_, H> {
+impl<H> Postprocessor<'_, H>
+where
+    H: FnMut(&[Token], Range<u32>, u32, &mut Check<'_>) -> Result<u32, Cancelled>,
+{
     fn run(mut self, check: &mut Check<'_>) -> Result<(), Cancelled> {
         loop {
             poll(check, Stage::Postprocess, self.hunk.after.end as usize)?;
@@ -141,9 +172,9 @@ impl<H: SliderHeuristic> Postprocessor<'_, H> {
                     debug_assert!(success);
                 }
             } else {
-                let slider_end = self
-                    .heuristic
-                    .best_slider_end(self.tokens, self.hunk.after.clone(), earliest_end);
+                poll(check, Stage::Postprocess, self.hunk.after.end as usize)?;
+                let slider_end = (self.heuristic)(self.tokens, self.hunk.after.clone(), earliest_end, check)?;
+                poll(check, Stage::Postprocess, self.hunk.after.end as usize)?;
                 for _ in slider_end..self.hunk.after.end {
                     let success = self.slide_up(check)?;
                     debug_assert!(success);
