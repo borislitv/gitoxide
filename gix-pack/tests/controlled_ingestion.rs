@@ -34,6 +34,270 @@ fn options() -> ControlledOptions {
     }
 }
 
+#[test]
+fn overflowing_ofs_run_is_rejected_by_all_ingestion_paths_without_scanning_its_suffix() -> Result {
+    let hash = gix_hash::Kind::Sha1;
+    for terminated in [false, true] {
+        let mut bytes = data::header::encode(data::Version::V2, 1).to_vec();
+        bytes.push(0x60);
+        bytes.extend(std::iter::repeat_n(0x80, 1024 * 1024));
+        if terminated {
+            bytes.push(0);
+        }
+        let bytes = seal(bytes, hash);
+        for single in [false, true] {
+            let budget = Admission::default();
+            let result = if single {
+                Bundle::prepare_single_pack_admitted(
+                    &mut bytes.as_slice(),
+                    hash,
+                    admitted_options(),
+                    &budget,
+                    gix_zlib::Workspace::ZLIB_RS_0_6_8,
+                    &|_, _| Ok(None),
+                    &|| Ok(()),
+                )
+            } else {
+                Bundle::prepare_stream_admitted(
+                    &mut bytes.as_slice(),
+                    hash,
+                    admitted_options(),
+                    &budget,
+                    gix_zlib::Workspace::ZLIB_RS_0_6_8,
+                    &|_, _| Ok(None),
+                    &|| Ok(()),
+                )
+            };
+            let err = result.err().expect("unrepresentable OFS prefix cannot produce output");
+            assert!(
+                format!("{err:?}").contains("overflow"),
+                "must reject the finite prefix, not scan to an eventual header-size/truncation error: {err:?}"
+            );
+            assert_eq!(budget.live.get(), 0);
+            let result = if single {
+                Bundle::prepare_single_pack_controlled(
+                    &mut bytes.as_slice(),
+                    hash,
+                    admitted_options(),
+                    &|_, _| Ok(None),
+                    &mut cache::Never,
+                    &|| Ok(()),
+                )
+            } else {
+                Bundle::prepare_stream_controlled(
+                    &mut bytes.as_slice(),
+                    hash,
+                    admitted_options(),
+                    &|_, _| Ok(None),
+                    &mut cache::Never,
+                    &|| Ok(()),
+                )
+            };
+            let err = result
+                .err()
+                .expect("legacy controlled entrypoints reject the same overflow");
+            assert!(format!("{err:?}").contains("overflow"), "{err:?}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn overflowing_size_component_cannot_normalize_to_an_empty_blob() -> gix_error::TestResult {
+    let hash = gix_hash::Kind::Sha1;
+    let mut bytes = data::header::encode(data::Version::V2, 1).to_vec();
+    bytes.extend_from_slice(&[0xb0, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x10]);
+    let mut deflate = gix_zlib::stream::deflate::Write::new(Vec::new(), gix_zlib::Compression::DEFAULT);
+    deflate.flush()?;
+    bytes.extend_from_slice(&deflate.into_inner());
+    let bytes = seal(bytes, hash);
+    for single in [false, true] {
+        let budget = Admission::default();
+        let result = if single {
+            Bundle::prepare_single_pack_admitted(
+                &mut bytes.as_slice(),
+                hash,
+                admitted_options(),
+                &budget,
+                gix_zlib::Workspace::ZLIB_RS_0_6_8,
+                &|_, _| Ok(None),
+                &|| Ok(()),
+            )
+        } else {
+            Bundle::prepare_stream_admitted(
+                &mut bytes.as_slice(),
+                hash,
+                admitted_options(),
+                &budget,
+                gix_zlib::Workspace::ZLIB_RS_0_6_8,
+                &|_, _| Ok(None),
+                &|| Ok(()),
+            )
+        };
+        let err = result.err().expect("2^64 is not a zero-length blob");
+        assert!(format!("{err:?}").contains("overflow"), "{err:?}");
+        assert_eq!(budget.live.get(), 0);
+        let result = if single {
+            Bundle::prepare_single_pack_controlled(
+                &mut bytes.as_slice(),
+                hash,
+                admitted_options(),
+                &|_, _| Ok(None),
+                &mut cache::Never,
+                &|| Ok(()),
+            )
+        } else {
+            Bundle::prepare_stream_controlled(
+                &mut bytes.as_slice(),
+                hash,
+                admitted_options(),
+                &|_, _| Ok(None),
+                &mut cache::Never,
+                &|| Ok(()),
+            )
+        };
+        assert!(format!("{:?}", result.err().expect("controlled path rejects size overflow")).contains("overflow"));
+    }
+    let temp = gix_testtools::tempfile::tempdir()?;
+    gix_testtools::git(temp.path(), "init --bare")?;
+    std::fs::write(temp.path().join("overflow.pack"), &bytes)?;
+    let output = gix_testtools::git_command(temp.path())
+        .args(["index-pack", "--strict", "overflow.pack"])
+        .output()?;
+    assert!(
+        !output.status.success(),
+        "native rejects this unrepresentable size: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
+#[test]
+fn native_git_accepts_ofs_group_boundaries_and_extended_size_headers_and_rejects_overflow() -> gix_error::TestResult {
+    fn native_index(repo: &std::path::Path, name: &str, bytes: &[u8], valid: bool) -> gix_error::TestResult {
+        std::fs::write(repo.join(name), bytes)?;
+        let output = gix_testtools::git_command(repo)
+            .args(["index-pack", "--strict", "--index-version=2", name])
+            .output()?;
+        assert_eq!(
+            output.status.success(),
+            valid,
+            "native oracle for {name}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    }
+    for hash in [gix_hash::Kind::Sha1, gix_hash::Kind::Sha256] {
+        let temp = gix_testtools::tempfile::tempdir()?;
+        gix_testtools::git(
+            temp.path(),
+            if hash == gix_hash::Kind::Sha1 {
+                "init --bare"
+            } else {
+                "init --bare --object-format=sha256"
+            },
+        )?;
+        for version in [data::Version::V2, data::Version::V3] {
+            // OFS grouping has a +1 bias: the actual encoding boundaries are
+            // 127/128 and 16511/16512, not ordinary unsigned LEB128 boundaries.
+            for distance in [127usize, 128, 16_511, 16_512] {
+                let mut prefix = data::header::encode(version, 3).to_vec();
+                let base = prefix.len() as u64;
+                prefix.extend_from_slice(&[0xb3, 0]);
+                let mut deflate = gix_zlib::stream::deflate::Write::new(Vec::new(), gix_zlib::Compression::DEFAULT);
+                deflate.write_all(b"abc")?;
+                deflate.flush()?;
+                prefix.extend_from_slice(&deflate.into_inner());
+                let available = distance - (prefix.len() - base as usize);
+                let mut pack = None;
+                // Search only the small header/zlib overhead band in this fixture.
+                // The expected distance is determined by physical byte positions,
+                // independently of the parser or OFS encoder under test.
+                for padding_len in available.saturating_sub(64)..=available {
+                    let mut candidate = prefix.clone();
+                    Header::Blob.write_to(padding_len as u64, &mut candidate)?;
+                    let mut padding = gix_zlib::stream::deflate::Write::new(Vec::new(), gix_zlib::Compression::NONE);
+                    padding.write_all(&vec![b'x'; padding_len])?;
+                    padding.flush()?;
+                    candidate.extend_from_slice(&padding.into_inner());
+                    if candidate.len() - base as usize == distance {
+                        pack = Some(candidate);
+                        break;
+                    }
+                }
+                let mut pack = pack.expect("stored padding realizes the exact physical OFS distance");
+                append(
+                    &mut pack,
+                    Header::OfsDelta {
+                        base_distance: distance as u64,
+                    },
+                    b"\x03\x04\x90\x03\x01d",
+                );
+                let pack = seal(pack, hash);
+                let name = format!("valid-{}-{distance}.pack", version as u32);
+                native_index(temp.path(), &name, &pack, true)?;
+                let expected = Bundle::prepare_stream_controlled(
+                    &mut pack.as_slice(),
+                    hash,
+                    options(),
+                    &|_, _| Ok(None),
+                    &mut cache::Never,
+                    &|| Ok(()),
+                )?;
+                for single in [false, true] {
+                    let budget = Admission::default();
+                    let actual = if single {
+                        Bundle::prepare_single_pack_admitted(
+                            &mut pack.as_slice(),
+                            hash,
+                            options(),
+                            &budget,
+                            gix_zlib::Workspace::ZLIB_RS_0_6_8,
+                            &|_, _| Ok(None),
+                            &|| Ok(()),
+                        )?
+                    } else {
+                        Bundle::prepare_stream_admitted(
+                            &mut pack.as_slice(),
+                            hash,
+                            options(),
+                            &budget,
+                            gix_zlib::Workspace::ZLIB_RS_0_6_8,
+                            &|_, _| Ok(None),
+                            &|| Ok(()),
+                        )?
+                    };
+                    assert_eq!(&*actual.pack, expected.pack);
+                    assert_eq!(&*actual.index, expected.index);
+                    drop(actual);
+                    assert_eq!(budget.live.get(), 0);
+                }
+                let normalized = format!("normalized-{}-{distance}", version as u32);
+                native_index(temp.path(), &format!("{normalized}.pack"), &expected.pack, true)?;
+                assert_eq!(
+                    std::fs::read(temp.path().join(format!("{normalized}.idx")))?,
+                    expected.index
+                );
+            }
+        }
+        for terminated in [false, true] {
+            let mut bad = data::header::encode(data::Version::V2, 1).to_vec();
+            bad.push(0x60);
+            bad.extend(std::iter::repeat_n(0x80, 1024 * 1024));
+            if terminated {
+                bad.push(0);
+            }
+            native_index(temp.path(), "overflow.pack", &seal(bad, hash), false)?;
+        }
+        let mut truncated = data::header::encode(data::Version::V2, 1).to_vec();
+        truncated.extend_from_slice(&[0x60, 0x80, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0xfe, 0x7f]);
+        for end in data::header::SIZE..truncated.len() {
+            native_index(temp.path(), "truncated.pack", &truncated[..end], false)?;
+        }
+    }
+    Ok(())
+}
+
 #[derive(Default)]
 struct Admission {
     live: Cell<usize>,
