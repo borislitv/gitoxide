@@ -59,6 +59,40 @@ impl<'a> TreeRefIter<'a> {
         TreeRefIter { data, hash_kind }
     }
 
+    /// Decode one entry with request checks between at most 32 KiB of filename
+    /// scanning, including a single enormous or unterminated filename. Allocates
+    /// nothing and imposes no new filename-length or semantic policy. Modes use
+    /// the same bounded parser as [`Iterator::next`]. On error (including stop),
+    /// the iterator is exhausted and no partial entry is returned.
+    pub fn next_controlled(&mut self, check: &dyn Fn() -> Result) -> Result<Option<EntryRef<'a>>> {
+        let result = (|| {
+            check()?;
+            if self.data.is_empty() {
+                return Ok(None);
+            }
+            let parsed = decode::entry_with_name(self.data, self.hash_kind.len_in_bytes(), |name| {
+                use bstr::ByteSlice;
+                for (index, chunk) in name.chunks(32 * 1024).enumerate() {
+                    check()?;
+                    if let Some(offset) = chunk.find_byte(0) {
+                        return Ok(Some(index * 32 * 1024 + offset));
+                    }
+                }
+                Ok(None)
+            })?;
+            check()?;
+            let Some((rest, entry)) = parsed else {
+                return Err(crate::decode::empty_error().raise());
+            };
+            self.data = rest;
+            Ok(Some(entry))
+        })();
+        if result.is_err() {
+            self.data = &[];
+        }
+        result
+    }
+
     /// Follow a sequence of `path` components starting from this instance, and look them up in `odb` one by one using `buffer`
     /// until the last component is looked up and its tree entry is returned.
     ///
@@ -202,14 +236,27 @@ mod decode {
     use crate::{TreeRef, tree, tree::EntryRef};
 
     pub fn fast_entry(i: &[u8], hash_len: usize) -> Option<(&[u8], EntryRef<'_>)> {
-        let (mode, i) = tree::EntryMode::extract_from_bytes(i)?;
-        let (filename, i) = i.split_at(i.find_byte(0)?);
+        entry_with_name(i, hash_len, |name| Ok(name.find_byte(0))).expect("the uncontrolled name search cannot fail")
+    }
+
+    pub fn entry_with_name(
+        i: &[u8],
+        hash_len: usize,
+        find_nul: impl FnOnce(&[u8]) -> Result<Option<usize>>,
+    ) -> Result<Option<(&[u8], EntryRef<'_>)>> {
+        let Some((mode, i)) = tree::EntryMode::extract_from_bytes(i) else {
+            return Ok(None);
+        };
+        let Some(end) = find_nul(i)? else {
+            return Ok(None);
+        };
+        let (filename, i) = i.split_at(end);
         let i = &i[1..];
         let (oid, i) = match i.len() {
-            len if len < hash_len => return None,
+            len if len < hash_len => return Ok(None),
             _ => i.split_at(hash_len),
         };
-        Some((
+        Ok(Some((
             i,
             EntryRef {
                 mode,
@@ -217,7 +264,7 @@ mod decode {
                 oid: gix_hash::oid::try_from_bytes(oid)
                     .unwrap_or_else(|_| panic!("we counted exactly {hash_len} bytes")),
             },
-        ))
+        )))
     }
 
     pub fn tree(data: &[u8], hash_len: usize) -> Result<TreeRef<'_>> {

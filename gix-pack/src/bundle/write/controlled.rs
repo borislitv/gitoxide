@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeMap,
-    io::{self, Read, Write},
+    io::{self, BufRead, Read, Write},
     path::PathBuf,
 };
 
@@ -86,6 +86,45 @@ impl Bundle {
             }
             append_bounded(&mut bytes, &chunk[..n], options.max_input_bytes)?;
         }
+        Self::prepare_bytes_controlled(bytes, object_hash, options, resolve, cache, check)
+    }
+
+    /// Prepare exactly one pack, stopping after its checksum without waiting for
+    /// EOF or consuming the next protocol message. Uses the maintained entry
+    /// parser and resumable zlib decoder, then the same structural preparation as
+    /// [`Self::prepare_stream_controlled`]. No object/delta codec is duplicated.
+    ///
+    /// This is a pack boundary, not transport completion or strict object semantic
+    /// validation. HTTP callers must separately finish their body/gzip framing and
+    /// reject trailing request bytes before publication. Interactive callers keep
+    /// the same buffered reader for subsequent protocol input. Its read-ahead and
+    /// blocking-I/O deadline remain caller-owned. Aggregate admission remains the
+    /// caller's obligation, just as for `prepare_stream_controlled`.
+    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::type_complexity)]
+    pub fn prepare_single_pack_controlled(
+        input: &mut impl BufRead,
+        object_hash: gix_hash::Kind,
+        options: Options,
+        resolve: &dyn Fn(&gix_hash::oid, &mut Vec<u8>) -> Result<Option<gix_object::Kind>>,
+        cache: &mut dyn cache::DecodeEntry,
+        check: &dyn Fn() -> Result,
+    ) -> Result<Outcome> {
+        let bytes = single_pack_bytes(input, object_hash, options, check)?;
+        Self::prepare_bytes_controlled(bytes, object_hash, options, resolve, cache, check)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::type_complexity)]
+    fn prepare_bytes_controlled(
+        bytes: Vec<u8>,
+        object_hash: gix_hash::Kind,
+        options: Options,
+        resolve: &dyn Fn(&gix_hash::oid, &mut Vec<u8>) -> Result<Option<gix_object::Kind>>,
+        cache: &mut dyn cache::DecodeEntry,
+        check: &dyn Fn() -> Result,
+    ) -> Result<Outcome> {
+        check()?;
         let mut file = data::File::from_data(bytes.as_slice(), PathBuf::new(), object_hash)?
             .with_alloc_limit_bytes(Some(options.max_decode_bytes));
         file.id = options.input_pack_id;
@@ -110,7 +149,7 @@ impl Bundle {
         if metadata_bytes > options.max_decode_bytes {
             bail!(allocation_limit("Pack metadata exceeds allocation limit"));
         }
-        let mut entries = Vec::new();
+        let mut entries: Vec<(data::Entry, bool)> = Vec::new();
         entries
             .try_reserve_exact(count)
             .or_raise(|| gix_error::allocation_failure("Could not reserve pack metadata"))?;
@@ -122,6 +161,19 @@ impl Bundle {
         for _ in 0..count {
             check()?;
             let entry = file.entry(cursor as u64)?;
+            if let data::entry::Header::OfsDelta { base_distance } = entry.header {
+                let base = entry
+                    .checked_base_pack_offset(base_distance)
+                    .ok_or_else(|| gix_error::Error::from(corruption("OFS base is not a prior entry start")))?;
+                // Offsets inside a compressed payload may themselves decode as
+                // valid entries. Only already scanned physical starts are bases.
+                if entries
+                    .binary_search_by_key(&base, |(entry, _)| entry.pack_offset())
+                    .is_err()
+                {
+                    bail!(corruption("OFS base is not a prior entry start"));
+                }
+            }
             let size = usize::try_from(entry.decompressed_size)
                 .map_err(|_| allocation_limit("Pack entry exceeds address space"))
                 .or_error()?;
@@ -205,6 +257,99 @@ impl Bundle {
                 num_objects: count as u32,
             },
         })
+    }
+}
+
+// Read only what the maintained entry/zlib parsers consume. In particular, never
+// issue an EOF probe after the checksum on a response-dependent interactive stream.
+fn single_pack_bytes(
+    input: &mut impl BufRead,
+    object_hash: gix_hash::Kind,
+    options: Options,
+    check: &dyn Fn() -> Result,
+) -> Result<Vec<u8>> {
+    check()?;
+    let mut reader = Recording {
+        input,
+        bytes: Vec::new(),
+        limit: options.max_input_bytes,
+        check,
+    };
+    let mut header = [0; data::header::SIZE];
+    reader.read_exact(&mut header).or_error()?;
+    let (_, count) = data::header::decode(&header)?;
+    if count > options.max_objects {
+        bail!(allocation_limit("Input pack exceeds object count limit"));
+    }
+    let mut inflate = gix_zlib::Decompress::default();
+    let mut scratch = [0; 32 * 1024];
+    for _ in 0..count {
+        check()?;
+        let offset = reader.bytes.len() as u64;
+        let entry = data::Entry::from_read(&mut reader, offset, object_hash.len_in_bytes()).or_error()?;
+        if entry.decompressed_size > options.max_decode_bytes as u64 {
+            bail!(allocation_limit("Pack entry exceeds decoder allocation limit"));
+        }
+        inflate.reset();
+        let mut written = 0u64;
+        loop {
+            check()?;
+            let available = match reader.input.fill_buf() {
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                result => result.or_error()?,
+            };
+            let available = &available[..available.len().min(scratch.len())];
+            let (before_in, before_out) = (inflate.total_in(), inflate.total_out());
+            let status = inflate.decompress(available, &mut scratch, gix_zlib::FlushDecompress::None)?;
+            let consumed = (inflate.total_in() - before_in) as usize;
+            let produced = inflate.total_out() - before_out;
+            append_bounded(&mut reader.bytes, &available[..consumed], reader.limit)?;
+            reader.input.consume(consumed);
+            written = written
+                .checked_add(produced)
+                .ok_or_else(|| gix_error::Error::from(corruption("Pack inflated size overflows")))?;
+            check()?;
+            if written > entry.decompressed_size {
+                bail!(corruption("Zlib output exceeds the declared size"));
+            }
+            if status == gix_zlib::Status::StreamEnd {
+                if written != entry.decompressed_size {
+                    bail!(corruption("Zlib output is shorter than the declared size"));
+                }
+                break;
+            }
+            if consumed == 0 && produced == 0 {
+                bail!(corruption("Truncated zlib stream made no progress"));
+            }
+        }
+    }
+    let mut trailer = gix_hash::Kind::buf();
+    reader
+        .read_exact(&mut trailer[..object_hash.len_in_bytes()])
+        .or_error()?;
+    check()?;
+    Ok(reader.bytes)
+}
+
+struct Recording<'a, R> {
+    input: &'a mut R,
+    bytes: Vec<u8>,
+    limit: usize,
+    check: &'a dyn Fn() -> Result,
+}
+
+impl<R: Read> Read for Recording<'_, R> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        (self.check)().map_err(io::Error::other)?;
+        let remaining = self.limit.saturating_sub(self.bytes.len());
+        if remaining == 0 && !out.is_empty() {
+            return Err(io::Error::other(allocation_limit("Pack byte limit exceeded")));
+        }
+        let size = out.len().min(remaining).min(32 * 1024);
+        let n = self.input.read(&mut out[..size])?;
+        (self.check)().map_err(io::Error::other)?;
+        append_bounded(&mut self.bytes, &out[..n], self.limit).map_err(io::Error::other)?;
+        Ok(n)
     }
 }
 
