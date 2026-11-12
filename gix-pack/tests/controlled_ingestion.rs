@@ -34,6 +34,547 @@ fn options() -> ControlledOptions {
     }
 }
 
+#[derive(Default)]
+struct Admission {
+    live: Cell<usize>,
+    peak: Cell<usize>,
+    acquisitions: Cell<usize>,
+    fail_at: Cell<Option<usize>>,
+    limit: Cell<Option<usize>>,
+}
+
+impl gix_pack::memory::Budget for Admission {
+    fn acquire(&self, bytes: usize) -> Result {
+        let n = self.acquisitions.get() + 1;
+        self.acquisitions.set(n);
+        let live = self.live.get().checked_add(bytes).expect("test sizes fit");
+        if self.fail_at.get() == Some(n) || self.limit.get().is_some_and(|limit| live > limit) {
+            return Err(gix_error::allocation_limit("test admission denied").into());
+        }
+        self.live.set(live);
+        self.peak.set(self.peak.get().max(live));
+        Ok(())
+    }
+    fn release(&self, bytes: usize) {
+        self.live
+            .set(self.live.get().checked_sub(bytes).expect("no unmatched release"));
+    }
+}
+
+fn admitted_options() -> ControlledOptions {
+    ControlledOptions {
+        max_decode_bytes: 4096,
+        ..options()
+    }
+}
+
+#[test]
+fn admitted_buffer_preserves_exact_capacity_overlap_and_destruction_lifetime() -> Result {
+    use gix_pack::memory::Buffer;
+    let budget = Admission::default();
+    let mut bytes = Buffer::new(&budget);
+    bytes.reserve(16)?;
+    bytes.extend(b"large", 64)?;
+    assert_eq!(bytes.capacity(), 16);
+    assert_eq!(budget.live.get(), 16);
+    bytes.truncate(1);
+    assert_eq!(budget.live.get(), 16, "small contents retain their backing charge");
+    bytes.reserve(32)?;
+    assert_eq!(&*bytes, b"l");
+    assert_eq!(budget.peak.get(), 48, "replacement coexists with old allocation");
+    assert_eq!(budget.live.get(), 32);
+    bytes.truncate(0);
+    bytes.extend(&[7; 32], 64)?;
+    assert_eq!(budget.live.get(), 32, "large-small-large reuses charged capacity");
+    budget.limit.set(Some(95));
+    assert!(
+        bytes.reserve(64).is_err(),
+        "32 + 64 cannot fit even though 64 alone could"
+    );
+    assert_eq!(bytes.capacity(), 32);
+    assert_eq!(
+        &*bytes, &[7; 32],
+        "failed pre-admission cannot change the existing allocation"
+    );
+    drop(bytes);
+    assert_eq!(budget.live.get(), 0);
+    let acquired = budget.acquisitions.get();
+    let mut overflow = Buffer::<u64>::new(&budget);
+    assert!(overflow.reserve(usize::MAX).is_err());
+    assert_eq!(
+        budget.acquisitions.get(),
+        acquired,
+        "invalid layout is rejected before admission"
+    );
+    assert_eq!(overflow.capacity(), 0);
+
+    struct ObserveFree<'a>(&'a Admission);
+    impl Drop for ObserveFree<'_> {
+        fn drop(&mut self) {
+            assert!(self.0.live.get() != 0, "charge outlives element destruction");
+        }
+    }
+    let mut values = Buffer::new(&budget);
+    values.push(ObserveFree(&budget))?;
+    drop(values);
+    assert_eq!(budget.live.get(), 0);
+    Ok(())
+}
+
+#[test]
+fn admitted_large_small_large_ingestion_reuses_workspace_without_detaching_charges() -> Result {
+    let hash = gix_hash::Kind::Sha1;
+    let mut bytes = data::header::encode(data::Version::V2, 3).to_vec();
+    // Deterministic, incompressible-enough data exercises compressed-buffer growth,
+    // not just a very large declared size with a tiny deflate stream.
+    let mut random = 17u32;
+    let large: Vec<u8> = (0..32 * 1024)
+        .map(|_| {
+            random ^= random << 13;
+            random ^= random >> 17;
+            random ^= random << 5;
+            random as u8
+        })
+        .collect();
+    append(&mut bytes, Header::Blob, &large);
+    append(&mut bytes, Header::Blob, b"small");
+    append(&mut bytes, Header::Blob, &large);
+    let bytes = seal(bytes, hash);
+    let opts = ControlledOptions {
+        max_decode_bytes: 128 * 1024,
+        ..options()
+    };
+    let expected = Bundle::prepare_stream_controlled(
+        &mut bytes.as_slice(),
+        hash,
+        opts,
+        &|_, _| Ok(None),
+        &mut cache::Never,
+        &|| Ok(()),
+    )?;
+    for single in [false, true] {
+        let budget = Admission::default();
+        let actual = if single {
+            Bundle::prepare_single_pack_admitted(
+                &mut bytes.as_slice(),
+                hash,
+                opts,
+                &budget,
+                gix_zlib::Workspace::ZLIB_RS_0_6_8,
+                &|_, _| Ok(None),
+                &|| Ok(()),
+            )?
+        } else {
+            Bundle::prepare_stream_admitted(
+                &mut bytes.as_slice(),
+                hash,
+                opts,
+                &budget,
+                gix_zlib::Workspace::ZLIB_RS_0_6_8,
+                &|_, _| Ok(None),
+                &|| Ok(()),
+            )?
+        };
+        assert_eq!(&*actual.pack, expected.pack);
+        assert_eq!(&*actual.index, expected.index);
+        assert_eq!(budget.live.get(), actual.pack.capacity() + actual.index.capacity());
+        assert!(
+            budget.peak.get() > 2 * 1024 * 1024 + opts.max_decode_bytes + bytes.len() + actual.pack.len(),
+            "input, output, decoder, compressed entry and both codecs overlap"
+        );
+        drop(actual);
+        assert_eq!(budget.live.get(), 0);
+    }
+    Ok(())
+}
+
+#[test]
+fn admitted_preparation_retains_only_output_owners_and_matches_maintained_bytes() -> Result {
+    for hash in [gix_hash::Kind::Sha1, gix_hash::Kind::Sha256] {
+        for version in [data::Version::V2, data::Version::V3] {
+            let mut forward = forward(hash);
+            forward.truncate(forward.len() - hash.len_in_bytes());
+            forward[..12].copy_from_slice(&data::header::encode(version, 3));
+            let forward = seal(forward, hash);
+            let mut ofs = data::header::encode(version, 2).to_vec();
+            let base = append(&mut ofs, Header::Blob, b"abc");
+            let distance = ofs.len() as u64 - base;
+            append(
+                &mut ofs,
+                Header::OfsDelta {
+                    base_distance: distance,
+                },
+                b"\x03\x04\x90\x03\x01d",
+            );
+            let mut thin = data::header::encode(version, 1).to_vec();
+            append(
+                &mut thin,
+                Header::RefDelta {
+                    base_id: id(hash, b"abc"),
+                },
+                b"\x03\x04\x90\x03\x01d",
+            );
+            for input in [
+                forward,
+                seal(ofs, hash),
+                seal(thin, hash),
+                seal(data::header::encode(version, 0).to_vec(), hash),
+            ] {
+                let resolve = |base: &gix_hash::oid, out: &mut Vec<u8>| {
+                    if base != id(hash, b"abc").as_ref() {
+                        return Ok(None);
+                    }
+                    out.clear();
+                    out.extend_from_slice(b"abc");
+                    Ok(Some(gix_object::Kind::Blob))
+                };
+                let expected = Bundle::prepare_stream_controlled(
+                    &mut input.as_slice(),
+                    hash,
+                    admitted_options(),
+                    &resolve,
+                    &mut cache::Never,
+                    &|| Ok(()),
+                )?;
+                for single in [false, true] {
+                    let budget = Admission::default();
+                    let resolver = |base: &gix_hash::oid, out: &mut [u8]| {
+                        if base != id(hash, b"abc").as_ref() {
+                            return Ok(None);
+                        }
+                        assert!(
+                            budget.live.get() >= admitted_options().max_decode_bytes,
+                            "external base is filled into already admitted workspace"
+                        );
+                        out[..3].copy_from_slice(b"abc");
+                        Ok(Some((gix_object::Kind::Blob, 3)))
+                    };
+                    let mut transport = input.clone();
+                    if single {
+                        transport.extend_from_slice(b"next phase");
+                    }
+                    let mut reader = transport.as_slice();
+                    let actual = if single {
+                        Bundle::prepare_single_pack_admitted(
+                            &mut reader,
+                            hash,
+                            admitted_options(),
+                            &budget,
+                            gix_zlib::Workspace::ZLIB_RS_0_6_8,
+                            &resolver,
+                            &|| Ok(()),
+                        )?
+                    } else {
+                        Bundle::prepare_stream_admitted(
+                            &mut reader,
+                            hash,
+                            admitted_options(),
+                            &budget,
+                            gix_zlib::Workspace::ZLIB_RS_0_6_8,
+                            &resolver,
+                            &|| Ok(()),
+                        )?
+                    };
+                    assert_eq!(&*actual.pack, expected.pack);
+                    assert_eq!(&*actual.index, expected.index);
+                    assert_eq!(
+                        budget.live.get(),
+                        actual.pack.capacity() + actual.index.capacity(),
+                        "input, decoder, metadata, compressed entry and native workspaces are gone"
+                    );
+                    assert!(
+                        budget.peak.get() > budget.live.get() + 2 * 1024 * 1024,
+                        "overlapping native workspaces and Rust backing stores were admitted"
+                    );
+                    if single {
+                        assert_eq!(reader, b"next phase");
+                    }
+                    let pack = actual.pack;
+                    drop(actual.index);
+                    assert_eq!(budget.live.get(), pack.capacity());
+                    drop(pack);
+                    assert_eq!(budget.live.get(), 0);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn admitted_denial_and_cancellation_release_every_reachable_partial_owner() -> Result {
+    let input = forward(gix_hash::Kind::Sha1);
+    for single in [false, true] {
+        let run = |budget: &Admission, check: &dyn Fn() -> Result| {
+            let mut reader = input.as_slice();
+            if single {
+                Bundle::prepare_single_pack_admitted(
+                    &mut reader,
+                    gix_hash::Kind::Sha1,
+                    admitted_options(),
+                    budget,
+                    gix_zlib::Workspace::ZLIB_RS_0_6_8,
+                    &|_, _| Ok(None),
+                    check,
+                )
+                .map(drop)
+            } else {
+                Bundle::prepare_stream_admitted(
+                    &mut reader,
+                    gix_hash::Kind::Sha1,
+                    admitted_options(),
+                    budget,
+                    gix_zlib::Workspace::ZLIB_RS_0_6_8,
+                    &|_, _| Ok(None),
+                    check,
+                )
+                .map(drop)
+            }
+        };
+        let baseline = Admission::default();
+        let polls = Cell::new(0);
+        run(&baseline, &|| {
+            polls.set(polls.get() + 1);
+            Ok(())
+        })?;
+        assert_eq!(baseline.live.get(), 0);
+        for fail in 1..=baseline.acquisitions.get() {
+            let budget = Admission::default();
+            budget.fail_at.set(Some(fail));
+            let error = run(&budget, &|| Ok(())).expect_err("every acquisition can deny before allocation");
+            assert!(
+                format!("{error:?}").contains("admission denied"),
+                "acquisition {fail}: {error:?}"
+            );
+            assert_eq!(budget.live.get(), 0, "denied acquisition {fail}, single={single}");
+        }
+        for stop in 1..=polls.get() {
+            let budget = Admission::default();
+            let seen = Cell::new(0);
+            let result = run(&budget, &|| {
+                seen.set(seen.get() + 1);
+                if seen.get() >= stop {
+                    Err(gix_error::cancelled("test stop").into())
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(result.expect_err("stop never yields detached output").is_cancelled());
+            assert_eq!(budget.live.get(), 0, "cancelled poll {stop}, single={single}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn admitted_tiny_budget_denies_before_codec_construction_or_resolver_work() {
+    struct NoRead;
+    impl Read for NoRead {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            panic!("denied framing cannot read input");
+        }
+    }
+    impl BufRead for NoRead {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            panic!("denied framing cannot fill input");
+        }
+        fn consume(&mut self, _: usize) {
+            panic!("denied framing cannot consume input");
+        }
+    }
+    let budget = Admission::default();
+    budget.limit.set(Some(1));
+    let result = Bundle::prepare_single_pack_admitted(
+        &mut NoRead,
+        gix_hash::Kind::Sha1,
+        admitted_options(),
+        &budget,
+        gix_zlib::Workspace::ZLIB_RS_0_6_8,
+        &|_, _| panic!("no resolver work after denial"),
+        &|| Ok(()),
+    );
+    assert!(result.is_err());
+    assert_eq!(budget.live.get(), 0);
+    assert_eq!(budget.acquisitions.get(), 1);
+}
+
+#[test]
+fn admitted_errors_strict_bounds_and_resolver_unwind_never_leak_owners() -> Result {
+    let hash = gix_hash::Kind::Sha1;
+    let valid = forward(hash);
+    let mut bad_checksum = valid.clone();
+    *bad_checksum.last_mut().expect("sealed pack has a checksum") ^= 1;
+    let mut invalid_delta = data::header::encode(data::Version::V2, 2).to_vec();
+    let base = append(&mut invalid_delta, Header::Blob, b"abc");
+    let distance = invalid_delta.len() as u64 - base;
+    append(
+        &mut invalid_delta,
+        Header::OfsDelta {
+            base_distance: distance,
+        },
+        b"\x03\x04\x00",
+    );
+    let invalid_delta = seal(invalid_delta, hash);
+    for single in [false, true] {
+        for (input, opts) in [
+            (&bad_checksum, admitted_options()),
+            (&invalid_delta, admitted_options()),
+            (
+                &valid,
+                ControlledOptions {
+                    max_input_bytes: valid.len() - 1,
+                    ..admitted_options()
+                },
+            ),
+            (
+                &valid,
+                ControlledOptions {
+                    max_output_bytes: 32,
+                    ..admitted_options()
+                },
+            ),
+            (
+                &valid,
+                ControlledOptions {
+                    max_index_bytes: 100,
+                    ..admitted_options()
+                },
+            ),
+            (
+                &valid,
+                ControlledOptions {
+                    max_objects: 2,
+                    ..admitted_options()
+                },
+            ),
+            (
+                &valid,
+                ControlledOptions {
+                    max_decode_bytes: 2,
+                    ..admitted_options()
+                },
+            ),
+            (
+                &valid,
+                ControlledOptions {
+                    max_resolve_attempts: 0,
+                    ..admitted_options()
+                },
+            ),
+            (
+                &valid,
+                ControlledOptions {
+                    decode: data::decode::Limits {
+                        max_delta_depth: 0,
+                        max_delta_bytes: 0,
+                    },
+                    ..admitted_options()
+                },
+            ),
+        ] {
+            let budget = Admission::default();
+            let result = if single {
+                Bundle::prepare_single_pack_admitted(
+                    &mut input.as_slice(),
+                    hash,
+                    opts,
+                    &budget,
+                    gix_zlib::Workspace::ZLIB_RS_0_6_8,
+                    &|_, _| Ok(None),
+                    &|| Ok(()),
+                )
+            } else {
+                Bundle::prepare_stream_admitted(
+                    &mut input.as_slice(),
+                    hash,
+                    opts,
+                    &budget,
+                    gix_zlib::Workspace::ZLIB_RS_0_6_8,
+                    &|_, _| Ok(None),
+                    &|| Ok(()),
+                )
+            };
+            assert!(result.is_err(), "invalid input or strict bound cannot produce an owner");
+            assert_eq!(budget.live.get(), 0);
+        }
+        for end in 0..valid.len() {
+            let budget = Admission::default();
+            let result = if single {
+                Bundle::prepare_single_pack_admitted(
+                    &mut &valid[..end],
+                    hash,
+                    admitted_options(),
+                    &budget,
+                    gix_zlib::Workspace::ZLIB_RS_0_6_8,
+                    &|_, _| Ok(None),
+                    &|| Ok(()),
+                )
+            } else {
+                Bundle::prepare_stream_admitted(
+                    &mut &valid[..end],
+                    hash,
+                    admitted_options(),
+                    &budget,
+                    gix_zlib::Workspace::ZLIB_RS_0_6_8,
+                    &|_, _| Ok(None),
+                    &|| Ok(()),
+                )
+            };
+            assert!(result.is_err(), "truncated at {end}");
+            assert_eq!(budget.live.get(), 0);
+        }
+    }
+    let mut thin = data::header::encode(data::Version::V2, 1).to_vec();
+    append(
+        &mut thin,
+        Header::RefDelta {
+            base_id: id(hash, b"abc"),
+        },
+        b"\x03\x04\x90\x03\x01d",
+    );
+    let thin = seal(thin, hash);
+    for mode in 0..4 {
+        let budget = Admission::default();
+        let result = Bundle::prepare_stream_admitted(
+            &mut thin.as_slice(),
+            hash,
+            admitted_options(),
+            &budget,
+            gix_zlib::Workspace::ZLIB_RS_0_6_8,
+            &|_, out| match mode {
+                0 => Ok(None),
+                1 => Ok(Some((gix_object::Kind::Blob, out.len() + 1))),
+                2 => {
+                    out[..3].copy_from_slice(b"bad");
+                    Ok(Some((gix_object::Kind::Blob, 3)))
+                }
+                _ => Err(gix_error::cancelled("external source stopped").into()),
+            },
+            &|| Ok(()),
+        );
+        assert!(
+            result.is_err(),
+            "absent, oversized, mismatched and failed external bases fail"
+        );
+        assert_eq!(budget.live.get(), 0);
+    }
+    let budget = Admission::default();
+    let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = Bundle::prepare_stream_admitted(
+            &mut thin.as_slice(),
+            hash,
+            admitted_options(),
+            &budget,
+            gix_zlib::Workspace::ZLIB_RS_0_6_8,
+            &|_, _| panic!("external resolver unwinds"),
+            &|| Ok(()),
+        );
+    }));
+    assert!(unwind.is_err());
+    assert_eq!(budget.live.get(), 0, "resolver panic unwinds every scratch owner");
+    Ok(())
+}
+
 fn id(hash: gix_hash::Kind, bytes: &[u8]) -> gix_hash::ObjectId {
     gix_object::compute_hash(hash, gix_object::Kind::Blob, bytes).expect("small synthetic object can be hashed")
 }
@@ -441,6 +982,34 @@ fn ofs_base_must_be_an_entry_start_not_a_valid_stream_inside_another_object() ->
         .args(["index-pack", "--strict", "bad.pack"])
         .output()?;
     assert!(!native.status.success(), "native Git must reject a non-entry OFS base");
+    for single in [false, true] {
+        let budget = Admission::default();
+        let result = if single {
+            Bundle::prepare_single_pack_admitted(
+                &mut bytes.as_slice(),
+                hash,
+                admitted_options(),
+                &budget,
+                gix_zlib::Workspace::ZLIB_RS_0_6_8,
+                &|_, _| Ok(None),
+                &|| Ok(()),
+            )
+        } else {
+            Bundle::prepare_stream_admitted(
+                &mut bytes.as_slice(),
+                hash,
+                admitted_options(),
+                &budget,
+                gix_zlib::Workspace::ZLIB_RS_0_6_8,
+                &|_, _| Ok(None),
+                &|| Ok(()),
+            )
+        };
+        let error = result.err().expect("admitted path rejects the same interior OFS base");
+        assert!(error.is_corrupted());
+        assert!(error.to_string().contains("entry start"));
+        assert_eq!(budget.live.get(), 0);
+    }
     let result = Bundle::prepare_stream_controlled(
         &mut bytes.as_slice(),
         hash,

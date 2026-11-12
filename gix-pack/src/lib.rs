@@ -45,6 +45,8 @@ pub mod find;
 pub mod cache;
 ///
 pub mod data;
+/// Pre-allocation admission and retained backing-store ownership.
+pub mod memory;
 
 mod find_traits;
 pub use find_traits::{Find, FindExt};

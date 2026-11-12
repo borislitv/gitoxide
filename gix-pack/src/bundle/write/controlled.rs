@@ -268,10 +268,25 @@ fn single_pack_bytes(
     options: Options,
     check: &dyn Fn() -> Result,
 ) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    record_single_pack(input, object_hash, options, check, &mut |chunk| {
+        append_bounded(&mut bytes, chunk, options.max_input_bytes)
+    })?;
+    Ok(bytes)
+}
+
+pub(super) fn record_single_pack(
+    input: &mut impl BufRead,
+    object_hash: gix_hash::Kind,
+    options: Options,
+    check: &dyn Fn() -> Result,
+    record: &mut dyn FnMut(&[u8]) -> Result,
+) -> Result {
     check()?;
     let mut reader = Recording {
         input,
-        bytes: Vec::new(),
+        record,
+        len: 0,
         limit: options.max_input_bytes,
         check,
     };
@@ -285,7 +300,7 @@ fn single_pack_bytes(
     let mut scratch = [0; 32 * 1024];
     for _ in 0..count {
         check()?;
-        let offset = reader.bytes.len() as u64;
+        let offset = reader.len as u64;
         let entry = data::Entry::from_read(&mut reader, offset, object_hash.len_in_bytes()).or_error()?;
         if entry.decompressed_size > options.max_decode_bytes as u64 {
             bail!(allocation_limit("Pack entry exceeds decoder allocation limit"));
@@ -303,7 +318,8 @@ fn single_pack_bytes(
             let status = inflate.decompress(available, &mut scratch, gix_zlib::FlushDecompress::None)?;
             let consumed = (inflate.total_in() - before_in) as usize;
             let produced = inflate.total_out() - before_out;
-            append_bounded(&mut reader.bytes, &available[..consumed], reader.limit)?;
+            (reader.record)(&available[..consumed])?;
+            reader.len += consumed;
             reader.input.consume(consumed);
             written = written
                 .checked_add(produced)
@@ -328,12 +344,13 @@ fn single_pack_bytes(
         .read_exact(&mut trailer[..object_hash.len_in_bytes()])
         .or_error()?;
     check()?;
-    Ok(reader.bytes)
+    Ok(())
 }
 
 struct Recording<'a, R> {
     input: &'a mut R,
-    bytes: Vec<u8>,
+    record: &'a mut dyn FnMut(&[u8]) -> Result,
+    len: usize,
     limit: usize,
     check: &'a dyn Fn() -> Result,
 }
@@ -341,14 +358,15 @@ struct Recording<'a, R> {
 impl<R: Read> Read for Recording<'_, R> {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         (self.check)().map_err(io::Error::other)?;
-        let remaining = self.limit.saturating_sub(self.bytes.len());
+        let remaining = self.limit.saturating_sub(self.len);
         if remaining == 0 && !out.is_empty() {
             return Err(io::Error::other(allocation_limit("Pack byte limit exceeded")));
         }
         let size = out.len().min(remaining).min(32 * 1024);
         let n = self.input.read(&mut out[..size])?;
         (self.check)().map_err(io::Error::other)?;
-        append_bounded(&mut self.bytes, &out[..n], self.limit).map_err(io::Error::other)?;
+        (self.record)(&out[..n]).map_err(io::Error::other)?;
+        self.len += n;
         Ok(n)
     }
 }
@@ -487,7 +505,7 @@ impl<T: crate::FileData> Resolve<'_, T> {
     }
 }
 
-fn hash_object(
+pub(super) fn hash_object(
     hash: gix_hash::Kind,
     kind: gix_object::Kind,
     data: &[u8],
