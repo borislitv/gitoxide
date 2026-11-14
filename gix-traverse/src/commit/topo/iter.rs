@@ -240,8 +240,10 @@ where
     }
 
     fn pop_commit(&mut self) -> Option<Result<Info>> {
-        if let Some(admission) = &self.admission {
-            if let Err(error) = admission.check() { return Some(Err(error)); }
+        if let Some(admission) = &self.admission
+            && let Err(error) = admission.check()
+        {
+            return Some(Err(error));
         }
         let commit = self.topo_queue.pop()?;
         let i = match self.indegrees.get_mut(&commit.id) {

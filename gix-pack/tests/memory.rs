@@ -24,10 +24,8 @@ impl Budget for Admission {
     }
 
     fn release(&self, bytes: usize) {
-        self.0
-            .live
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |live| live.checked_sub(bytes))
-            .expect("each release matches a live reservation");
+        let before = self.0.live.fetch_sub(bytes, Ordering::SeqCst);
+        assert!(before >= bytes, "each release matches a live reservation");
         self.0.releases.fetch_add(1, Ordering::SeqCst);
     }
 }

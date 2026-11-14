@@ -55,8 +55,8 @@ fn reconstruction_can_cancel_inside_one_large_copy() {
     let error = delta::reconstruct_controlled(&base, &mut output, bytes, &check)
         .expect_err("one copy cannot run through cancellation");
     assert!(error.is_cancelled());
-    assert!(output.iter().any(|byte| *byte == b'A'), "the copy began");
-    assert!(output.iter().any(|byte| *byte == 0xa5), "the copy did not finish before cancellation");
+    assert!(output.contains(&b'A'), "the copy began");
+    assert!(output.contains(&0xa5), "the copy did not finish before cancellation");
 }
 
 #[test]

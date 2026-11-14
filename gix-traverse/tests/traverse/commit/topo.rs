@@ -382,8 +382,10 @@ mod date_order {
 
 mod admitted {
     use super::*;
+    use gix_error::ResultExt;
     use std::{
         collections::BTreeMap,
+        fmt::Write,
         sync::{
             Arc,
             atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -432,9 +434,9 @@ mod admitted {
         fn commit(&mut self, parents: &[ObjectId], time: i64) -> gix_error::Result<ObjectId> {
             let mut bytes = format!("tree {}\n", ObjectId::null(gix_hash::Kind::Sha1));
             for parent in parents {
-                bytes.push_str(&format!("parent {parent}\n"));
+                writeln!(bytes, "parent {parent}").or_error()?;
             }
-            bytes.push_str(&format!("author A <a@example.invalid> {time} +0000\ncommitter A <a@example.invalid> {time} +0000\n\nsynthetic\n"));
+            write!(bytes, "author A <a@example.invalid> {time} +0000\ncommitter A <a@example.invalid> {time} +0000\n\nsynthetic\n").or_error()?;
             let id = gix_object::compute_hash(gix_hash::Kind::Sha1, gix_object::Kind::Commit, bytes.as_bytes())?;
             self.commits.insert(id, bytes.into_bytes());
             Ok(id)
