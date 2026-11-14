@@ -68,6 +68,25 @@ impl<'a, T> Buffer<'a, T> {
         self.data.capacity()
     }
 
+    /// Move backing storage into a shared budget owner without copying or
+    /// releasing/reacquiring its admission. The owner must be the exact budget
+    /// originally borrowed by this buffer; an equal budget limit is insufficient.
+    pub fn into_owned(self, owner: std::sync::Arc<dyn Budget + Send + Sync>) -> Result<OwnedBuffer<T>> {
+        let budget: &dyn Budget = owner.as_ref();
+        // Trait-object vtables may be duplicated across codegen units. Identity
+        // belongs to the budget allocation, not its possibly distinct metadata.
+        if !std::ptr::addr_eq(self.reservation.budget, budget) {
+            return Err(gix_error::validation("Owned buffer requires its original admission budget").into());
+        }
+        let Self { data, mut reservation } = self;
+        let bytes = reservation.bytes;
+        reservation.bytes = 0;
+        Ok(OwnedBuffer {
+            data,
+            _reservation: OwnedReservation { budget: owner, bytes },
+        })
+    }
+
     /// Reserve an exact replacement capacity, preserving initialized elements.
     pub fn reserve(&mut self, capacity: usize) -> Result {
         if capacity <= self.capacity() {
@@ -121,6 +140,41 @@ impl<'a, T> Buffer<'a, T> {
 
     pub(crate) fn budget(&self) -> &'a dyn Budget {
         self.reservation.budget
+    }
+}
+
+struct OwnedReservation {
+    budget: std::sync::Arc<dyn Budget + Send + Sync>,
+    bytes: usize,
+}
+
+impl Drop for OwnedReservation {
+    fn drop(&mut self) {
+        if self.bytes != 0 {
+            self.budget.release(self.bytes);
+        }
+    }
+}
+
+/// Move-only immutable backing whose original admission owner survives transfer
+/// between jobs, publication and output. No bare Vec escape or mutable access is
+/// provided; backing storage drops before the matching admission is released.
+pub struct OwnedBuffer<T> {
+    data: Vec<T>,
+    _reservation: OwnedReservation,
+}
+
+impl<T> OwnedBuffer<T> {
+    /// Actual element capacity retained by this owner.
+    pub fn capacity(&self) -> usize {
+        self.data.capacity()
+    }
+}
+
+impl<T> std::ops::Deref for OwnedBuffer<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        &self.data
     }
 }
 
