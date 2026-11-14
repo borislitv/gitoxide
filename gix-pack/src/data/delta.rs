@@ -15,7 +15,13 @@ pub fn decode_header_size(d: &[u8]) -> Result<(u64, usize)> {
             bail!(corrupt("delta header size uses more bits than fit into u64"));
         }
         consumed += 1;
-        size |= (u64::from(*cmd) & 0x7f) << shift;
+        let component = 1u64
+            .checked_shl(shift)
+            .and_then(|factor| factor.checked_mul(u64::from(*cmd) & 0x7f))
+            .ok_or_raise(|| corrupt("delta header size overflows u64"))?;
+        size = size
+            .checked_add(component)
+            .ok_or_raise(|| corrupt("delta header size overflows u64"))?;
         shift += 7;
         if *cmd & 0x80 == 0 {
             return Ok((size, consumed));
@@ -26,6 +32,28 @@ pub fn decode_header_size(d: &[u8]) -> Result<(u64, usize)> {
 
 pub(crate) fn apply(base: &[u8], target: &mut [u8], data: &[u8]) -> Result {
     apply_controlled(base, target, data, &|| Ok(()))
+}
+
+/// Reconstruct a complete, inflated delta into caller-owned admitted storage.
+///
+/// `data` includes both delta size headers. Neither the base nor target is
+/// allocated or grown by this function. Header sizes must match their exact
+/// buffers, every instruction is checked, and copying polls `check` at most every
+/// 32 KiB. This is also suitable for immutable range-backed pack stores which do
+/// not have a contiguous mapping of the complete pack file.
+pub fn reconstruct_controlled(
+    base: &[u8],
+    target: &mut [u8],
+    data: &[u8],
+    check: &dyn Fn() -> Result,
+) -> Result {
+    check()?;
+    let (base_size, base_header) = decode_header_size(data)?;
+    let (result_size, result_header) = decode_header_size(&data[base_header..])?;
+    if base_size != base.len() as u64 || result_size != target.len() as u64 {
+        bail!(corrupt("delta size headers disagree with admitted buffers"));
+    }
+    apply_controlled(base, target, &data[base_header + result_header..], check)
 }
 
 pub(crate) fn apply_controlled(base: &[u8], mut target: &mut [u8], data: &[u8], check: &dyn Fn() -> Result) -> Result {

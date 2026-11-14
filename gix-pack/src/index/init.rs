@@ -38,6 +38,18 @@ where
 {
     /// Instantiate an index file from `data` as assumed to be read or memory-mapped from `path`.
     pub fn from_data(data: T, path: PathBuf, object_hash: gix_hash::Kind) -> Result<Self> {
+        Self::from_data_controlled(data, path, object_hash, &|| Ok(()))
+    }
+
+    /// Open caller-owned index bytes with checks inside variable-size layout
+    /// validation. The caller retains ownership/admission for the complete data.
+    pub fn from_data_controlled(
+        data: T,
+        path: PathBuf,
+        object_hash: gix_hash::Kind,
+        check: &dyn Fn() -> Result,
+    ) -> Result<Self> {
+        check()?;
         let idx_len = data.len();
         let hash_len = object_hash.len_in_bytes();
 
@@ -75,7 +87,8 @@ where
             (kind, fan, num_objects)
         };
         validate_fan(&fan)?;
-        validate_size(&data, kind, num_objects, hash_len)?;
+        validate_size(&data, kind, num_objects, hash_len, check)?;
+        check()?;
         Ok(Self {
             data,
             path,
@@ -105,7 +118,7 @@ fn validate_fan(fan: &[u32; FAN_LEN]) -> Result {
     Ok(())
 }
 
-fn validate_size(data: &[u8], kind: Version, num_objects: u32, hash_len: usize) -> Result {
+fn validate_size(data: &[u8], kind: Version, num_objects: u32, hash_len: usize, check: &dyn Fn() -> Result) -> Result {
     let num_objects = num_objects as usize;
     let footer_size = hash_len * 2;
     let expected_size = match kind {
@@ -136,17 +149,17 @@ fn validate_size(data: &[u8], kind: Version, num_objects: u32, hash_len: usize) 
                     num_objects
                 )));
             }
-            let (large_offsets, max_large_offset_index) = data[offset32_start..offset32_end]
-                .as_chunks::<N32_SIZE>()
-                .0
-                .iter()
-                .filter_map(|offset| {
+            let (mut large_offsets, mut max_large_offset_index) = (0usize, 0usize);
+            for chunk in data[offset32_start..offset32_end].chunks(32 * 1024) {
+                check()?;
+                for offset in chunk.as_chunks::<N32_SIZE>().0 {
                     let offset = crate::read_u32(offset);
-                    (offset & (1 << 31) != 0).then_some((offset ^ (1 << 31)) as usize)
-                })
-                .fold((0usize, 0usize), |(count, max_index), index| {
-                    (count + 1, max_index.max(index))
-                });
+                    if offset & (1 << 31) != 0 {
+                        large_offsets += 1;
+                        max_large_offset_index = max_large_offset_index.max((offset ^ (1 << 31)) as usize);
+                    }
+                }
+            }
             v2_header_size
                 .checked_add(oid_bytes)
                 .and_then(|size| size.checked_add(table_bytes))
