@@ -54,4 +54,33 @@ pub enum Sorting {
 mod init;
 pub use init::Builder;
 
+pub(super) mod admission;
+pub use admission::{Budget, Limits};
+
+/// A controlled topological walk whose values retain their backing admission.
+pub struct AdmittedTopo<Find, Predicate> {
+    inner: crate::commit::Topo<Find, Predicate>,
+    admission: std::sync::Arc<admission::State>,
+}
+
+/// Immutable topological result with admission for its owned parent list. There
+/// is no consuming conversion that could detach the original allocation.
+pub struct AdmittedInfo {
+    info: crate::commit::Info,
+    _admission: std::sync::Arc<admission::State>,
+}
+
+impl std::ops::Deref for AdmittedInfo {
+    type Target = crate::commit::Info;
+    fn deref(&self) -> &Self::Target { &self.info }
+}
+
+impl<Find, Predicate> Iterator for AdmittedTopo<Find, Predicate>
+where Find: gix_object::Find, Predicate: FnMut(&gix_hash::oid) -> bool {
+    type Item = gix_error::Result<AdmittedInfo>;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|result| result.map(|info| AdmittedInfo { info, _admission: self.admission.clone() }))
+    }
+}
+
 pub(super) mod iter;

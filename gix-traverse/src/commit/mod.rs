@@ -36,6 +36,8 @@ pub struct Topo<Find, Predicate> {
     parents: Parents,
     min_gen: u32,
     buf: Vec<u8>,
+    // Declared last: all map/queue/buffer backing drops before admission.
+    admission: Option<std::sync::Arc<topo::admission::State>>,
 }
 
 pub mod topo;

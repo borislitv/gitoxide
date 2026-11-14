@@ -44,6 +44,14 @@ impl Queue {
         }
     }
 
+    pub(super) fn try_reserve_exact(&mut self, capacity: usize) -> Result {
+        match self {
+            Self::Date(queue) => queue.try_reserve_exact(capacity)?,
+            Self::Topo(queue) => queue.try_reserve_exact(capacity)?,
+        }
+        Ok(())
+    }
+
     fn pop(&mut self) -> Option<Info> {
         match self {
             Self::Date(q) => q.pop().map(|(_, info)| info),
@@ -64,6 +72,7 @@ where
 {
     pub(super) fn compute_indegrees_to_depth(&mut self, gen_cutoff: u32) -> Result {
         while let Some(((generation, _), _)) = self.indegree_queue.peek() {
+            if let Some(admission) = &self.admission { admission.check()?; }
             if *generation >= gen_cutoff {
                 self.indegree_walk_step()?;
             } else {
@@ -80,6 +89,7 @@ where
 
             let parents = self.collect_parents(&id)?;
             for parent in parents {
+                super::admission::room(self.admission.as_deref(), &self.indegrees, &parent.commit_id)?;
                 self.indegrees
                     .entry(parent.commit_id)
                     .and_modify(|e| *e += 1)
@@ -98,6 +108,7 @@ where
 
     fn explore_to_depth(&mut self, gen_cutoff: u32) -> Result {
         while let Some(((generation, _), _)) = self.explore_queue.peek() {
+            if let Some(admission) = &self.admission { admission.check()?; }
             if *generation >= gen_cutoff {
                 self.explore_walk_step()?;
             } else {
@@ -135,6 +146,7 @@ where
             commit_time: parent_commit_time,
         } in parents
         {
+            if let Some(admission) = &self.admission { admission.check()?; }
             let parent_state = self.states.get(&pid).ok_or_else(missing_state)?;
             if parent_state.contains(WalkFlags::Uninteresting) {
                 continue;
@@ -186,6 +198,7 @@ where
                 let grand_parents = self.collect_all_parents(&parent.commit_id)?;
 
                 for grand_parent in &grand_parents {
+                    super::admission::room(self.admission.as_deref(), &self.states, &grand_parent.commit_id)?;
                     self.states
                         .entry(grand_parent.commit_id)
                         .and_modify(|s| *s |= WalkFlags::Uninteresting)
@@ -201,6 +214,7 @@ where
         };
 
         for parent in parents {
+            super::admission::room(self.admission.as_deref(), &self.states, &parent.commit_id)?;
             self.states
                 .entry(parent.commit_id)
                 .and_modify(|s| *s |= pass)
@@ -216,15 +230,19 @@ where
             id,
             matches!(self.parents, Parents::First),
             &mut self.buf,
+            self.admission.as_deref(),
         )
     }
 
     // Same as collect_parents but disregards the first_parent flag
     pub(super) fn collect_all_parents(&mut self, id: &oid) -> Result<SmallVec<[Parent; 1]>> {
-        collect_parents(&mut self.commit_graph, &self.find, id, false, &mut self.buf)
+        collect_parents(&mut self.commit_graph, &self.find, id, false, &mut self.buf, self.admission.as_deref())
     }
 
     fn pop_commit(&mut self) -> Option<Result<Info>> {
+        if let Some(admission) = &self.admission {
+            if let Err(error) = admission.check() { return Some(Err(error)); }
+        }
         let commit = self.topo_queue.pop()?;
         let i = match self.indegrees.get_mut(&commit.id) {
             Some(i) => i,
@@ -269,20 +287,27 @@ fn collect_parents<Find>(
     id: &oid,
     first_only: bool,
     buf: &mut Vec<u8>,
+    admission: Option<&super::admission::State>,
 ) -> Result<SmallVec<[Parent; 1]>>
 where
     Find: gix_object::Find,
 {
     let mut parents = SmallVec::<[Parent; 1]>::new();
+    if let Some(admission) = admission { admission.check()?; }
     match find(cache.as_ref(), &f, id, buf)? {
         Either::CommitRefIter(c) => {
             for token in c {
+                if let Some(admission) = admission { admission.check()?; }
                 use gix_object::commit::ref_iter::Token as T;
                 match token {
                     Ok(T::Tree { .. }) => continue,
-                    Ok(T::Parent { id }) => {
+                    Ok(T::Parent { id: parent_id }) => {
+                        if admission.is_some_and(|state| parents.len() >= state.limits.edges) {
+                            return Err(gix_error::validation("controlled topo parent edge bound exceeded").into());
+                        }
+                        if let Some(admission) = admission { admission.parent(&id.to_owned(), parents.len())?; }
                         parents.push(Parent {
-                            commit_id: id,
+                            commit_id: parent_id,
                             // Dummy numbers to be filled in after parsing the parent IDs.
                             generation: 0,
                             commit_time: 0,
@@ -300,8 +325,9 @@ where
             // Need to check the cache again. That a commit is not in the cache
             // doesn't mean a parent is not.
             for parent in parents.iter_mut() {
+                if let Some(admission) = admission { admission.check()?; }
                 let commit = find(cache.as_ref(), &f, &parent.commit_id, buf)?;
-                (parent.generation, parent.commit_time) = gen_and_commit_time(commit)?;
+                (parent.generation, parent.commit_time) = gen_and_commit_time(commit, admission)?;
             }
         }
         Either::CachedCommit(c) => {
@@ -309,7 +335,7 @@ where
                 let Ok(pos) = pos else {
                     // drop corrupt cache and use ODB from now on.
                     *cache = None;
-                    return collect_parents(cache, f, id, first_only, buf);
+                    return collect_parents(cache, f, id, first_only, buf, admission);
                 };
                 let parent_commit = cache
                     .as_ref()
@@ -329,11 +355,12 @@ where
     Ok(parents)
 }
 
-pub(super) fn gen_and_commit_time(c: Either<'_, '_>) -> Result<GenAndCommitTime> {
+pub(super) fn gen_and_commit_time(c: Either<'_, '_>, admission: Option<&super::admission::State>) -> Result<GenAndCommitTime> {
     match c {
         Either::CommitRefIter(c) => {
             let mut commit_time = 0;
             for token in c {
+                if let Some(admission) = admission { admission.check()?; }
                 use gix_object::commit::ref_iter::Token as T;
                 match token {
                     Ok(T::Tree { .. }) => continue,

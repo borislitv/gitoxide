@@ -20,6 +20,7 @@ pub struct Builder<Find, Predicate> {
     tips: Vec<ObjectId>,
     tips_seen: HashSet<ObjectId>,
     ends: Vec<ObjectId>,
+    admission: Option<std::sync::Arc<super::admission::State>>,
 }
 
 impl<Find> Builder<Find, fn(&oid) -> bool>
@@ -49,6 +50,7 @@ where
             tips_seen: Default::default(),
             ends: Default::default(),
             predicate: |_| true,
+            admission: None,
         }
     }
 
@@ -69,6 +71,7 @@ where
             tips_seen: self.tips_seen,
             ends: self.ends,
             predicate,
+            admission: self.admission,
         }
     }
 }
@@ -117,10 +120,37 @@ where
         self
     }
 
+    /// Pre-admit a complete physical traversal before allocating its maps, queues
+    /// or Find buffer. The controlled profile excludes commit-graph shortcuts and
+    /// permits at most 1,024 tips/ends so initial sorting is a bounded operation.
+    /// `Find` must honor `limits.buffer_bytes` without growing the supplied Vec.
+    pub fn with_admission(mut self, budget: std::sync::Arc<dyn super::Budget>, limits: super::Limits) -> Result<Self> {
+        self.admission = Some(std::sync::Arc::new(super::admission::State::new(budget, limits)?));
+        Ok(self)
+    }
+
     /// Build a new [`Topo`] instance.
     ///
     /// Note that merely building an instance is currently expensive.
     pub fn build(self) -> Result<Topo<Find, Predicate>> {
+        if self.admission.is_some() {
+            return Err(gix_error::validation("use build_admitted to retain parent-list admission").into());
+        }
+        self.build_inner()
+    }
+
+    /// Build an iterator whose returned values retain admission for owned parent
+    /// lists even after the iterator itself has been destroyed.
+    pub fn build_admitted(self) -> Result<super::AdmittedTopo<Find, Predicate>> {
+        let admission = self.admission.clone().ok_or_raise(|| gix_error::validation("topo admission is required"))?;
+        let inner = self.build_inner()?;
+        Ok(super::AdmittedTopo { inner, admission })
+    }
+
+    fn build_inner(self) -> Result<Topo<Find, Predicate>> {
+        if self.admission.is_some() && (self.commit_graph.is_some() || self.tips.len() + self.ends.len() > 1024) {
+            return Err(gix_error::validation("controlled topo requires physical reads and bounded tips").into());
+        }
         let mut w = Topo {
             commit_graph: self.commit_graph,
             find: self.find,
@@ -133,7 +163,20 @@ where
             parents: self.parents,
             min_gen: gix_commitgraph::GENERATION_NUMBER_INFINITY,
             buf: vec![],
+            admission: self.admission,
         };
+
+        if let Some(admission) = &w.admission {
+            admission.check()?;
+            let limits = admission.limits;
+            w.indegrees.try_reserve(limits.commits)?;
+            w.states.try_reserve(limits.commits)?;
+            w.explore_queue.try_reserve_exact(limits.commits)?;
+            w.indegree_queue.try_reserve_exact(limits.commits)?;
+            w.topo_queue.try_reserve_exact(limits.commits)?;
+            w.buf.try_reserve_exact(limits.buffer_bytes)?;
+            admission.check()?;
+        }
 
         // Initial flags for the states of the tips and ends. All of them are
         // seen and added to the explore and indegree queues. The ends are by
@@ -147,14 +190,22 @@ where
             .map(|id| (id, tip_flags))
             .chain(self.ends.iter().map(|id| (id, end_flags)))
         {
+            if let Some(state) = w.states.get_mut(id) {
+                // Repeated ends and a tip that is also an end are one physical
+                // commit. They must not grow the queues past the admitted count.
+                *state |= flags;
+                continue;
+            }
+            super::admission::room(w.admission.as_deref(), &w.indegrees, id)?;
             *w.indegrees.entry(*id).or_default() = 1;
             let commit = find(w.commit_graph.as_ref(), &w.find, id, &mut w.buf)?;
-            let (generation, time) = gen_and_commit_time(commit)?;
+            let (generation, time) = gen_and_commit_time(commit, w.admission.as_deref())?;
 
             if generation < w.min_gen {
                 w.min_gen = generation;
             }
 
+            super::admission::room(w.admission.as_deref(), &w.states, id)?;
             w.states.insert(*id, flags);
             w.explore_queue.insert((generation, time), *id);
             w.indegree_queue.insert((generation, time), *id);
@@ -165,6 +216,7 @@ where
         for id in &self.ends {
             let parents = w.collect_all_parents(id)?;
             for parent in parents {
+                super::admission::room(w.admission.as_deref(), &w.states, &parent.commit_id)?;
                 w.states
                     .entry(parent.commit_id)
                     .and_modify(|s| *s |= WalkFlags::Uninteresting)
@@ -183,12 +235,12 @@ where
                 .get(id)
                 .ok_or_raise(|| gix_error::corruption("Indegree information is missing"))?;
 
-            if *i != 1 {
+            if *i != 1 || w.states.get(id).is_some_and(|state| state.contains(WalkFlags::Uninteresting)) {
                 continue;
             }
 
             let commit = find(w.commit_graph.as_ref(), &w.find, id, &mut w.buf)?;
-            let (generation, time) = gen_and_commit_time(commit)?;
+            let (generation, time) = gen_and_commit_time(commit, w.admission.as_deref())?;
             let parent_ids = w
                 .collect_all_parents(id)?
                 .into_iter()
@@ -207,6 +259,7 @@ where
         }
 
         w.topo_queue.initial_sort();
+        if let Some(admission) = &w.admission { admission.check()?; }
         Ok(w)
     }
 }

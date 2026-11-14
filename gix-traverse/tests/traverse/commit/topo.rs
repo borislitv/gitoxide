@@ -379,3 +379,183 @@ mod date_order {
         Ok(())
     }
 }
+
+mod admitted {
+    use super::*;
+    use std::{
+        collections::BTreeMap,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+    };
+
+    #[derive(Default)]
+    struct Admission {
+        live: AtomicUsize,
+        reservations: AtomicUsize,
+        releases: AtomicUsize,
+        cancelled: AtomicBool,
+        denied: AtomicBool,
+    }
+
+    impl topo::Budget for Admission {
+        fn check(&self) -> gix_error::Result {
+            if self.cancelled.load(Ordering::SeqCst) {
+                return Err(gix_error::cancelled("synthetic traversal cancelled").into());
+            }
+            Ok(())
+        }
+
+        fn reserve(&self, bytes: usize) -> gix_error::Result {
+            if self.denied.load(Ordering::SeqCst) {
+                return Err(gix_error::allocation_limit("synthetic admission denied").into());
+            }
+            assert_eq!(self.live.swap(bytes, Ordering::SeqCst), 0, "one reservation per traversal");
+            self.reservations.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn release(&self, bytes: usize) {
+            assert_eq!(self.live.swap(0, Ordering::SeqCst), bytes, "release the complete live reservation");
+            self.releases.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Default)]
+    struct Source {
+        commits: BTreeMap<ObjectId, Vec<u8>>,
+        reads: AtomicUsize,
+    }
+
+    impl Source {
+        fn commit(&mut self, parents: &[ObjectId], time: i64) -> gix_error::Result<ObjectId> {
+            let mut bytes = format!("tree {}\n", ObjectId::null(gix_hash::Kind::Sha1));
+            for parent in parents {
+                bytes.push_str(&format!("parent {parent}\n"));
+            }
+            bytes.push_str(&format!("author A <a@example.invalid> {time} +0000\ncommitter A <a@example.invalid> {time} +0000\n\nsynthetic\n"));
+            let id = gix_object::compute_hash(gix_hash::Kind::Sha1, gix_object::Kind::Commit, bytes.as_bytes())?;
+            self.commits.insert(id, bytes.into_bytes());
+            Ok(id)
+        }
+    }
+
+    impl gix_object::Find for Source {
+        fn try_find<'a>(&self, id: &oid, out: &'a mut Vec<u8>) -> gix_error::Result<Option<gix_object::Data<'a>>> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            let Some(bytes) = self.commits.get(id) else { return Ok(None); };
+            assert!(out.capacity() >= bytes.len(), "Find must receive its pre-admitted backing");
+            out.clear();
+            out.extend_from_slice(bytes);
+            Ok(Some(gix_object::Data::new(out, gix_object::Kind::Commit, id.kind())))
+        }
+    }
+
+    fn graph() -> gix_error::Result<(Source, [ObjectId; 4])> {
+        let mut source = Source::default();
+        let root = source.commit(&[], 900)?;
+        let left = source.commit(&[root], 1)?;
+        let right = source.commit(&[root], 1000)?;
+        let tip = source.commit(&[left, right], 2)?;
+        Ok((source, [root, left, right, tip]))
+    }
+
+    fn limits() -> topo::Limits {
+        topo::Limits { commits: 4, edges: 4, buffer_bytes: 4096 }
+    }
+
+    #[test]
+    fn returned_parent_list_retains_admission_after_the_iterator_is_destroyed() -> gix_testtools::TestResult {
+        let (source, [_, left, right, tip]) = graph()?;
+        let budget = Arc::new(Admission::default());
+        let mut walk = topo::Builder::new(&source).with_tips([tip]).sorting(topo::Sorting::TopoOrder)
+            .with_admission(budget.clone(), limits())?.build_admitted()?;
+        let info = walk.next().expect("the tip exists")?;
+        assert_eq!(info.id, tip);
+        assert_eq!(info.parent_ids.as_slice(), [left, right]);
+        drop(walk);
+        assert_ne!(budget.live.load(Ordering::SeqCst), 0, "the returned heap-backed parents are still live");
+        assert_eq!(budget.releases.load(Ordering::SeqCst), 0);
+        drop(info);
+        assert_eq!(budget.live.load(Ordering::SeqCst), 0);
+        assert_eq!(budget.reservations.load(Ordering::SeqCst), 1);
+        assert_eq!(budget.releases.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn controlled_order_keeps_merge_ancestry_despite_reversed_commit_clocks() -> gix_testtools::TestResult {
+        let (source, [root, left, right, tip]) = graph()?;
+        let budget = Arc::new(Admission::default());
+        let walk = topo::Builder::new(&source).with_tips([tip]).sorting(topo::Sorting::TopoOrder)
+            .with_admission(budget.clone(), limits())?.build_admitted()?;
+        let actual = walk.map(|info| info.map(|info| info.id)).collect::<gix_error::Result<Vec<_>>>()?;
+        assert_eq!(actual, [tip, right, left, root]);
+        assert_eq!(budget.live.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn admission_denial_and_plain_build_do_not_read_or_detach_parent_storage() -> gix_testtools::TestResult {
+        let (source, [_, _, _, tip]) = graph()?;
+        let budget = Arc::new(Admission::default());
+        budget.denied.store(true, Ordering::SeqCst);
+        let error = topo::Builder::new(&source).with_tips([tip]).with_admission(budget.clone(), limits())
+            .err().expect("denied backing cannot construct a controlled builder");
+        assert!(error.to_string().contains("admission denied"), "{error}");
+        assert_eq!(source.reads.load(Ordering::SeqCst), 0);
+        assert_eq!(budget.reservations.load(Ordering::SeqCst), 0);
+
+        budget.denied.store(false, Ordering::SeqCst);
+        let error = topo::Builder::new(&source).with_tips([tip]).with_admission(budget.clone(), limits())?
+            .build().err().expect("controlled backing cannot escape through ordinary Info values");
+        assert!(error.to_string().contains("build_admitted"), "{error}");
+        assert_eq!(source.reads.load(Ordering::SeqCst), 0);
+        assert_eq!(budget.live.load(Ordering::SeqCst), 0);
+        assert_eq!(budget.releases.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn understated_commit_or_parent_inventory_fails_without_leaking_admission() -> gix_testtools::TestResult {
+        let (source, [_, _, _, tip]) = graph()?;
+        for limits in [topo::Limits { commits: 3, ..limits() }, topo::Limits { edges: 3, ..limits() }] {
+            let budget = Arc::new(Admission::default());
+            let error = topo::Builder::new(&source).with_tips([tip]).with_admission(budget.clone(), limits)?
+                .build_admitted().err().expect("the physical inventory exceeds the declared bound");
+            assert!(error.to_string().contains("bound exceeded"), "{error}");
+            assert_eq!(budget.live.load(Ordering::SeqCst), 0);
+            assert_eq!(budget.releases.load(Ordering::SeqCst), 1);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cancellation_after_build_stops_before_another_physical_read() -> gix_testtools::TestResult {
+        let (source, [_, _, _, tip]) = graph()?;
+        let budget = Arc::new(Admission::default());
+        let mut walk = topo::Builder::new(&source).with_tips([tip])
+            .with_admission(budget.clone(), limits())?.build_admitted()?;
+        let before = source.reads.load(Ordering::SeqCst);
+        budget.cancelled.store(true, Ordering::SeqCst);
+        let error = walk.next().expect("cancellation is reported").err().expect("cancelled work yields no commit");
+        assert!(error.is_cancelled(), "{error}");
+        assert_eq!(source.reads.load(Ordering::SeqCst), before);
+        drop(walk);
+        assert_eq!(budget.live.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_ends_exclude_the_tip_without_duplicating_physical_queue_entries() -> gix_testtools::TestResult {
+        let (source, [_, _, _, tip]) = graph()?;
+        let budget = Arc::new(Admission::default());
+        let mut walk = topo::Builder::new(&source).with_tips([tip]).with_ends([tip; 1023])
+            .with_admission(budget.clone(), limits())?.build_admitted()?;
+        assert!(walk.next().is_none(), "an explicit end excludes the tip itself");
+        drop(walk);
+        assert_eq!(budget.live.load(Ordering::SeqCst), 0);
+        Ok(())
+    }
+}
