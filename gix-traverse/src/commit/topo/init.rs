@@ -1,7 +1,7 @@
 use gix_error::Result;
 use std::collections::HashSet;
 
-use gix_error::OptionExt;
+use gix_error::{OptionExt, ResultExt};
 use gix_hash::{ObjectId, oid};
 use gix_revwalk::{PriorityQueue, graph::IdMap};
 
@@ -169,12 +169,17 @@ where
         if let Some(admission) = &w.admission {
             admission.check()?;
             let limits = admission.limits;
-            w.indegrees.try_reserve(limits.commits)?;
-            w.states.try_reserve(limits.commits)?;
-            w.explore_queue.try_reserve_exact(limits.commits)?;
-            w.indegree_queue.try_reserve_exact(limits.commits)?;
+            w.indegrees.try_reserve(limits.commits)
+                .or_raise(|| gix_error::message("could not allocate admitted indegrees"))?;
+            w.states.try_reserve(limits.commits)
+                .or_raise(|| gix_error::message("could not allocate admitted walk states"))?;
+            w.explore_queue.try_reserve_exact(limits.commits)
+                .or_raise(|| gix_error::message("could not allocate admitted exploration queue"))?;
+            w.indegree_queue.try_reserve_exact(limits.commits)
+                .or_raise(|| gix_error::message("could not allocate admitted indegree queue"))?;
             w.topo_queue.try_reserve_exact(limits.commits)?;
-            w.buf.try_reserve_exact(limits.buffer_bytes)?;
+            w.buf.try_reserve_exact(limits.buffer_bytes)
+                .or_raise(|| gix_error::message("could not allocate admitted commit buffer"))?;
             admission.check()?;
         }
 

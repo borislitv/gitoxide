@@ -1,5 +1,5 @@
 use gix_commitgraph::Parent;
-use gix_error::{Error, ErrorExt, Result, corruption, message};
+use gix_error::{Error, ErrorExt, Result, ResultExt, corruption, message};
 use gix_hash::oid;
 use gix_revwalk::PriorityQueue;
 use smallvec::SmallVec;
@@ -46,8 +46,8 @@ impl Queue {
 
     pub(super) fn try_reserve_exact(&mut self, capacity: usize) -> Result {
         match self {
-            Self::Date(queue) => queue.try_reserve_exact(capacity)?,
-            Self::Topo(queue) => queue.try_reserve_exact(capacity)?,
+            Self::Date(queue) => queue.try_reserve_exact(capacity).or_raise(|| message("could not allocate admitted date queue"))?,
+            Self::Topo(queue) => queue.try_reserve_exact(capacity).or_raise(|| message("could not allocate admitted topo stack"))?,
         }
         Ok(())
     }

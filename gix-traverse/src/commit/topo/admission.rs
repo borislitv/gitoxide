@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use gix_error::{OptionExt, Result, bail};
+use gix_error::{OptionExt, Result, ResultExt, bail};
 use gix_hash::ObjectId;
 use gix_revwalk::{PriorityQueue, graph::IdMap};
 
@@ -45,7 +45,8 @@ impl State {
         let bytes = allocation_bound(limits).ok_or_raise(|| gix_error::validation("topological allocation overflow"))?;
         budget.reserve(bytes)?;
         let state = Self { budget, limits, bytes, parent_counts: Mutex::new((IdMap::default(), 0)) };
-        state.parent_counts.lock().map_err(|_| gix_error::validation("topo admission poisoned"))?.0.try_reserve(limits.commits)?;
+        state.parent_counts.lock().map_err(|_| gix_error::validation("topo admission poisoned"))?.0.try_reserve(limits.commits)
+            .or_raise(|| gix_error::message("could not allocate admitted parent counts"))?;
         Ok(state)
     }
     pub fn check(&self) -> Result { self.budget.check() }
