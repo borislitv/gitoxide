@@ -44,6 +44,52 @@ pub enum Stage {
     RenameCandidate,
     /// Initializing or rehashing the byte-only numeric index.
     Index,
+    /// An admitted Vec relocation completed; addresses are opaque owner identities.
+    Backing {
+        /// Previous backing address, or zero for a new allocation.
+        old: usize,
+        /// Current backing address, or zero for inline storage.
+        new: usize,
+    },
+    /// Start an authoritative census at a quiescent ownership boundary.
+    RetainBegin,
+    /// A backing is still owned by a persistent root.
+    Retain {
+        /// Opaque backing owner identity; never dereferenced.
+        address: usize,
+    },
+    /// Complete the census; only absent, already-freed backings may be released.
+    RetainEnd,
+    /// Move an immutable, still-owned backing out of repeated scratch censuses.
+    /// Its owner must stay alive until `RetainScopeEnd`, including error exits.
+    RetainPinned {
+        /// Opaque backing identity, never dereferenced.
+        address: usize,
+    },
+    /// Compact mutable scratch tracking after the initial complete census and
+    /// immutable-root marking. No pinned root may be destroyed in this scope.
+    RetainScopeBegin,
+    /// End immutable-root protection. The next complete census must enumerate
+    /// all surviving roots normally; this event itself never refunds a charge.
+    RetainScopeEnd,
+    /// Transfer an admitted immutable byte-token backing to its exclusive owner.
+    /// Unlike trace pins, this lease survives censuses without a phase scope.
+    /// Only the sealed byte-input owner may issue this event, after insertion.
+    BackingOwned {
+        /// Opaque backing identity, never dereferenced.
+        address: usize,
+    },
+    /// The exclusive byte-token owner physically freed this backing. Cleanup
+    /// must issue this even after cancellation, never before dropping storage.
+    BackingFreed {
+        /// Opaque identity captured before freeing storage, never dereferenced.
+        address: usize,
+    },
+    /// Before a commit-processing step; processed counts previously visited commits.
+    /// This is independent of live-memory admission.
+    Commit,
+    /// Collecting admitted native origin provenance after complete attribution.
+    OriginTrace,
 }
 
 /// Progress after a bounded unit of inner work.
@@ -84,12 +130,17 @@ pub trait Allocator: Send + Sync {
     fn reserve(&self, bytes: usize) -> Result<Box<dyn Allocation>, Cancelled>;
 }
 
-/// Conservative request arena: growth charges are retained until all request
-/// scratch AND returned output have been freed. Reallocation is deliberately
-/// overcharged rather than releasing a charge while old backing may be pinned.
+/// Conservative backing registry. Completed relocations replace their old charge;
+/// quiescent, complete live-root censuses refund destroyed temporary owners.
+/// Never run a census while an unenumerated owner can still retain backing.
 /// This accounts backing capacity, not allocator metadata, RSS or scheduler time.
 pub struct Allocations {
-    leases: Vec<Box<dyn Allocation>>,
+    pending: Vec<Box<dyn Allocation>>,
+    backings: std::collections::HashMap<usize, (Box<dyn Allocation>, u64)>,
+    pinned: std::collections::HashMap<usize, (Box<dyn Allocation>, u64)>,
+    owned: std::collections::HashMap<usize, (Box<dyn Allocation>, u64)>,
+    pinned_scope: bool,
+    epoch: u64,
     metadata: Box<dyn Allocation>,
     allocator: std::sync::Arc<dyn Allocator>,
 }
@@ -98,44 +149,275 @@ impl Allocations {
     /// Call only after all charged backing owners were freed. Never let a stop
     /// error skip release; capacity-reservation destructors must be bounded.
     pub fn clear_with_control(&mut self, check: &mut Check<'_>) {
-        while !self.leases.is_empty() {
+        while !self.pending.is_empty() {
             for _ in 0..32 {
-                drop(self.leases.pop());
+                drop(self.pending.pop());
             }
-            let _ = poll(check, Stage::Cleanup, self.leases.len());
+            let _ = poll(check, Stage::Cleanup, self.pending.len());
         }
-        drop(std::mem::take(&mut self.leases));
+        drop(std::mem::take(&mut self.pending));
+        let mut count = 0;
+        for map in [&mut self.backings, &mut self.pinned, &mut self.owned] {
+            for entry in std::mem::take(map) {
+                drop(entry);
+                count += 1;
+                if count % 32 == 0 {
+                    let _ = poll(check, Stage::Cleanup, count);
+                }
+            }
+        }
         let _ = self.metadata.resize(0);
     }
     /// Create an empty arena. Store it after its charged output owner so Rust
     /// destroys the output before releasing the arena's charges.
     pub fn new(allocator: std::sync::Arc<dyn Allocator>) -> Result<Self, Cancelled> {
         Ok(Self {
-            leases: Vec::new(),
+            pending: Vec::new(),
+            backings: Default::default(),
+            pinned: Default::default(),
+            owned: Default::default(),
+            pinned_scope: false,
+            epoch: 0,
             metadata: allocator.reserve(0)?,
             allocator,
         })
     }
 
     /// Admit one conservative capacity increase, retaining its charge. The
-    /// caller must emit an Allocate event for every controlled backing growth.
+    /// caller must emit an Allocate event for every controlled backing growth
+    /// and associate persistent backing with an allocated event.
     pub fn admit(&mut self, bytes: usize) -> Result<(), Cancelled> {
-        if self.leases.len() == self.leases.capacity() {
-            let target = self.leases.capacity().saturating_mul(2).max(32);
-            if target > 131072 {
-                return Err(Cancelled);
-            }
-            self.metadata
-                .resize(target * std::mem::size_of::<Box<dyn Allocation>>())?;
-            self.leases
-                .try_reserve_exact(target - self.leases.len())
-                .map_err(|_| Cancelled)?;
-            self.metadata
-                .resize(self.leases.capacity() * std::mem::size_of::<Box<dyn Allocation>>())?;
+        let live = self.pending.len() + self.backings.len() + self.pinned.len() + self.owned.len();
+        if live >= 131072 {
+            return Err(Cancelled);
         }
-        self.leases.push(self.allocator.reserve(bytes)?);
+        let target = (live + 1).next_power_of_two().max(32);
+        // Admit both old and replacement metadata while either can be live.
+        self.metadata.resize(
+            (target * 4 + self.backings.capacity() * 2 + self.pinned.capacity() * 2 + self.owned.capacity() * 2)
+                * std::mem::size_of::<(usize, (Box<dyn Allocation>, u64))>()
+                + (target + self.pending.capacity()) * std::mem::size_of::<Box<dyn Allocation>>()
+                + 128,
+        )?;
+        self.pending.try_reserve_exact(1).map_err(|_| Cancelled)?;
+        self.backings.try_reserve(1).map_err(|_| Cancelled)?;
+        self.pending.push(self.allocator.reserve(bytes)?);
         Ok(())
     }
+
+    /// Associate a completed allocation with its backing, after relocation freed
+    /// the previous storage. No address is dereferenced or used as an object ID.
+    pub fn allocated(&mut self, old: usize, new: usize, bytes: usize) -> Result<(), Cancelled> {
+        // Exclusive token storage is immutable until physically freed. It must
+        // never be relocated by a mutable-vector growth event.
+        if old != 0 && self.owned.contains_key(&old) {
+            return Err(Cancelled);
+        }
+        let mut lease = self.pending.pop().ok_or(Cancelled)?;
+        if let Err(error) = lease.resize(bytes) {
+            self.pending.push(lease);
+            return Err(error);
+        }
+        if old != 0 {
+            self.backings.remove(&old);
+            self.pinned.remove(&old);
+        }
+        if new != 0 && bytes != 0 {
+            self.backings.insert(new, (lease, self.epoch));
+        }
+        Ok(())
+    }
+
+    /// Begin only when all temporary owners from the preceding step were freed.
+    pub fn begin_retention(&mut self) -> Result<(), Cancelled> {
+        self.epoch = self.epoch.checked_add(1).ok_or(Cancelled)?;
+        Ok(())
+    }
+
+    /// Mark a backing still owned by the complete persistent-root set.
+    pub fn retain(&mut self, address: usize) {
+        if let Some((_, epoch)) = self
+            .backings
+            .get_mut(&address)
+            .or_else(|| self.pinned.get_mut(&address))
+        {
+            *epoch = self.epoch;
+        }
+    }
+
+    /// Protect a charged immutable backing. Merely seeing a progress checkpoint
+    /// cannot establish this lifetime: the owner explicitly supplies its address.
+    pub fn pin(&mut self, address: usize) -> Result<(), Cancelled> {
+        if self.pinned.contains_key(&address) {
+            return Ok(());
+        }
+        if !self.backings.contains_key(&address) {
+            return Err(Cancelled);
+        }
+        if self.pinned.len() == self.pinned.capacity() {
+            let target = (self.pinned.len() + 1).next_power_of_two().max(32);
+            self.metadata.resize(
+                (target * 4 + self.backings.capacity() * 2 + self.pinned.capacity() * 2 + self.owned.capacity() * 2)
+                    * std::mem::size_of::<(usize, (Box<dyn Allocation>, u64))>()
+                    + self.pending.capacity() * std::mem::size_of::<Box<dyn Allocation>>()
+                    + 128,
+            )?;
+            self.pinned.try_reserve(1).map_err(|_| Cancelled)?;
+        }
+        let entry = self.backings.remove(&address).ok_or(Cancelled)?;
+        self.pinned.insert(address, entry);
+        Ok(())
+    }
+
+    /// Register the exclusive immutable token owner after physical allocation.
+    /// Admission failure leaves the original backing charge intact. No epoch or
+    /// progress event is ownership evidence: each backing is transferred once.
+    pub fn own(&mut self, address: usize, check: &mut Check<'_>) -> Result<(), Cancelled> {
+        if self.pinned_scope || self.owned.contains_key(&address) || !self.backings.contains_key(&address) {
+            return Err(Cancelled);
+        }
+        if self.owned.len() == self.owned.capacity() {
+            poll(check, Stage::Index, 0)?;
+            let target = (self.owned.len() + 1).next_power_of_two().max(32);
+            self.metadata.resize(
+                (target * 4 + self.backings.capacity() * 2 + self.pinned.capacity() * 2 + self.owned.capacity() * 2)
+                    * std::mem::size_of::<(usize, (Box<dyn Allocation>, u64))>()
+                    + self.pending.capacity() * std::mem::size_of::<Box<dyn Allocation>>()
+                    + 128,
+            )?;
+            // Reserve empty replacement storage, then move leases explicitly.
+            // Do not let HashMap growth perform an unchecked full rehash of all
+            // immutable owners. A stop must finish relocation before returning.
+            let mut replacement = std::collections::HashMap::new();
+            replacement.try_reserve(target).map_err(|_| Cancelled)?;
+            let mut stopped = false;
+            let mut panic = None;
+            for (index, entry) in self.owned.drain().enumerate() {
+                replacement.insert(entry.0, entry.1);
+                if (index + 1) % 32 == 0 && panic.is_none() {
+                    // Dropping a partially drained map on callback unwind would
+                    // refund leases before their token owners unwind. Finish
+                    // moving first, without calling a panicking callback again.
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        poll(check, Stage::Index, index + 1)
+                    })) {
+                        Ok(result) => stopped |= result.is_err(),
+                        Err(payload) => panic = Some(payload),
+                    }
+                }
+            }
+            self.owned = replacement;
+            if let Some(payload) = panic {
+                std::panic::resume_unwind(payload);
+            }
+            if stopped {
+                return Err(Cancelled);
+            }
+            poll(check, Stage::Index, 0)?;
+        }
+        let entry = self.backings.remove(&address).ok_or(Cancelled)?;
+        self.owned.insert(address, entry);
+        Ok(())
+    }
+
+    /// A sealed token owner has already freed storage. Also release an ordinary
+    /// lease if ownership-transfer admission failed before the move. This must
+    /// not check cancellation before refunding already-freed backing.
+    pub fn freed(&mut self, address: usize) {
+        self.owned.remove(&address);
+        self.backings.remove(&address);
+    }
+
+    /// Start one nonnested immutable-owner scope after a complete census. Rebuild
+    /// only the remaining mutable registry so dead historical capacity is not
+    /// scanned once per immutable output row. Peak old/new metadata is admitted.
+    pub fn begin_pinned_scope(&mut self, check: &mut Check<'_>) -> Result<(), Cancelled> {
+        poll(check, Stage::Cleanup, 0)?;
+        if self.pinned_scope || !self.pending.is_empty() || !self.owned.is_empty() {
+            return Err(Cancelled);
+        }
+        let target = self.backings.len().next_power_of_two().max(32);
+        self.metadata.resize(
+            (target * 4 + self.backings.capacity() * 2 + self.pinned.capacity() * 2 + self.owned.capacity() * 2)
+                * std::mem::size_of::<(usize, (Box<dyn Allocation>, u64))>()
+                + self.pending.capacity() * std::mem::size_of::<Box<dyn Allocation>>()
+                + 128,
+        )?;
+        let mut compact = std::collections::HashMap::new();
+        compact.try_reserve(self.backings.len()).map_err(|_| Cancelled)?;
+        let mut stopped = false;
+        for (index, entry) in self.backings.drain().enumerate() {
+            compact.insert(entry.0, entry.1);
+            if index % 32 == 0 {
+                stopped |= poll(check, Stage::Cleanup, index).is_err();
+            }
+        }
+        self.backings = compact;
+        self.pinned_scope = true;
+        // Never stop a move halfway and drop charges for still-live owners.
+        if stopped {
+            Err(Cancelled)
+        } else {
+            poll(check, Stage::Cleanup, 0)
+        }
+    }
+
+    /// No owner is freed or refunded here. Normal final censuses (or ordered
+    /// error cleanup) again account both registries after the scope ends.
+    pub fn end_pinned_scope(&mut self) {
+        self.pinned_scope = false;
+    }
+
+    /// Release only allocations absent from that authoritative root set. A stop
+    /// cannot interrupt release of dead charges or reset charges on live roots.
+    pub fn end_retention(&mut self, check: &mut Check<'_>) -> Result<(), Cancelled> {
+        let mut count = 0;
+        let mut stopped = false;
+        while !self.pending.is_empty() {
+            for _ in 0..32 {
+                drop(self.pending.pop());
+            }
+            stopped |= poll(check, Stage::Cleanup, self.pending.len()).is_err();
+        }
+        let mut retain = |_: &usize, (_, epoch): &mut (Box<dyn Allocation>, u64)| {
+            count += 1;
+            if count % 32 == 0 {
+                stopped |= poll(check, Stage::Cleanup, count).is_err();
+            }
+            *epoch == self.epoch
+        };
+        self.backings.retain(&mut retain);
+        if !self.pinned_scope {
+            self.pinned.retain(&mut retain);
+        }
+        self.metadata.resize(
+            (self.backings.capacity() + self.pinned.capacity() + self.owned.capacity())
+                * 2
+                * std::mem::size_of::<(usize, (Box<dyn Allocation>, u64))>()
+                + self.pending.capacity() * std::mem::size_of::<Box<dyn Allocation>>()
+                + 128,
+        )?;
+        if stopped { Err(Cancelled) } else { Ok(()) }
+    }
+}
+
+/// Record an admitted relocation only after the old backing was freed.
+pub fn allocated(old: usize, new: usize, bytes: usize, check: &mut Check<'_>) -> Result<(), Cancelled> {
+    poll(check, Stage::Backing { old, new }, bytes)
+}
+
+/// Mark a Vec's backing without exposing mutable storage or discounting capacity.
+pub fn retain_vec<T>(data: &Vec<T>, check: &mut Check<'_>) -> Result<(), Cancelled> {
+    if data.capacity() != 0 && std::mem::size_of::<T>() != 0 {
+        poll(
+            check,
+            Stage::Retain {
+                address: data.as_ptr() as usize,
+            },
+            data.capacity() * std::mem::size_of::<T>(),
+        )?;
+    }
+    Ok(())
 }
 
 pub(crate) fn poll(check: &mut Check<'_>, stage: Stage, processed: usize) -> Result<(), Cancelled> {
@@ -187,7 +469,14 @@ pub fn try_reserve<T>(out: &mut Vec<T>, additional: usize, check: &mut Check<'_>
     let target = len.max(out.capacity().saturating_mul(2)).min(maximum);
     let bytes = target.checked_mul(std::mem::size_of::<T>()).ok_or(Cancelled)?;
     admit_bytes(bytes, check)?;
-    out.try_reserve_exact(target - out.len()).map_err(|_| Cancelled)
+    let old = if out.capacity() == 0 { 0 } else { out.as_ptr() as usize };
+    out.try_reserve_exact(target - out.len()).map_err(|_| Cancelled)?;
+    allocated(
+        old,
+        out.as_ptr() as usize,
+        out.capacity() * std::mem::size_of::<T>(),
+        check,
+    )
 }
 
 /// Push one fixed-size element, admitting geometric capacity growth first.

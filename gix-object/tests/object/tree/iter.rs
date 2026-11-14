@@ -17,6 +17,84 @@ fn empty() {
 }
 
 #[test]
+fn controlled_iteration_preserves_entries_offsets_and_unbounded_byte_names() -> gix_testtools::TestResult {
+    for hash in [gix_hash::Kind::Sha1, gix_hash::Kind::Sha256] {
+        let mut bytes = b"100644 ".to_vec();
+        let name = vec![0xff; 3 * 32 * 1024 + 1];
+        bytes.extend_from_slice(&name);
+        bytes.push(0);
+        bytes.extend_from_slice(gix_hash::ObjectId::null(hash).as_bytes());
+        let next = bytes.len();
+        bytes.extend_from_slice(b"120000 link\0");
+        bytes.extend_from_slice(gix_hash::ObjectId::null(hash).as_bytes());
+        let mut controlled = TreeRefIter::from_bytes(&bytes, hash);
+        let mut legacy = TreeRefIter::from_bytes(&bytes, hash);
+        let calls = std::cell::Cell::new(0);
+        let first = controlled
+            .next_controlled(&|| {
+                calls.set(calls.get() + 1);
+                Ok(())
+            })?
+            .unwrap();
+        assert_eq!(first.filename, name.as_bstr());
+        assert_eq!(first, legacy.next().unwrap()?);
+        assert_eq!(controlled.offset_to_next_entry(&bytes), next);
+        assert!(calls.get() >= 5, "one pathological entry must have inner checks");
+        assert_eq!(controlled.next_controlled(&|| Ok(()))?, Some(legacy.next().unwrap()?));
+        assert!(controlled.next_controlled(&|| Ok(()))?.is_none());
+    }
+    Ok(())
+}
+
+#[test]
+fn controlled_iteration_stops_inside_one_name_and_never_returns_a_partial_entry() {
+    for terminated in [false, true] {
+        let mut bytes = b"100644 ".to_vec();
+        bytes.extend_from_slice(&vec![b'a'; 1024 * 1024]);
+        if terminated {
+            bytes.push(0);
+            bytes.extend_from_slice(gix_hash::ObjectId::null(gix_hash::Kind::Sha1).as_bytes());
+        }
+        let mut iter = TreeRefIter::from_bytes(&bytes, gix_hash::Kind::Sha1);
+        let calls = std::cell::Cell::new(0);
+        let result = iter.next_controlled(&|| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 3 {
+                Err(gix_error::cancelled("inside name").into())
+            } else {
+                Ok(())
+            }
+        });
+        assert!(result.unwrap_err().is_cancelled());
+        assert_eq!(calls.get(), 3);
+        assert!(iter.next_controlled(&|| Ok(())).unwrap().is_none());
+    }
+}
+
+#[test]
+fn controlled_iteration_errors_and_final_stop_are_fused() {
+    for bytes in [b"garbage".as_slice(), b"100644 unterminated", b"100644 name\0short"] {
+        let mut iter = TreeRefIter::from_bytes(bytes, gix_hash::Kind::Sha1);
+        assert!(iter.next_controlled(&|| Ok(())).is_err());
+        assert!(iter.next().is_none());
+    }
+    let mut bytes = b"100644 name\0".to_vec();
+    bytes.extend_from_slice(gix_hash::ObjectId::null(gix_hash::Kind::Sha1).as_bytes());
+    let mut iter = TreeRefIter::from_bytes(&bytes, gix_hash::Kind::Sha1);
+    let calls = std::cell::Cell::new(0);
+    let result = iter.next_controlled(&|| {
+        calls.set(calls.get() + 1);
+        if calls.get() == 3 {
+            Err(gix_error::cancelled("final boundary").into())
+        } else {
+            Ok(())
+        }
+    });
+    assert!(result.unwrap_err().is_cancelled());
+    assert!(iter.next().is_none());
+}
+
+#[test]
 fn error_handling() {
     let data = tree_fixture("everything.tree").expect("fixture is valid");
     let iter = TreeRefIter::from_bytes(&data[..data.len() / 2], fixture_hash_kind());

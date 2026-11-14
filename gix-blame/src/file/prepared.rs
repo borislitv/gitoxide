@@ -1,4 +1,5 @@
 use gix_diff::blob::InternedInput;
+use gix_diff::blob::byte_input::OwnedByteInput;
 use gix_diff::blob::control::{BYTE_CHUNK, Cancelled, Check, Checkpoint, Stage, try_line_ranges};
 #[cfg(test)]
 use gix_diff::blob::sources::byte_lines;
@@ -32,6 +33,9 @@ fn extend<T: Copy>(out: &mut Vec<T>, src: &[T], check: &mut Check<'_>) -> Result
 }
 
 const HISTORY_TOKEN_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+// Bound optional historical owners as well as logical byte weight. Current
+// required inputs retain their separate credit; this never truncates attribution.
+const HISTORY_TOKEN_BUDGET_COUNT: usize = 1024;
 const LINE_WEIGHT_OVERHEAD_BYTES: usize = 64;
 
 type PreparedView<'a> = (&'a InternedInput<Vec<u8>>, (usize, usize));
@@ -41,7 +45,7 @@ type PreparedView<'a> = (&'a InternedInput<Vec<u8>>, (usize, usize));
 #[derive(Default)]
 pub(super) struct PreparedInput {
     parent_id: Option<ObjectId>,
-    input: InternedInput<Vec<u8>>,
+    input: OwnedByteInput,
     offsets: Vec<usize>,
     spare_offsets: Vec<usize>,
     retained_bytes: usize,
@@ -54,10 +58,13 @@ pub(super) struct PreparedInput {
 }
 
 impl PreparedInput {
+    pub(super) fn retain_backings(&self, check: &mut Check<'_>) -> Result<(), Cancelled> {
+        gix_diff::blob::control::retain_vec(&self.offsets, check)?;
+        gix_diff::blob::control::retain_vec(&self.spare_offsets, check)?;
+        self.input.retain_backings(check)
+    }
     pub(super) fn clear_with_control(&mut self, check: &mut Check<'_>) {
-        self.input.before.clear();
-        self.input.after.clear();
-        self.input.interner.clear_with_control(check);
+        self.input.clear_with_control(check);
         self.parent_id = None;
     }
     pub(super) fn with_current_input_credit(mut self) -> Self {
@@ -125,6 +132,8 @@ impl PreparedInput {
         }
         if self.parent_id != Some(suspect_id)
             || self.retained_bytes.saturating_sub(current_weight) > HISTORY_TOKEN_BUDGET_BYTES
+            || self.input.interner.num_tokens() as usize
+                > HISTORY_TOKEN_BUDGET_COUNT + self.input.before.len() + self.input.after.len()
         {
             self.resets += 1;
             self.clear_with_control(check);
@@ -135,13 +144,14 @@ impl PreparedInput {
             for range in try_line_ranges(suspect, check)? {
                 let line = &suspect[range];
                 let token = self.try_intern(line, check)?;
-                gix_diff::blob::control::try_push(&mut self.input.after, token, check)?;
+                gix_diff::blob::control::try_push(self.input.sequences_mut().1, token, check)?;
                 position += line.len();
                 gix_diff::blob::control::try_push(&mut self.offsets, position, check)?;
             }
         } else {
             // The last parent is the current suspect in a linear traversal.
-            std::mem::swap(&mut self.input.before, &mut self.input.after);
+            let (before, after) = self.input.sequences_mut();
+            std::mem::swap(before, after);
         }
 
         let common = try_common_prefix(parent, suspect, check)?;
@@ -173,8 +183,9 @@ impl PreparedInput {
             parent_suffix = parent.len() - (suspect.len() - self.offsets[suffix_line]);
         }
 
-        self.input.before.clear();
-        extend(&mut self.input.before, &self.input.after[..prefix_lines], check)?;
+        let (before, after) = self.input.sequences_mut();
+        before.clear();
+        extend(before, &after[..prefix_lines], check)?;
         self.spare_offsets.clear();
         extend(&mut self.spare_offsets, &self.offsets[..=prefix_lines], check)?;
         let mut position = prefix_bytes;
@@ -211,13 +222,13 @@ impl PreparedInput {
                     {
                         end -= 1;
                     }
-                    extend(&mut self.input.before, &self.input.after[first..end], check)?;
-                    for &end in &self.offsets[first + 1..=end] {
-                        gix_diff::blob::control::try_push(
-                            &mut self.spare_offsets,
-                            position + (end - source_start),
-                            check,
-                        )?;
+                    let (before, after) = self.input.sequences_mut();
+                    extend(before, &after[first..end], check)?;
+                    let ends = &self.offsets[first + 1..=end];
+                    gix_diff::blob::control::try_reserve(&mut self.spare_offsets, ends.len(), check)?;
+                    for chunk in ends.chunks(1024) {
+                        self.spare_offsets
+                            .extend(chunk.iter().map(|&end| position + (end - source_start)));
                         poll(check, Stage::Copy, self.spare_offsets.len())?;
                     }
                     position += self.offsets[end] - source_start;
@@ -240,14 +251,18 @@ impl PreparedInput {
             } else {
                 self.try_intern(line, check)?
             };
-            gix_diff::blob::control::try_push(&mut self.input.before, token, check)?;
+            gix_diff::blob::control::try_push(self.input.sequences_mut().0, token, check)?;
             position += line.len();
             gix_diff::blob::control::try_push(&mut self.spare_offsets, position, check)?;
         }
-        extend(&mut self.input.before, &self.input.after[suffix_line..], check)?;
+        let (before, after) = self.input.sequences_mut();
+        extend(before, &after[suffix_line..], check)?;
         let suspect_suffix = self.offsets[suffix_line];
-        for &end in &self.offsets[suffix_line + 1..] {
-            gix_diff::blob::control::try_push(&mut self.spare_offsets, parent_suffix + (end - suspect_suffix), check)?;
+        let ends = &self.offsets[suffix_line + 1..];
+        gix_diff::blob::control::try_reserve(&mut self.spare_offsets, ends.len(), check)?;
+        for chunk in ends.chunks(1024) {
+            self.spare_offsets
+                .extend(chunk.iter().map(|&end| parent_suffix + (end - suspect_suffix)));
             poll(check, Stage::Copy, self.spare_offsets.len())?;
         }
         std::mem::swap(&mut self.offsets, &mut self.spare_offsets);
@@ -289,7 +304,14 @@ impl PreparedInput {
 
     fn try_intern(&mut self, line: &[u8], check: &mut Check<'_>) -> Result<gix_diff::blob::Token, Cancelled> {
         let previous_count = self.input.interner.num_tokens();
-        let token = self.input.interner.try_intern_bytes(line, check)?;
+        let token = match self.input.try_intern(line, check) {
+            Ok(token) => token,
+            Err(error) => {
+                self.parent_id = None;
+                self.retained_bytes = 0;
+                return Err(error);
+            }
+        };
         if token.0 == previous_count {
             // Account for owned line data, its Vec, allocator and table entry.
             self.retained_bytes = self
@@ -301,33 +323,57 @@ impl PreparedInput {
 }
 
 fn try_common_prefix(left: &[u8], right: &[u8], check: &mut Check<'_>) -> Result<usize, Cancelled> {
+    poll(check, Stage::Common, 0)?;
     let mut count = 0;
     for (left, right) in left.chunks(BYTE_CHUNK).zip(right.chunks(BYTE_CHUNK)) {
-        let matched = left.iter().zip(right).take_while(|(a, b)| a == b).count();
+        let blocks = left
+            .as_chunks::<256>()
+            .0
+            .iter()
+            .zip(right.as_chunks::<256>().0)
+            .take_while(|(a, b)| a == b)
+            .count();
+        let prefix = blocks * 256;
+        let matched = prefix
+            + left[prefix..]
+                .iter()
+                .zip(&right[prefix..])
+                .take_while(|(a, b)| a == b)
+                .count();
         count += matched;
         poll(check, Stage::Common, count)?;
         if matched != left.len().min(right.len()) {
             break;
         }
     }
+    poll(check, Stage::Common, count)?;
     Ok(count)
 }
 
 fn try_common_suffix(left: &[u8], right: &[u8], check: &mut Check<'_>) -> Result<usize, Cancelled> {
+    poll(check, Stage::Common, 0)?;
     let mut count = 0;
     for (left, right) in left.rchunks(BYTE_CHUNK).zip(right.rchunks(BYTE_CHUNK)) {
-        let matched = left
-            .iter()
-            .rev()
-            .zip(right.iter().rev())
+        let blocks = left
+            .rchunks_exact(256)
+            .zip(right.rchunks_exact(256))
             .take_while(|(a, b)| a == b)
             .count();
+        let prefix = blocks * 256;
+        let matched = prefix
+            + left[..left.len() - prefix]
+                .iter()
+                .rev()
+                .zip(right[..right.len() - prefix].iter().rev())
+                .take_while(|(a, b)| a == b)
+                .count();
         count += matched;
         poll(check, Stage::Common, count)?;
         if matched != left.len().min(right.len()) {
             break;
         }
     }
+    poll(check, Stage::Common, count)?;
     Ok(count)
 }
 

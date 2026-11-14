@@ -90,59 +90,148 @@ pub mod component {
 pub fn component(
     input: &BStr,
     mode: Option<component::Mode>,
+    options: component::Options,
+) -> Result<&BStr, component::Error> {
+    match component_impl(input, mode, options, &mut Uncontrolled) {
+        Ok(result) => result,
+        Err(never) => match never {},
+    }
+}
+
+/// Validate exactly as [`component()`], with fallible request-local control inside
+/// every input-sized scan. Byte searches/loops process at most 32 KiB per check;
+/// HFS decoding polls before each block of at most 8192 characters (at most 32 KiB
+/// of input, including invalid UTF-8). Fixed-size prefix checks remain bounded.
+/// Checks also run before validation and before returning success or a validation
+/// error. A control error takes precedence at those boundaries and is propagated
+/// unchanged; validation errors retain [`component::Error`] as their concrete cause.
+///
+/// No filename limit, allocation on success, input normalization or process-global
+/// interrupt state is introduced. The returned value borrows the original bytes;
+/// no partial result is returned on stop. UTF-8 handling is the same lossy byte
+/// iteration as the legacy HFS check, not a new UTF-8 validity requirement.
+/// The checker's own work, storage and deadline policy remain caller-owned.
+///
+/// ```
+/// use bstr::ByteSlice;
+/// let name = b"ordinary-name".as_bstr();
+/// let checked = gix_validate::path::component_controlled(
+///     name, None, Default::default(), &|| Ok(()),
+/// )?;
+/// assert!(std::ptr::eq(name, checked));
+/// # Ok::<(), gix_error::Error>(())
+/// ```
+pub fn component_controlled<'a>(
+    input: &'a BStr,
+    mode: Option<component::Mode>,
+    options: component::Options,
+    check: &dyn Fn() -> gix_error::Result,
+) -> gix_error::Result<&'a BStr> {
+    use gix_error::ResultExt;
+    check()?;
+    let result = component_impl(input, mode, options, &mut Controlled(check))?;
+    check()?;
+    result.or_error()
+}
+
+const SCAN_QUANTUM: usize = 32 * 1024;
+
+trait Control {
+    type Error;
+    const BYTE_QUANTUM: usize;
+    fn check(&mut self) -> Result<(), Self::Error>;
+}
+
+struct Uncontrolled;
+impl Control for Uncontrolled {
+    type Error = std::convert::Infallible;
+    const BYTE_QUANTUM: usize = usize::MAX;
+    fn check(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+struct Controlled<'a>(&'a dyn Fn() -> gix_error::Result);
+impl Control for Controlled<'_> {
+    type Error = gix_error::Error;
+    const BYTE_QUANTUM: usize = SCAN_QUANTUM;
+    fn check(&mut self) -> Result<(), Self::Error> {
+        (self.0)()
+    }
+}
+
+// Keep validation failures separate from control failures internally, so legacy
+// callers retain their original concrete error and allocate nothing even on error.
+fn component_impl<'a, C: Control>(
+    input: &'a BStr,
+    mode: Option<component::Mode>,
     component::Options {
         protect_windows,
         protect_hfs,
         protect_ntfs,
     }: component::Options,
-) -> Result<&BStr, component::Error> {
+    control: &mut C,
+) -> Result<Result<&'a BStr, component::Error>, C::Error> {
     if input.is_empty() {
-        return Err(component::Error::Empty);
+        return Ok(Err(component::Error::Empty));
     }
     if input == ".." || input == "." {
-        return Err(component::Error::Relative);
+        return Ok(Err(component::Error::Relative));
     }
     if protect_windows {
-        if input.find_byteset(br"/\").is_some() {
-            return Err(component::Error::PathSeparator);
+        if contains(input, |chunk| chunk.find_byteset(br"/\").is_some(), control)? {
+            return Ok(Err(component::Error::PathSeparator));
         }
+        control.check()?;
         if input.chars().nth(1) == Some(':') {
-            return Err(component::Error::WindowsPathPrefix);
+            return Ok(Err(component::Error::WindowsPathPrefix));
         }
-    } else if input.find_byte(b'/').is_some() {
-        return Err(component::Error::PathSeparator);
+    } else if contains(input, |chunk| chunk.find_byte(b'/').is_some(), control)? {
+        return Ok(Err(component::Error::PathSeparator));
     }
     if protect_hfs {
-        if is_dot_hfs(input, "git") {
-            return Err(component::Error::DotGitDir);
+        if is_dot_hfs(input, "git", control)? {
+            return Ok(Err(component::Error::DotGitDir));
         }
-        if is_symlink(mode) && is_dot_hfs(input, "gitmodules") {
-            return Err(component::Error::SymlinkedGitModules);
+        if is_symlink(mode) && is_dot_hfs(input, "gitmodules", control)? {
+            return Ok(Err(component::Error::SymlinkedGitModules));
         }
     }
 
     if protect_ntfs {
-        if is_dot_git_ntfs(input) {
-            return Err(component::Error::DotGitDir);
+        if is_dot_git_ntfs(input, control)? {
+            return Ok(Err(component::Error::DotGitDir));
         }
-        if is_symlink(mode) && is_dot_ntfs(input, "gitmodules", "gi7eba") {
-            return Err(component::Error::SymlinkedGitModules);
+        if is_symlink(mode) && is_dot_ntfs(input, "gitmodules", "gi7eba", control)? {
+            return Ok(Err(component::Error::SymlinkedGitModules));
         }
 
-        if protect_windows && let Some(err) = check_win_devices_and_illegal_characters(input) {
-            return Err(err);
+        if protect_windows && let Some(err) = check_win_devices_and_illegal_characters(input, control)? {
+            return Ok(Err(err));
         }
     }
 
     if !(protect_hfs | protect_ntfs) {
         if input.eq_ignore_ascii_case(b".git") {
-            return Err(component::Error::DotGitDir);
+            return Ok(Err(component::Error::DotGitDir));
         }
         if is_symlink(mode) && input.eq_ignore_ascii_case(b".gitmodules") {
-            return Err(component::Error::SymlinkedGitModules);
+            return Ok(Err(component::Error::SymlinkedGitModules));
         }
     }
-    Ok(input)
+    Ok(Ok(input))
+}
+
+fn contains<C: Control>(input: &[u8], predicate: impl Fn(&[u8]) -> bool, control: &mut C) -> Result<bool, C::Error> {
+    for chunk in input.chunks(C::BYTE_QUANTUM) {
+        control.check()?;
+        let found = predicate(chunk);
+        control.check()?;
+        if found {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Return `true` if the path component at `input` looks like a Windows device, like `CON`
@@ -151,19 +240,23 @@ pub fn component(
 /// This is relevant only on Windows, where one may be tricked into reading or writing to such devices.
 /// When reading from `CON`, a console-program may block until the user provided input.
 pub fn component_is_windows_device(input: &BStr) -> bool {
-    is_win_device(input)
+    match is_win_device(input, &mut Uncontrolled) {
+        Ok(result) => result,
+        Err(never) => match never {},
+    }
 }
 
-fn is_win_device(input: &BStr) -> bool {
-    let Some(in3) = input.get(..3) else { return false };
-    if in3.eq_ignore_ascii_case(b"AUX") && is_done_windows(input.get(3..)) {
-        return true;
+fn is_win_device<C: Control>(input: &BStr, control: &mut C) -> Result<bool, C::Error> {
+    control.check()?;
+    let Some(in3) = input.get(..3) else { return Ok(false) };
+    if in3.eq_ignore_ascii_case(b"AUX") && is_done_windows(input.get(3..), control)? {
+        return Ok(true);
     }
-    if in3.eq_ignore_ascii_case(b"NUL") && is_done_windows(input.get(3..)) {
-        return true;
+    if in3.eq_ignore_ascii_case(b"NUL") && is_done_windows(input.get(3..), control)? {
+        return Ok(true);
     }
-    if in3.eq_ignore_ascii_case(b"PRN") && is_done_windows(input.get(3..)) {
-        return true;
+    if in3.eq_ignore_ascii_case(b"PRN") && is_done_windows(input.get(3..), control)? {
+        return Ok(true);
     }
     // Note that the following allows `COM0`, even though `LPT0` is not allowed.
     // Even though tests seem to indicate that neither `LPT0` nor `COM0` are valid
@@ -173,45 +266,68 @@ fn is_win_device(input: &BStr) -> bool {
     // and to have exactly the same behaviour during validation (for worktree-writes).
     if in3.eq_ignore_ascii_case(b"COM")
         && input.get(3).is_some_and(|n| *n >= b'1' && *n <= b'9')
-        && is_done_windows(input.get(4..))
+        && is_done_windows(input.get(4..), control)?
     {
-        return true;
+        return Ok(true);
     }
     if in3.eq_ignore_ascii_case(b"LPT")
         && input.get(3).is_some_and(u8::is_ascii_digit)
-        && is_done_windows(input.get(4..))
+        && is_done_windows(input.get(4..), control)?
     {
-        return true;
+        return Ok(true);
     }
     if in3.eq_ignore_ascii_case(b"CON")
-        && (is_done_windows(input.get(3..))
-            || (input.get(3..6).is_some_and(|n| n.eq_ignore_ascii_case(b"IN$")) && is_done_windows(input.get(6..)))
-            || (input.get(3..7).is_some_and(|n| n.eq_ignore_ascii_case(b"OUT$")) && is_done_windows(input.get(7..))))
+        && (is_done_windows(input.get(3..), control)?
+            || (input.get(3..6).is_some_and(|n| n.eq_ignore_ascii_case(b"IN$"))
+                && is_done_windows(input.get(6..), control)?)
+            || (input.get(3..7).is_some_and(|n| n.eq_ignore_ascii_case(b"OUT$"))
+                && is_done_windows(input.get(7..), control)?))
     {
-        return true;
+        return Ok(true);
     }
-    false
+    Ok(false)
 }
 
-fn check_win_devices_and_illegal_characters(input: &BStr) -> Option<component::Error> {
-    if is_win_device(input) {
-        return Some(component::Error::WindowsReservedName);
+fn check_win_devices_and_illegal_characters<C: Control>(
+    input: &BStr,
+    control: &mut C,
+) -> Result<Option<component::Error>, C::Error> {
+    if is_win_device(input, control)? {
+        return Ok(Some(component::Error::WindowsReservedName));
     }
-    if input.iter().any(|b| *b < 0x20 || b":<>\"|?*".contains(b)) {
-        return Some(component::Error::WindowsIllegalCharacter);
+    if contains(
+        input,
+        |chunk| chunk.iter().any(|b| *b < 0x20 || b":<>\"|?*".contains(b)),
+        control,
+    )? {
+        return Ok(Some(component::Error::WindowsIllegalCharacter));
     }
     if input.ends_with(b".") || input.ends_with(b" ") {
-        return Some(component::Error::WindowsIllegalCharacter);
+        return Ok(Some(component::Error::WindowsIllegalCharacter));
     }
-    None
+    Ok(None)
 }
 
 fn is_symlink(mode: Option<component::Mode>) -> bool {
     mode == Some(component::Mode::Symlink)
 }
 
-fn is_dot_hfs(input: &BStr, search_case_insensitive: &str) -> bool {
-    let mut input = input.chars().filter(|c| match *c as u32 {
+fn is_dot_hfs<C: Control>(input: &BStr, search_case_insensitive: &str, control: &mut C) -> Result<bool, C::Error> {
+    let mut chars = input.chars();
+    let mut remaining = 0;
+    let mut next = || -> Result<Option<char>, C::Error> {
+        loop {
+            // bstr's lossy next() decodes at most four input bytes. Poll before
+            // decoding, including while skipping arbitrarily many HFS ignorables.
+            if remaining == 0 {
+                control.check()?;
+                remaining = SCAN_QUANTUM / 4;
+            }
+            remaining -= 1;
+            let Some(c) = chars.next() else {
+                return Ok(None);
+            };
+            let keep = match c as u32 {
         // Case-insensitive HFS+ skips these code points as "ignorable" when comparing filenames. See:
         // https://github.com/git/git/commit/6162a1d323d24fd8cbbb1a6145a91fb849b2568f
         // https://developer.apple.com/library/archive/technotes/tn/tn1150.html#StringComparisonAlgorithm
@@ -233,49 +349,61 @@ fn is_dot_hfs(input: &BStr, search_case_insensitive: &str) -> bool {
             0x206f | // NOMINAL DIGIT SHAPES
             0xfeff => false, // ZERO WIDTH NO-BREAK SPACE
             _ => true
-        });
-    if input.next() != Some('.') {
-        return false;
+            };
+            if keep {
+                return Ok(Some(c));
+            }
+        }
+    };
+    if next()? != Some('.') {
+        return Ok(false);
     }
 
     let mut comp = search_case_insensitive.chars();
     loop {
-        match (comp.next(), input.next()) {
+        match (comp.next(), next()?) {
             (Some(a), Some(b)) => {
                 if !a.eq_ignore_ascii_case(&b) {
-                    return false;
+                    return Ok(false);
                 }
             }
-            (None, None) => return true,
-            _ => return false,
+            (None, None) => return Ok(true),
+            _ => return Ok(false),
         }
     }
 }
 
-fn is_dot_git_ntfs(input: &BStr) -> bool {
+fn is_dot_git_ntfs<C: Control>(input: &BStr, control: &mut C) -> Result<bool, C::Error> {
+    control.check()?;
     if input.get(..4).is_some_and(|input| input.eq_ignore_ascii_case(b".git")) {
-        return is_done_ntfs(input.get(4..));
+        return is_done_ntfs(input.get(4..), control);
     }
     if input.get(..5).is_some_and(|input| input.eq_ignore_ascii_case(b"git~1")) {
-        return is_done_ntfs(input.get(5..));
+        return is_done_ntfs(input.get(5..), control);
     }
-    false
+    Ok(false)
 }
 
 /// The `search_case_insensitive` name is the actual name to look for (in a case-insensitive way).
 /// Opposed to that there is the special `ntfs_shortname_prefix` which is derived from `search_case_insensitive`
 /// but looks more like a hash, one that NTFS uses to disambiguate things, for when there is a lot of files
 /// with the same prefix.
-fn is_dot_ntfs(input: &BStr, search_case_insensitive: &str, ntfs_shortname_prefix: &str) -> bool {
+fn is_dot_ntfs<C: Control>(
+    input: &BStr,
+    search_case_insensitive: &str,
+    ntfs_shortname_prefix: &str,
+    control: &mut C,
+) -> Result<bool, C::Error> {
+    control.check()?;
     if input.first() == Some(&b'.') {
         let end_pos = 1 + search_case_insensitive.len();
         if input
             .get(1..end_pos)
             .is_some_and(|input| input.eq_ignore_ascii_case(search_case_insensitive.as_bytes()))
         {
-            is_done_ntfs(input.get(end_pos..))
+            is_done_ntfs(input.get(end_pos..), control)
         } else {
-            false
+            Ok(false)
         }
     } else {
         let search_case_insensitive: &[u8] = search_case_insensitive.as_bytes();
@@ -290,7 +418,7 @@ fn is_dot_ntfs(input: &BStr, search_case_insensitive: &str, ntfs_shortname_prefi
                     && input.get(7).is_some_and(|num| (b'1'..=b'4').contains(num))
             })
         {
-            return is_done_ntfs(input.get(8..));
+            return is_done_ntfs(input.get(8..), control);
         }
 
         let ntfs_shortname_prefix: &[u8] = ntfs_shortname_prefix.as_bytes();
@@ -298,20 +426,20 @@ fn is_dot_ntfs(input: &BStr, search_case_insensitive: &str, ntfs_shortname_prefi
         let mut pos = 0;
         while pos < 8 {
             let Some(b) = input.get(pos).copied() else {
-                return false;
+                return Ok(false);
             };
             if saw_tilde {
                 if !b.is_ascii_digit() {
-                    return false;
+                    return Ok(false);
                 }
             } else if b == b'~' {
                 saw_tilde = true;
                 pos += 1;
                 let Some(b) = input.get(pos).copied() else {
-                    return false;
+                    return Ok(false);
                 };
                 if !(b'1'..=b'9').contains(&b) {
-                    return false;
+                    return Ok(false);
                 }
             } else if pos >= 6
                 || b & 0x80 == 0x80
@@ -319,34 +447,48 @@ fn is_dot_ntfs(input: &BStr, search_case_insensitive: &str, ntfs_shortname_prefi
                     .get(pos)
                     .is_none_or(|ob| !b.eq_ignore_ascii_case(ob))
             {
-                return false;
+                return Ok(false);
             }
             pos += 1;
         }
-        is_done_ntfs(input.get(pos..))
+        is_done_ntfs(input.get(pos..), control)
     }
 }
 
 /// Check if trailing filename bytes leave a match to special files like `.git` unchanged in NTFS.
-fn is_done_ntfs(input: Option<&[u8]>) -> bool {
+fn is_done_ntfs<C: Control>(input: Option<&[u8]>, control: &mut C) -> Result<bool, C::Error> {
     // Skip spaces and dots. Then return true if we are at the end or a colon.
-    let Some(input) = input else { return true };
-    for b in input.bytes() {
-        if b == b':' {
-            return true;
+    let Some(input) = input else { return Ok(true) };
+    for chunk in input.chunks(C::BYTE_QUANTUM) {
+        control.check()?;
+        for b in chunk {
+            if *b == b':' {
+                control.check()?;
+                return Ok(true);
+            }
+            if *b != b' ' && *b != b'.' {
+                control.check()?;
+                return Ok(false);
+            }
         }
-        if b != b' ' && b != b'.' {
-            return false;
-        }
+        control.check()?;
     }
-    true
+    Ok(true)
 }
 
 /// Check if trailing filename bytes leave a match to Windows reserved device names unchanged.
-fn is_done_windows(input: Option<&[u8]>) -> bool {
+fn is_done_windows<C: Control>(input: Option<&[u8]>, control: &mut C) -> Result<bool, C::Error> {
     // Skip spaces. Then return true if we are at the end or a dot or colon.
-    let Some(input) = input else { return true };
-    let skip = input.bytes().take_while(|b| *b == b' ').count();
-    let Some(next) = input.get(skip) else { return true };
-    *next == b'.' || *next == b':'
+    let Some(input) = input else { return Ok(true) };
+    for chunk in input.chunks(C::BYTE_QUANTUM) {
+        control.check()?;
+        for b in chunk {
+            if *b != b' ' {
+                control.check()?;
+                return Ok(*b == b'.' || *b == b':');
+            }
+        }
+        control.check()?;
+    }
+    Ok(true)
 }

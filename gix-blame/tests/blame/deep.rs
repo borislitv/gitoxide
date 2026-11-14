@@ -1,0 +1,457 @@
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+use gix_diff::blob::control::{Allocation, Allocator, Cancelled};
+use gix_object::{Data, Header, Kind};
+
+pub(super) struct Budget(pub(super) Arc<Mutex<(usize, usize)>>, pub(super) usize);
+struct Charge {
+    state: Arc<Mutex<(usize, usize)>>,
+    bytes: usize,
+    limit: usize,
+}
+impl Allocation for Charge {
+    fn resize(&mut self, bytes: usize) -> Result<(), Cancelled> {
+        let mut state = self.state.lock().unwrap();
+        let used = state.0 - self.bytes + bytes;
+        if used > self.limit {
+            return Err(Cancelled);
+        }
+        state.0 = used;
+        state.1 = state.1.max(used);
+        self.bytes = bytes;
+        Ok(())
+    }
+}
+impl Drop for Charge {
+    fn drop(&mut self) {
+        self.state.lock().unwrap().0 -= self.bytes;
+    }
+}
+impl Allocator for Budget {
+    fn reserve(&self, bytes: usize) -> Result<Box<dyn Allocation>, Cancelled> {
+        let mut charge = Charge {
+            state: self.0.clone(),
+            bytes: 0,
+            limit: self.1,
+        };
+        charge.resize(bytes)?;
+        Ok(Box::new(charge))
+    }
+}
+
+// A faithful immutable physical-object provider: every ID is the real object
+// hash. Fixture storage is input ownership, separate from the job's live budget.
+struct History(HashMap<gix_hash::ObjectId, (Kind, Vec<u8>)>);
+impl History {
+    fn insert(&mut self, kind: Kind, data: Vec<u8>) -> gix_hash::ObjectId {
+        let id = gix_object::compute_hash(super::fixture_hash_kind(), kind, &data).unwrap();
+        self.0.insert(id, (kind, data));
+        id
+    }
+}
+impl gix_object::FindHeader for History {
+    fn try_header(&self, id: &gix_hash::oid) -> gix_error::Result<Option<Header>> {
+        Ok(self.0.get(id).map(|(kind, data)| Header {
+            kind: *kind,
+            size: data.len() as u64,
+        }))
+    }
+}
+impl gix_object::Find for History {
+    fn try_find<'a>(&self, id: &gix_hash::oid, buffer: &'a mut Vec<u8>) -> gix_error::Result<Option<Data<'a>>> {
+        let Some((kind, data)) = self.0.get(id) else {
+            return Ok(None);
+        };
+        assert!(
+            buffer.capacity() >= data.len(),
+            "provider may not grow unadmitted caller storage"
+        );
+        buffer.clear();
+        buffer.extend_from_slice(data);
+        Ok(Some(Data::new(buffer, *kind, super::fixture_hash_kind())))
+    }
+}
+
+#[test]
+fn raw_pair_entry_discards_another_providers_prepopulated_resources() -> gix_testtools::TestResult {
+    let mut source_a = History(HashMap::new());
+    let parent_blob = source_a.insert(Kind::Blob, b"anchor\nold\n".to_vec());
+    let tip_blob = source_a.insert(Kind::Blob, b"anchor\nnew\n".to_vec());
+    let mut commit = |blob: gix_hash::ObjectId, parent: Option<gix_hash::ObjectId>, time| {
+        let mut tree = b"100644 f\0".to_vec();
+        tree.extend_from_slice(blob.as_bytes());
+        let tree = source_a.insert(Kind::Tree, tree);
+        let parent = parent.map_or(String::new(), |id| format!("parent {id}\n"));
+        source_a.insert(Kind::Commit, format!("tree {tree}\n{parent}author Fixture <fixture@example.invalid> {time} +0000\ncommitter Fixture <fixture@example.invalid> {time} +0000\n\nPhysical history\n").into_bytes())
+    };
+    let parent = commit(parent_blob, None, 1);
+    let tip = commit(tip_blob, Some(parent), 2);
+    let mut platform = super::Fixture::new()?.resource_cache;
+    for (id, side) in [
+        (parent_blob, gix_diff::blob::ResourceKind::OldOrSource),
+        (tip_blob, gix_diff::blob::ResourceKind::NewOrDestination),
+    ] {
+        platform.set_resource_controlled_raw(
+            id,
+            gix_object::tree::EntryKind::Blob,
+            "f".into(),
+            side,
+            &source_a,
+            &mut |_| Ok(()),
+        )?;
+    }
+    assert_eq!(platform.controlled_raw_buffers()?.0, b"anchor\nold\n");
+    // B contains the physical commits/trees and tip, but not the parent blob.
+    // A's valid bytes cannot manufacture membership in B's source context.
+    let mut source_b = source_a;
+    source_b.0.remove(&parent_blob);
+    let state = Arc::new(Mutex::new((0, 0)));
+    let result = gix_blame::file_with_allocations(
+        source_b,
+        gix_blame::Start::Commit(tip),
+        None,
+        &mut platform,
+        "f".into(),
+        Default::default(),
+        Default::default(),
+        Arc::new(Budget(state.clone(), 4 * 1024 * 1024)),
+        &mut |_| Ok(()),
+    );
+    assert!(
+        result.is_err(),
+        "another provider's pair cannot satisfy a missing physical input"
+    );
+    let mut roots = 0;
+    platform.retain_controlled_backings(&mut |_| {
+        roots += 1;
+        Ok(())
+    })?;
+    assert_eq!(roots, 0);
+    assert_eq!(state.lock().unwrap().0, 0);
+    Ok(())
+}
+
+#[test]
+fn raw_pair_later_provider_and_admission_failures_release_storage_and_charges() -> gix_testtools::TestResult {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    struct LaterDenial {
+        budget: Budget,
+        deny: Arc<AtomicBool>,
+    }
+    impl Allocator for LaterDenial {
+        fn reserve(&self, bytes: usize) -> Result<Box<dyn Allocation>, Cancelled> {
+            if self.deny.load(Ordering::Relaxed) {
+                Err(Cancelled)
+            } else {
+                self.budget.reserve(bytes)
+            }
+        }
+    }
+    for missing_blob in [false, true] {
+        let mut history = History(HashMap::new());
+        let mut parent = None;
+        let mut root_blob = None;
+        for revision in 0..8 {
+            let blob = history.insert(Kind::Blob, format!("anchor\nvalue-{revision}\n").into_bytes());
+            root_blob.get_or_insert(blob);
+            let mut tree = b"100644 f\0".to_vec();
+            tree.extend_from_slice(blob.as_bytes());
+            let tree = history.insert(Kind::Tree, tree);
+            let parent_header = parent.map_or(String::new(), |id| format!("parent {id}\n"));
+            parent = Some(history.insert(Kind::Commit, format!("tree {tree}\n{parent_header}author Fixture <fixture@example.invalid> {} +0000\ncommitter Fixture <fixture@example.invalid> {} +0000\n\nChanged history\n", revision + 1, revision + 1).into_bytes()));
+        }
+        if missing_blob {
+            history.0.remove(&root_blob.unwrap());
+        }
+        let mut platform = super::Fixture::new()?.resource_cache;
+        let state = Arc::new(Mutex::new((0, 0)));
+        let deny = Arc::new(AtomicBool::new(false));
+        let mut reached = false;
+        let result = gix_blame::file_with_allocations(
+            history,
+            gix_blame::Start::Commit(parent.unwrap()),
+            None,
+            &mut platform,
+            "f".into(),
+            Default::default(),
+            gix_blame::Tuning {
+                reuse_line_tokens: true,
+                retain_current_input_tokens: true,
+                reuse_unchanged_runs: true,
+                bounded_resource_cache: true,
+                index_changes: true,
+            },
+            Arc::new(LaterDenial {
+                budget: Budget(state.clone(), 4 * 1024 * 1024),
+                deny: deny.clone(),
+            }),
+            &mut |event| {
+                if event.stage == gix_diff::blob::control::Stage::Commit && event.processed == 3 {
+                    reached = true;
+                    if !missing_blob {
+                        deny.store(true, Ordering::Relaxed);
+                    }
+                }
+                Ok(())
+            },
+        );
+        assert!(reached, "must perform actual pair reuse before failure");
+        assert!(result.is_err(), "failure cannot return a partial blame");
+        let mut roots = 0;
+        platform.retain_controlled_backings(&mut |_| {
+            roots += 1;
+            Ok(())
+        })?;
+        assert_eq!(roots, 0);
+        assert_eq!(state.lock().unwrap().0, 0);
+    }
+    Ok(())
+}
+
+#[test]
+fn complete_160000_commit_history_has_a_small_live_capacity_budget() -> gix_testtools::TestResult {
+    let mut history = History(HashMap::new());
+    let blob = history.insert(Kind::Blob, b"one\n".to_vec());
+    let mut tree = b"100644 file.txt\0".to_vec();
+    tree.extend_from_slice(blob.as_bytes());
+    let tree = history.insert(Kind::Tree, tree);
+    let mut parent = None;
+    let mut root = None;
+    for revision in 0..160_000 {
+        let parent_header = parent.map_or(String::new(), |id: gix_hash::ObjectId| format!("parent {id}\n"));
+        let body = format!(
+            "tree {tree}\n{parent_header}author Fixture <fixture@example.invalid> {} +0000\ncommitter Fixture <fixture@example.invalid> {} +0000\n\nSynthetic immutable history\n",
+            revision + 1,
+            revision + 1
+        );
+        let id = history.insert(Kind::Commit, body.into_bytes());
+        root.get_or_insert(id);
+        parent = Some(id);
+    }
+    let mut platform = super::Fixture::new()?.resource_cache;
+    let state = Arc::new(Mutex::new((0, 0)));
+    let mut commit_checkpoints = 0;
+    let result = gix_blame::file_with_allocations(
+        history,
+        gix_blame::Start::Commit(parent.unwrap()),
+        None,
+        &mut platform,
+        "file.txt".into(),
+        gix_blame::Options::default(),
+        gix_blame::Tuning::default(),
+        Arc::new(Budget(state.clone(), 4 * 1024 * 1024)),
+        &mut |event| {
+            if event.stage == gix_diff::blob::control::Stage::Commit {
+                assert_eq!(event.processed, commit_checkpoints);
+                commit_checkpoints += 1;
+            }
+            Ok(())
+        },
+    );
+    assert!(
+        result.is_ok(),
+        "a small live working set must not accumulate dead history charges: {:?}",
+        result.as_ref().err()
+    );
+    let result = result?;
+    assert_eq!(commit_checkpoints, 160_000);
+    assert!(
+        result.native_trace().is_none(),
+        "the existing entrypoint does not collect trace"
+    );
+    assert_eq!(result.outcome().statistics.commits_traversed, 160_000);
+    assert_eq!(result.outcome().entries.len(), 1);
+    assert_eq!(result.outcome().entries[0].commit_id, root.unwrap());
+    assert_eq!(result.outcome().blob, b"one\n");
+    assert!(state.lock().unwrap().0 >= result.outcome().blob.capacity());
+    drop(result);
+    assert_eq!(state.lock().unwrap().0, 0);
+    Ok(())
+}
+
+#[test]
+fn complete_160000_changed_history_reuses_live_scratch_with_selected_tuning() -> gix_testtools::TestResult {
+    let mut history = History(HashMap::new());
+    let mut parent = None;
+    let mut root = None;
+    for revision in 0..160_000 {
+        let blob = history.insert(Kind::Blob, format!("anchor\nvalue-{revision}\n").into_bytes());
+        let mut tree = b"100644 file.txt\0".to_vec();
+        tree.extend_from_slice(blob.as_bytes());
+        let tree = history.insert(Kind::Tree, tree);
+        let parent_header = parent.map_or(String::new(), |id: gix_hash::ObjectId| format!("parent {id}\n"));
+        let body = format!(
+            "tree {tree}\n{parent_header}author Fixture <fixture@example.invalid> {} +0000\ncommitter Fixture <fixture@example.invalid> {} +0000\n\nSynthetic changed history\n",
+            revision + 1,
+            revision + 1
+        );
+        let id = history.insert(Kind::Commit, body.into_bytes());
+        root.get_or_insert(id);
+        parent = Some(id);
+    }
+    let mut platform = super::Fixture::new()?.resource_cache;
+    let state = Arc::new(Mutex::new((0, 0)));
+    let result = gix_blame::file_with_allocations(
+        history,
+        gix_blame::Start::Commit(parent.unwrap()),
+        None,
+        &mut platform,
+        "file.txt".into(),
+        gix_blame::Options {
+            diff_algorithm: gix_diff::blob::Algorithm::Myers,
+            rewrites: Some(gix_diff::Rewrites::default()),
+            ..Default::default()
+        },
+        gix_blame::Tuning {
+            reuse_line_tokens: true,
+            retain_current_input_tokens: true,
+            reuse_unchanged_runs: true,
+            bounded_resource_cache: true,
+            index_changes: true,
+        },
+        Arc::new(Budget(state.clone(), 64 * 1024 * 1024)),
+        &mut |_| Ok(()),
+    )?;
+    assert_eq!(result.outcome().statistics.commits_traversed, 160_000);
+    assert_eq!(result.outcome().entries.len(), 2);
+    assert_eq!(result.outcome().entries[0].commit_id, root.unwrap());
+    assert_eq!(result.outcome().entries[1].commit_id, parent.unwrap());
+    assert_eq!(result.outcome().entries[0].start_in_source_file, 0);
+    assert_eq!(result.outcome().entries[0].start_in_blamed_file, 0);
+    assert_eq!(result.outcome().entries[0].len.get(), 1);
+    assert_eq!(result.outcome().entries[1].start_in_source_file, 1);
+    assert_eq!(result.outcome().entries[1].start_in_blamed_file, 1);
+    assert_eq!(result.outcome().entries[1].len.get(), 1);
+    assert_eq!(result.outcome().blob, b"anchor\nvalue-159999\n");
+    let (live, peak) = *state.lock().unwrap();
+    assert!(
+        live >= result.outcome().blob.capacity(),
+        "surviving output must stay charged"
+    );
+    assert!(
+        peak < 4 * 1024 * 1024,
+        "two active lines plus the 1024-token optional history must reset, not accumulate 160000 token leases: {peak}"
+    );
+    drop(result);
+    assert_eq!(state.lock().unwrap().0, 0);
+    Ok(())
+}
+
+#[test]
+fn prepared_token_owners_are_destroyed_on_later_cancel_and_panic() -> gix_testtools::TestResult {
+    for panic in [false, true] {
+        let mut history = History(HashMap::new());
+        let mut parent = None;
+        for revision in 0..8 {
+            let blob = history.insert(Kind::Blob, format!("anchor\nvalue-{revision}\n").into_bytes());
+            let mut tree = b"100644 file.txt\0".to_vec();
+            tree.extend_from_slice(blob.as_bytes());
+            let tree = history.insert(Kind::Tree, tree);
+            let parent_header = parent.map_or(String::new(), |id: gix_hash::ObjectId| format!("parent {id}\n"));
+            let body = format!(
+                "tree {tree}\n{parent_header}author Fixture <fixture@example.invalid> {} +0000\ncommitter Fixture <fixture@example.invalid> {} +0000\n\nChanged history\n",
+                revision + 1,
+                revision + 1
+            );
+            parent = Some(history.insert(Kind::Commit, body.into_bytes()));
+        }
+        let mut platform = super::Fixture::new()?.resource_cache;
+        let state = Arc::new(Mutex::new((0, 0)));
+        let mut reached = false;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            gix_blame::file_with_allocations(
+                history,
+                gix_blame::Start::Commit(parent.unwrap()),
+                None,
+                &mut platform,
+                "file.txt".into(),
+                gix_blame::Options {
+                    diff_algorithm: gix_diff::blob::Algorithm::Myers,
+                    rewrites: Some(gix_diff::Rewrites::default()),
+                    ..Default::default()
+                },
+                gix_blame::Tuning {
+                    reuse_line_tokens: true,
+                    retain_current_input_tokens: true,
+                    reuse_unchanged_runs: true,
+                    bounded_resource_cache: true,
+                    index_changes: true,
+                },
+                Arc::new(Budget(state.clone(), 4 * 1024 * 1024)),
+                &mut |event| {
+                    if event.stage == gix_diff::blob::control::Stage::Commit && event.processed == 3 {
+                        reached = true;
+                        assert!(!panic, "application callback panic after actual prepared-token reuse");
+                        return Err(Cancelled);
+                    }
+                    Ok(())
+                },
+            )
+        }));
+        assert!(reached, "must reach a later real traversal step");
+        if panic {
+            assert!(
+                result.is_err(),
+                "callback panic must unwind rather than become successful output"
+            );
+        } else {
+            assert!(result.unwrap().is_err(), "a later stop must not return partial output");
+        }
+        let mut platform_roots = 0;
+        platform.retain_controlled_backings(&mut |_| {
+            platform_roots += 1;
+            Ok(())
+        })?;
+        assert_eq!(
+            platform_roots, 0,
+            "external raw storage must not outlive the failed job arena"
+        );
+        assert_eq!(
+            state.lock().unwrap().0,
+            0,
+            "all owned storage must be released on either exit"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn cumulative_work_denial_is_independent_of_the_live_capacity_budget() -> gix_testtools::TestResult {
+    let mut history = History(HashMap::new());
+    let blob = history.insert(Kind::Blob, b"one\n".to_vec());
+    let mut tree = b"100644 file.txt\0".to_vec();
+    tree.extend_from_slice(blob.as_bytes());
+    let tree = history.insert(Kind::Tree, tree);
+    let mut parent = None;
+    for revision in 0..6 {
+        let parent_header = parent.map_or(String::new(), |id: gix_hash::ObjectId| format!("parent {id}\n"));
+        parent = Some(history.insert(Kind::Commit, format!("tree {tree}\n{parent_header}author Fixture <fixture@example.invalid> {} +0000\ncommitter Fixture <fixture@example.invalid> {} +0000\n\nWork limit\n", revision + 1, revision + 1).into_bytes()));
+    }
+    let mut platform = super::Fixture::new()?.resource_cache;
+    let state = Arc::new(Mutex::new((0, 0)));
+    let mut completed_work = 0;
+    let result = gix_blame::file_with_allocations(
+        history,
+        gix_blame::Start::Commit(parent.unwrap()),
+        None,
+        &mut platform,
+        "file.txt".into(),
+        Default::default(),
+        Default::default(),
+        Arc::new(Budget(state.clone(), 4 * 1024 * 1024)),
+        &mut |event| {
+            if event.stage == gix_diff::blob::control::Stage::Commit {
+                completed_work = event.processed;
+                if completed_work >= 3 {
+                    return Err(Cancelled);
+                }
+            }
+            Ok(())
+        },
+    );
+    assert!(result.is_err());
+    assert_eq!(completed_work, 3);
+    assert_eq!(state.lock().unwrap().0, 0);
+    Ok(())
+}

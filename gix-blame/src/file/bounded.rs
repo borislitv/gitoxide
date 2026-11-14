@@ -36,6 +36,13 @@ impl Queue {
             self.0
                 .try_reserve_exact(capacity - self.0.len())
                 .map_err(|_| message("blame queue allocation failed").raise())?;
+            gix_diff::blob::control::allocated(
+                0,
+                self.0.as_slice().as_ptr() as usize,
+                self.0.capacity() * std::mem::size_of::<Entry>(),
+                check,
+            )
+            .map_err(|e| e.raise())?;
         }
         self.0.push(Entry(time, id));
         Ok(())
@@ -43,12 +50,34 @@ impl Queue {
     pub fn pop_value(&mut self) -> Option<gix_hash::ObjectId> {
         self.0.pop().map(|e| e.1)
     }
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+    pub fn retain_backing(&self, check: &mut Check<'_>) -> Result {
+        if self.0.capacity() != 0 {
+            check(Checkpoint {
+                stage: Stage::Retain {
+                    address: self.0.as_slice().as_ptr() as usize,
+                },
+                processed: 0,
+            })
+            .map_err(|e| e.raise())?;
+        }
+        Ok(())
     }
 }
 
 pub(crate) type Shared<'a, 'b> = RefCell<&'a mut Check<'b>>;
+
+pub(super) fn allocated_smallvec<A: smallvec::Array>(
+    old: usize,
+    data: &smallvec::SmallVec<A>,
+    check: &mut Check<'_>,
+) -> std::result::Result<(), gix_diff::blob::control::Cancelled> {
+    let (address, bytes) = if data.spilled() {
+        (data.as_ptr() as usize, data.capacity() * std::mem::size_of::<A::Item>())
+    } else {
+        (0, 0)
+    };
+    gix_diff::blob::control::allocated(old, address, bytes, check)
+}
 
 /// A Vec of request-owned allocation owners, with checked cleanup on every exit.
 pub(crate) struct VecOwner<'a, 'b, 'c, T> {
@@ -114,6 +143,18 @@ pub(super) struct PreparedOwner<'a, 'b, 'c> {
     pub shared: &'a Shared<'b, 'c>,
 }
 
+/// The external platform can outlive the request arena. On panic it must free
+/// raw request storage before that arena unwinds, without re-entering a possibly
+/// panicking application callback. Normal exits use the checked cleanup path.
+pub(super) struct UnwindResources<'a>(pub &'a mut gix_diff::blob::Platform);
+impl Drop for UnwindResources<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.clear_controlled_raw(&mut |_| Ok(()));
+        }
+    }
+}
+
 pub(super) struct ByteOwner<'a, 'b, 'c> {
     pub data: gix_diff::blob::byte_input::ByteInput,
     pub shared: &'a Shared<'b, 'c>,
@@ -137,7 +178,14 @@ impl std::ops::DerefMut for PreparedOwner<'_, '_, '_> {
 impl Drop for PreparedOwner<'_, '_, '_> {
     fn drop(&mut self) {
         if let Some(input) = self.data.as_mut() {
-            input.clear_with_control(&mut **self.shared.borrow_mut());
+            if std::thread::panicking() {
+                // Do not invoke a possibly panicking application callback twice.
+                // The arena outlives this owner, so unwind releases its leases
+                // only after all token storage is physically destroyed here.
+                input.clear_with_control(&mut |_| Ok(()));
+            } else {
+                input.clear_with_control(&mut **self.shared.borrow_mut());
+            }
         }
     }
 }

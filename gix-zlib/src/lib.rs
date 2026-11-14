@@ -111,3 +111,30 @@ pub mod stream;
 pub mod inflate;
 
 mod decompress;
+
+/// Explicit estimates selected by an admitted-ingestion caller before constructing
+/// codec state. These count workspace, not allocator overhead or process RSS.
+/// The stable backend does not expose allocation callbacks: these are a profile,
+/// not a hard bound on an arbitrary backend/allocator. Review the profile when
+/// changing zlib-rs, enabling sirocco, changing target, or changing codec settings.
+#[derive(Clone, Copy, Debug)]
+pub struct Workspace {
+    /// Standalone Decompress used only while framing a single pack.
+    pub framing_inflate: usize,
+    /// Inflate used for structural entry and delta decoding.
+    pub entry_inflate: usize,
+    /// Streaming deflate used for normalization.
+    pub deflate: usize,
+}
+
+impl Workspace {
+    /// Conservative accounting profile for zlib-rs 0.6.8's default settings on
+    /// 64-bit targets, without sirocco. Each stream receives a 1 MiB estimate.
+    /// This intentionally exceeds its state/window/hash/pending/symbol storage;
+    /// it is not a promise about allocator overhead or future backend versions.
+    pub const ZLIB_RS_0_6_8: Self = Self {
+        framing_inflate: 1024 * 1024,
+        entry_inflate: 1024 * 1024,
+        deflate: 1024 * 1024,
+    };
+}

@@ -20,6 +20,36 @@ pub struct Outcome {
     pub num_objects: u32,
 }
 
+/// Encode a version-2 index for a completely written pack from caller-owned
+/// `(object ID, physical-entry CRC32, physical-entry offset)` metadata. No
+/// allocation, sorting, object decoding, file discovery or nested workers occurs.
+/// Entries must be strictly sorted by object ID and describe the exact output
+/// pack whose checksum is supplied by `pack_hash`.
+#[cfg(feature = "generate")]
+pub fn write_sorted_entries_controlled(
+    out: &mut dyn std::io::Write,
+    entries: &[(gix_hash::ObjectId, u32, u64)],
+    pack_hash: &gix_hash::ObjectId,
+    object_hash: gix_hash::Kind,
+    check: &dyn Fn() -> Result,
+) -> Result<gix_hash::ObjectId> {
+    check()?;
+    if entries.len() > u32::MAX as usize || pack_hash.kind() != object_hash {
+        return Err(gix_error::validation("Index metadata count or hash format is invalid").into());
+    }
+    let mut previous = None;
+    for (id, _, offset) in entries {
+        check()?;
+        if id.kind() != object_hash || *offset < crate::data::header::SIZE as u64
+            || previous.is_some_and(|previous| previous >= *id)
+        {
+            return Err(gix_error::validation("Index metadata is not a strictly ordered physical inventory").into());
+        }
+        previous = Some(*id);
+    }
+    crate::index::encode::write_to_controlled(out, entries, pack_hash, object_hash, check)
+}
+
 /// The progress ids used in [`write_data_iter_to_stream()`][crate::index::write_data_iter_to_stream()].
 ///
 /// Use this information to selectively extract the progress of interest in case the parent application has custom visualization.

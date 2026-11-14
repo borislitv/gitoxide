@@ -13,6 +13,7 @@ const ALL_ALGORITHMS: [Algorithm; 2] = [Algorithm::Histogram, Algorithm::Myers];
 
 mod controlled;
 mod interner;
+mod lazy_indent;
 
 mod fuzzed {
     use std::time::{Duration, Instant};

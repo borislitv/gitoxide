@@ -594,6 +594,13 @@ impl Platform {
             self.diff_cache
                 .try_reserve(1)
                 .map_err(|_| message("controlled raw cache allocation failed").raise())?;
+            crate::blob::control::allocated(
+                0,
+                std::ptr::from_ref(&self.diff_cache) as usize,
+                self.diff_cache.capacity() * 2 * std::mem::size_of::<(CacheKey, CacheValue)>() + 64,
+                check,
+            )
+            .map_err(|e| e.raise())?;
             self.controlled_raw = true;
             self.diff_cache.insert(
                 key.try_clone_controlled(check)?,
@@ -629,6 +636,61 @@ impl Platform {
         drop(cache);
         crate::blob::control::clear_with(&mut self.free_list, check);
         drop(std::mem::take(&mut self.free_list));
+    }
+
+    /// Borrow verified immutable raw bytes, including binary-classified content.
+    /// Blame treats NUL-containing blobs as byte lines, not as an empty diff.
+    pub fn controlled_raw_buffers(&self) -> Result<(&[u8], &[u8])> {
+        self.validate_controlled_raw()?;
+        let get = |key: &Option<CacheKey>| -> Result<&[u8]> {
+            let key = key
+                .as_ref()
+                .ok_or_else(|| message("controlled raw resource is unset").raise())?;
+            let value = self
+                .diff_cache
+                .get(key)
+                .ok_or_else(|| message("controlled raw resource is missing").raise())?;
+            Ok(value.buffer.as_slice())
+        };
+        Ok((get(&self.old)?, get(&self.new)?))
+    }
+
+    /// Enumerate the complete raw cache backing roots, never conversion state.
+    pub fn retain_controlled_backings(
+        &self,
+        check: &mut crate::blob::control::Check<'_>,
+    ) -> std::result::Result<(), crate::blob::control::Cancelled> {
+        use crate::blob::control::{Checkpoint, Stage, retain_vec};
+        if self.diff_cache.capacity() != 0 {
+            check(Checkpoint {
+                stage: Stage::Retain {
+                    address: std::ptr::from_ref(&self.diff_cache) as usize,
+                },
+                processed: 0,
+            })?;
+        }
+        for key in [&self.old, &self.new].into_iter().flatten() {
+            check(Checkpoint {
+                stage: Stage::Retain {
+                    address: key.location.as_ptr() as usize,
+                },
+                processed: 0,
+            })?;
+        }
+        for (key, value) in &self.diff_cache {
+            check(Checkpoint {
+                stage: Stage::Retain {
+                    address: key.location.as_ptr() as usize,
+                },
+                processed: 0,
+            })?;
+            retain_vec(&value.buffer, check)?;
+        }
+        retain_vec(&self.free_list, check)?;
+        for buffer in &self.free_list {
+            retain_vec(buffer, check)?;
+        }
+        Ok(())
     }
 
     /// Create a new instance with `options`, and a way to `filter` data from the object database to data that is diff-able.

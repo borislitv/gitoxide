@@ -67,6 +67,17 @@ impl<K: Ord, T> PriorityQueue<K, T> {
     pub fn new() -> Self {
         PriorityQueue(Default::default())
     }
+
+    /// Reserve empty queue backing before a capacity-admitted traversal starts.
+    pub fn try_reserve_exact(&mut self, additional: usize) -> Result<(), std::collections::TryReserveError> {
+        self.0.try_reserve_exact(additional)
+    }
+
+    /// Backing bytes for the given capacity, excluding separately owned values.
+    /// Returns `None` on arithmetic overflow.
+    pub fn bytes_for_capacity(capacity: usize) -> Option<usize> {
+        capacity.checked_mul(std::mem::size_of::<Item<K, T>>())
+    }
     /// Insert `value` so that it is ordered according to `key`.
     pub fn insert(&mut self, key: K, value: T) {
         self.0.push(Item { key, value });
