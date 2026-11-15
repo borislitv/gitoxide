@@ -190,9 +190,9 @@ impl PreparedInput {
         extend(&mut self.spare_offsets, &self.offsets[..=prefix_lines], check)?;
         let mut position = prefix_bytes;
         let mut nearby = prefix_lines;
-        let mut lines = try_line_ranges(&parent[prefix_bytes..parent_suffix], check)?.into_iter();
-        while let Some(range) = lines.next() {
-            let line = &parent[prefix_bytes + range.start..prefix_bytes + range.end];
+        while position < parent_suffix {
+            let len = try_line_len(&parent[position..parent_suffix], check)?;
+            let line = &parent[position..position + len];
             // Small separated edits need not re-intern the unchanged lines
             // between them. This is only a lookup hint: reuse requires exact
             // byte equality, and the complete diff still chooses attribution.
@@ -234,16 +234,9 @@ impl PreparedInput {
                     position += self.offsets[end] - source_start;
                     self.reused_run_lines += end - first;
                     nearby = end;
-                    // Existing ranges were relative to the original prefix;
-                    // skip the verified run without rescanning or retokenizing it.
-                    while lines
-                        .as_slice()
-                        .first()
-                        .is_some_and(|range| prefix_bytes + range.end <= position)
-                    {
-                        lines.next();
-                        poll(check, Stage::Common, position)?;
-                    }
+                    // The exact byte comparison and complete source boundaries
+                    // above validate the whole run. Discover the next line only
+                    // at its end, without scanning or materializing skipped lines.
                     continue;
                 }
                 nearby = first + 1;
@@ -320,6 +313,18 @@ impl PreparedInput {
         }
         Ok(token)
     }
+}
+
+fn try_line_len(bytes: &[u8], check: &mut Check<'_>) -> Result<usize, Cancelled> {
+    for (n, chunk) in bytes.chunks(BYTE_CHUNK).enumerate() {
+        if let Some(offset) = chunk.iter().position(|&byte| byte == b'\n') {
+            let end = n * BYTE_CHUNK + offset + 1;
+            poll(check, Stage::Tokenize, end)?;
+            return Ok(end);
+        }
+        poll(check, Stage::Tokenize, n * BYTE_CHUNK + chunk.len())?;
+    }
+    Ok(bytes.len())
 }
 
 fn try_common_prefix(left: &[u8], right: &[u8], check: &mut Check<'_>) -> Result<usize, Cancelled> {

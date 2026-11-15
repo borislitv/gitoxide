@@ -24,6 +24,9 @@ extend the controlled APIs without copying the algorithms into an application:
 - `gix-imara-diff` admits immutable token owners and registry metadata through
   the caller's capacity allocator, without an independent 131072-owner ceiling.
   Capacity denial still clears private token storage before releasing its leases.
+- `gix-blame` discovers parent middle-line boundaries lazily and advances over
+  verified unchanged runs without allocating ranges for skipped lines. Complete
+  byte comparisons and line boundaries remain required before token reuse.
 
 These are cooperative control and backing-accounting contracts, not a hard RSS,
 allocator or wall-clock-preemption guarantee. Callers must supply a verified
