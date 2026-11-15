@@ -27,6 +27,8 @@ extend the controlled APIs without copying the algorithms into an application:
 - `gix-blame` discovers parent middle-line boundaries lazily and advances over
   verified unchanged runs without allocating ranges for skipped lines. Complete
   byte comparisons and line boundaries remain required before token reuse.
+- Controlled Myers pruning polls in bounded weighted batches, accounting for
+  both forward and backward common-line scans without changing pruning decisions.
 
 These are cooperative control and backing-accounting contracts, not a hard RSS,
 allocator or wall-clock-preemption guarantee. Callers must supply a verified

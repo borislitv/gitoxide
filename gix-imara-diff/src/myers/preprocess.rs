@@ -5,6 +5,8 @@ use crate::control::{Cancelled, Check, Stage, poll};
 use crate::intern::Token;
 use crate::myers::sqrt;
 
+const COMMON_LINE_WINDOW: usize = 100;
+
 /// How often each token occurs in the two complete inputs of a diff, and the limits at which a token
 /// is considered [common](Occurrences::Common).
 ///
@@ -166,11 +168,26 @@ fn prune_unmatched_tokens(
     check: &mut Check<'_>,
 ) -> Result<(Vec<Token>, Vec<u32>), Cancelled> {
     assert_eq!(token_status.len(), file.len());
+    poll(check, Stage::Preprocess, 0)?;
     let mut tokens = Vec::new();
     let mut indices = Vec::new();
     crate::control::try_reserve(&mut tokens, file.len(), check)?;
     crate::control::try_reserve(&mut indices, file.len(), check)?;
+    // Charge the worst-case numeric work before each token: one classification
+    // plus up to 100 backward and 101 forward status visits for a common line.
+    // Cheap tokens can share a larger batch without letting common-line scans
+    // turn a token-count quantum into 201 times as much unchecked work.
+    const WORK_QUANTUM: usize = 1024;
+    let mut work = 0;
     for (i, (&token, &status)) in file.iter().zip(token_status).enumerate() {
+        let cost = match status {
+            Occurrences::Common => 2 * COMMON_LINE_WINDOW + 2,
+            _ => 1,
+        };
+        if work + cost > WORK_QUANTUM {
+            poll(check, Stage::Preprocess, i)?;
+            work = 0;
+        }
         let prune = match status {
             Occurrences::None => true,
             Occurrences::Some => false,
@@ -182,15 +199,14 @@ fn prune_unmatched_tokens(
             tokens.push(token);
             indices.push(i as u32);
         }
-        poll(check, Stage::Preprocess, i + 1)?;
+        work += cost;
     }
+    poll(check, Stage::Preprocess, file.len())?;
     Ok((tokens, indices))
 }
 
 // TODO do not unnecessarily rescan lines
 fn should_prune_common_line(token_status: &[Occurrences], pos: usize) -> bool {
-    const WINDOW_SIZE: usize = 100;
-
     // Git's `xdl_clean_mmatch` starts both `rpdis0` and `rpdis1` at 1 and sums them,
     // so the line under test is counted twice. Here, the backward scan stops just
     // before the candidate so we initialize the count to 1 to account for it. In the
@@ -199,7 +215,7 @@ fn should_prune_common_line(token_status: &[Occurrences], pos: usize) -> bool {
     let mut unmatched_before = 0;
     let mut common_before = 1;
 
-    let start = pos.saturating_sub(WINDOW_SIZE);
+    let start = pos.saturating_sub(COMMON_LINE_WINDOW);
     for status in token_status[start..pos].iter().rev() {
         match status {
             Occurrences::None => {
@@ -217,9 +233,9 @@ fn should_prune_common_line(token_status: &[Occurrences], pos: usize) -> bool {
     }
 
     // The candidate line gets walked over and counted in this scan so the
-    // count starts at 0 here. We also make sure to walk a full `WINDOW_SIZE`
-    // lines after the candidate and not just walk `WINDOW_SIZE` in total.
-    let end = token_status.len().min(pos + WINDOW_SIZE + 1);
+    // count starts at 0 here. We also make sure to walk a full `COMMON_LINE_WINDOW`
+    // lines after the candidate and not just walk `COMMON_LINE_WINDOW` in total.
+    let end = token_status.len().min(pos + COMMON_LINE_WINDOW + 1);
     let mut unmatched_after = 0;
     let mut common_after = 0;
     for status in token_status[pos..end].iter() {
