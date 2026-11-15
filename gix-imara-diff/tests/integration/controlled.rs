@@ -140,6 +140,69 @@ mod owned_tokens {
     }
 
     #[test]
+    fn admitted_large_token_dictionary_is_bounded_by_capacity_not_owner_count() {
+        fn account(arena: &mut Allocations, event: Checkpoint) -> Result<(), Cancelled> {
+            match event.stage {
+                Stage::Allocate => arena.admit(event.processed),
+                Stage::Backing { old, new } => arena.allocated(old, new, event.processed),
+                Stage::BackingOwned { address } => arena.own(address, &mut |_| Ok(())),
+                Stage::BackingFreed { address } => {
+                    arena.freed(address);
+                    Ok(())
+                }
+                Stage::Retain { address } => {
+                    arena.retain(address);
+                    Ok(())
+                }
+                _ => Ok(()),
+            }
+        }
+        let budget = Budget::default();
+        let mut arena = Allocations::new(Arc::new(budget.clone())).expect("admit empty registry");
+        let mut input = OwnedByteInput::default();
+        // A legal, modest byte dictionary can have more owners than the former
+        // 131072-entry registry ceiling. Capacity admission is the actual bound.
+        for id in 0..140_000 {
+            let line = format!("{id:064}\n");
+            let token = input
+                .try_intern(line.as_bytes(), &mut |event| account(&mut arena, event))
+                .expect("admitted dictionary must not have a hidden token-count limit");
+            assert_eq!(input.interner[token].as_slice(), line.as_bytes());
+        }
+        arena.begin_retention().expect("start complete census");
+        input
+            .retain_backings(&mut |event| account(&mut arena, event))
+            .expect("retain mutable roots");
+        arena.end_retention(&mut |_| Ok(())).expect("finish census");
+        assert_eq!(input.interner.num_tokens(), 140_000);
+        assert_eq!(budget.count(65), 140_000, "all immutable token bytes remain charged");
+        assert!(budget.total() >= 140_000 * 65, "registry metadata is also admitted");
+
+        budget.0.lock().expect("budget lock").deny = true;
+        assert!(
+            input
+                .try_intern(b"new-token-after-capacity-denial\n", &mut |event| account(
+                    &mut arena, event
+                ))
+                .is_err()
+        );
+        assert_eq!(
+            input.interner.num_tokens(),
+            0,
+            "capacity failure clears private token owners"
+        );
+        assert_eq!(budget.count(65), 0, "failed input frees all token backings");
+        budget.0.lock().expect("budget lock").deny = false;
+        drop(input);
+        arena.clear_with_control(&mut |_| Ok(()));
+        assert_eq!(
+            budget.total(),
+            0,
+            "scratch owners die before their charges are released"
+        );
+    }
+
+    #[test]
     fn active_20000_token_pair_has_constant_censuses_and_exact_reset_charges() {
         let mut harness = Harness::new();
         let mut input = OwnedByteInput::default();

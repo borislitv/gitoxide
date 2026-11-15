@@ -21,6 +21,9 @@ extend the controlled APIs without copying the algorithms into an application:
   before allocation; retained result parent lists keep that admission alive.
   The admitted profile disables commit-graph shortcuts and bounds initial tips
   and ends. Duplicate ends and tips that are also ends do not duplicate queues.
+- `gix-imara-diff` admits immutable token owners and registry metadata through
+  the caller's capacity allocator, without an independent 131072-owner ceiling.
+  Capacity denial still clears private token storage before releasing its leases.
 
 These are cooperative control and backing-accounting contracts, not a hard RSS,
 allocator or wall-clock-preemption guarantee. Callers must supply a verified

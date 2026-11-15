@@ -188,10 +188,14 @@ impl Allocations {
     /// and associate persistent backing with an allocated event.
     pub fn admit(&mut self, bytes: usize) -> Result<(), Cancelled> {
         let live = self.pending.len() + self.backings.len() + self.pinned.len() + self.owned.len();
-        if live >= 131072 {
-            return Err(Cancelled);
-        }
-        let target = (live + 1).next_power_of_two().max(32);
+        // Immutable line tokens each own a backing. A byte-admitted dictionary
+        // can legitimately exceed an unrelated fixed registry-entry limit.
+        // Charge registry growth to the same allocator as the token bytes.
+        let target = live
+            .checked_add(1)
+            .and_then(usize::checked_next_power_of_two)
+            .ok_or(Cancelled)?
+            .max(32);
         // Admit both old and replacement metadata while either can be live.
         self.metadata.resize(
             (target * 4 + self.backings.capacity() * 2 + self.pinned.capacity() * 2 + self.owned.capacity() * 2)
