@@ -29,6 +29,9 @@ extend the controlled APIs without copying the algorithms into an application:
   byte comparisons and line boundaries remain required before token reuse.
 - Controlled Myers pruning polls in bounded weighted batches, accounting for
   both forward and backward common-line scans without changing pruning decisions.
+- Controlled raw diff replacement reuses an evicted non-selected resource's
+  admitted backing. Growth, selected-side protection and cleanup retain their
+  existing allocation and ownership checks.
 
 These are cooperative control and backing-accounting contracts, not a hard RSS,
 allocator or wall-clock-preemption guarantee. Callers must supply a verified

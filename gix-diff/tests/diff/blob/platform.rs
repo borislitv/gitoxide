@@ -776,3 +776,470 @@ fn new_platform(
     );
     Platform::new(Default::default(), filter, mode, attributes)
 }
+
+mod raw_recycling {
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex},
+    };
+
+    use gix_diff::blob::{
+        Platform, ResourceKind,
+        control::{Allocation, Allocations, Allocator, Cancelled, Checkpoint, Stage},
+        pipeline,
+    };
+    use gix_object::{Data, Header, Kind, tree::EntryKind};
+    use gix_testtools::TestResult;
+
+    const BLOB_BYTES: usize = 64 * 1024;
+
+    #[derive(Default)]
+    struct BudgetState {
+        live: usize,
+        deny_large: bool,
+        denials: usize,
+    }
+
+    struct Budget(Arc<Mutex<BudgetState>>);
+    struct Charge {
+        state: Arc<Mutex<BudgetState>>,
+        bytes: usize,
+    }
+
+    impl Allocation for Charge {
+        fn resize(&mut self, bytes: usize) -> Result<(), Cancelled> {
+            let mut state = self.state.lock().expect("budget mutex");
+            // Small path/map/registry metadata remains admissible. Deny actual
+            // fulltext backing acquisition or growth, not ordinary cache work.
+            if state.deny_large && bytes > self.bytes && bytes >= BLOB_BYTES {
+                state.denials += 1;
+                return Err(Cancelled);
+            }
+            state.live = state.live - self.bytes + bytes;
+            self.bytes = bytes;
+            Ok(())
+        }
+    }
+
+    impl Drop for Charge {
+        fn drop(&mut self) {
+            self.state.lock().expect("budget mutex").live -= self.bytes;
+        }
+    }
+
+    impl Allocator for Budget {
+        fn reserve(&self, bytes: usize) -> Result<Box<dyn Allocation>, Cancelled> {
+            let mut charge = Charge {
+                state: self.0.clone(),
+                bytes: 0,
+            };
+            charge.resize(bytes)?;
+            Ok(Box::new(charge))
+        }
+    }
+
+    #[derive(Default)]
+    struct Blobs(HashMap<gix_hash::ObjectId, Vec<u8>>);
+
+    impl Blobs {
+        fn insert(&mut self, bytes: Vec<u8>) -> gix_hash::ObjectId {
+            let blob_id = gix_object::compute_hash(crate::fixture_hash_kind(), Kind::Blob, &bytes)
+                .expect("hash synthetic immutable blob");
+            self.0.insert(blob_id, bytes);
+            blob_id
+        }
+    }
+
+    impl gix_object::FindHeader for Blobs {
+        fn try_header(&self, id: &gix_hash::oid) -> gix_error::Result<Option<Header>> {
+            Ok(self.0.get(id).map(|bytes| Header {
+                kind: Kind::Blob,
+                size: bytes.len() as u64,
+            }))
+        }
+    }
+
+    impl gix_object::Find for Blobs {
+        fn try_find<'a>(&self, id: &gix_hash::oid, buffer: &'a mut Vec<u8>) -> gix_error::Result<Option<Data<'a>>> {
+            let Some(bytes) = self.0.get(id) else {
+                return Ok(None);
+            };
+            assert!(
+                buffer.capacity() >= bytes.len(),
+                "provider cannot grow unadmitted scratch"
+            );
+            buffer.clear();
+            buffer.extend_from_slice(bytes);
+            Ok(Some(Data::new(buffer, Kind::Blob, crate::fixture_hash_kind())))
+        }
+    }
+
+    fn payload(fill: u8, len: usize) -> Vec<u8> {
+        let mut bytes = vec![fill; len];
+        bytes[1] = 0;
+        bytes[len - 1] = 0xff;
+        bytes
+    }
+
+    fn setup() -> (Platform, Allocations, Arc<Mutex<BudgetState>>) {
+        // No repository, filesystem probe, attributes, filters or native Git.
+        let platform = Platform::new(
+            Default::default(),
+            gix_diff::blob::Pipeline::new(
+                pipeline::WorktreeRoots {
+                    old_root: None,
+                    new_root: None,
+                },
+                gix_filter::Pipeline::new(Default::default(), crate::fixture_hash_kind(), Default::default()),
+                Vec::new(),
+                pipeline::Options {
+                    large_file_threshold_bytes: 0,
+                    fs: Default::default(),
+                },
+            ),
+            pipeline::Mode::ToGit,
+            gix_worktree::Stack::new(
+                std::path::PathBuf::new(),
+                gix_worktree::stack::State::AttributesStack(Default::default()),
+                Default::default(),
+                Vec::new(),
+                Vec::new(),
+            ),
+        );
+        let state = Arc::new(Mutex::new(BudgetState::default()));
+        let allocations = Allocations::new(Arc::new(Budget(state.clone()))).expect("initial registry charge");
+        (platform, allocations, state)
+    }
+
+    fn route(allocations: &mut Allocations, event: Checkpoint) -> Result<(), Cancelled> {
+        match event.stage {
+            Stage::Allocate => allocations.admit(event.processed),
+            Stage::Backing { old, new } => allocations.allocated(old, new, event.processed),
+            Stage::Retain { address } => {
+                allocations.retain(address);
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn load(
+        platform: &mut Platform,
+        allocations: &mut Allocations,
+        blob_id: gix_hash::ObjectId,
+        side: ResourceKind,
+        objects: &impl gix_object::FindObjectOrHeader,
+    ) -> gix_error::Result {
+        platform.set_resource_controlled_raw(blob_id, EntryKind::Blob, "f".into(), side, objects, &mut |event| {
+            route(allocations, event)
+        })
+    }
+
+    fn census(platform: &Platform, allocations: &mut Allocations) {
+        allocations.begin_retention().expect("start complete root census");
+        platform
+            .retain_controlled_backings(&mut |event| route(allocations, event))
+            .expect("retain raw roots");
+        allocations
+            .end_retention(&mut |_| Ok(()))
+            .expect("refund only dead scratch");
+    }
+
+    fn finish(mut platform: Platform, mut allocations: Allocations, state: &Arc<Mutex<BudgetState>>) {
+        platform.clear_controlled_raw(&mut |event| {
+            route(&mut allocations, event)?;
+            Err(Cancelled)
+        });
+        assert!(
+            platform.controlled_raw_buffers().is_err(),
+            "persistent stop cannot skip clearing resources"
+        );
+        census(&platform, &mut allocations);
+        drop(platform);
+        // The registry outlives all physical buffers, including failure scratch.
+        drop(allocations);
+        assert_eq!(state.lock().expect("budget mutex").live, 0);
+    }
+
+    #[test]
+    fn controlled_raw_recycles_equal_and_smaller_backings_and_protects_the_other_side() -> TestResult {
+        let (mut platform, mut allocations, state) = setup();
+        let bytes = [
+            payload(b'a', BLOB_BYTES),
+            payload(b'b', BLOB_BYTES),
+            payload(b'c', BLOB_BYTES),
+            payload(b'd', BLOB_BYTES / 2),
+            payload(b'e', BLOB_BYTES),
+            payload(b'f', BLOB_BYTES),
+        ];
+        // Different immutable providers ensure recycled capacity is not recycled
+        // object identity or content. Each miss must obtain the new source bytes.
+        let mut providers: [Blobs; 6] = std::array::from_fn(|_| Blobs::default());
+        let ids: [_; 6] = std::array::from_fn(|index| providers[index].insert(bytes[index].clone()));
+        load(
+            &mut platform,
+            &mut allocations,
+            ids[0],
+            ResourceKind::OldOrSource,
+            &providers[0],
+        )?;
+        load(
+            &mut platform,
+            &mut allocations,
+            ids[1],
+            ResourceKind::NewOrDestination,
+            &providers[1],
+        )?;
+        census(&platform, &mut allocations);
+        let (old, new) = platform.controlled_raw_buffers()?;
+        let pointers = (old.as_ptr(), new.as_ptr());
+        state.lock().expect("budget mutex").deny_large = true;
+        for (index, side, old_index, new_index) in [
+            (2, ResourceKind::OldOrSource, 2, 1),
+            (3, ResourceKind::NewOrDestination, 2, 3),
+            (4, ResourceKind::OldOrSource, 4, 3),
+            (5, ResourceKind::NewOrDestination, 4, 5),
+        ] {
+            load(&mut platform, &mut allocations, ids[index], side, &providers[index])?;
+            let (old, new) = platform.controlled_raw_buffers()?;
+            assert_eq!(old, bytes[old_index]);
+            assert_eq!(
+                new, bytes[new_index],
+                "smaller input must not expose the victim's remaining bytes"
+            );
+            assert_eq!(
+                (old.as_ptr(), new.as_ptr()),
+                pointers,
+                "only the replaced side's backing is recycled"
+            );
+            census(&platform, &mut allocations);
+            let budget = state.lock().expect("budget mutex");
+            assert_eq!(
+                budget.denials, 0,
+                "equal/smaller inputs must not request another fulltext backing"
+            );
+            assert!(
+                budget.live >= 2 * BLOB_BYTES,
+                "both live capacities, not just lengths, remain charged"
+            );
+            assert!(
+                budget.live < 3 * BLOB_BYTES,
+                "dead history must not accumulate leases after census"
+            );
+        }
+        finish(platform, allocations, &state);
+        Ok(())
+    }
+
+    #[test]
+    fn controlled_raw_recycling_denies_real_growth_without_losing_the_protected_resource() -> TestResult {
+        let (mut platform, mut allocations, state) = setup();
+        let mut objects = Blobs::default();
+        let first = objects.insert(payload(b'a', BLOB_BYTES));
+        let protected_bytes = payload(b'b', BLOB_BYTES);
+        let protected = objects.insert(protected_bytes.clone());
+        let larger = objects.insert(payload(b'c', 4 * BLOB_BYTES));
+        load(
+            &mut platform,
+            &mut allocations,
+            first,
+            ResourceKind::OldOrSource,
+            &objects,
+        )?;
+        load(
+            &mut platform,
+            &mut allocations,
+            protected,
+            ResourceKind::NewOrDestination,
+            &objects,
+        )?;
+        census(&platform, &mut allocations);
+        state.lock().expect("budget mutex").deny_large = true;
+        assert!(
+            load(
+                &mut platform,
+                &mut allocations,
+                larger,
+                ResourceKind::OldOrSource,
+                &objects
+            )
+            .is_err()
+        );
+        assert_eq!(
+            state.lock().expect("budget mutex").denials,
+            1,
+            "growth requires a new admitted lease"
+        );
+        assert!(
+            platform.controlled_raw_buffers().is_err(),
+            "failed selection must not expose stale bytes"
+        );
+        // A hit aliases the still-selected destination without any source access.
+        load(
+            &mut platform,
+            &mut allocations,
+            protected,
+            ResourceKind::OldOrSource,
+            &gix_object::find::Never,
+        )?;
+        let (old, new) = platform.controlled_raw_buffers()?;
+        assert_eq!(old, protected_bytes);
+        assert_eq!(new, protected_bytes);
+        census(&platform, &mut allocations);
+        let live = state.lock().expect("budget mutex").live;
+        assert!(live >= BLOB_BYTES, "protected backing retains its lease");
+        assert!(
+            live < 2 * BLOB_BYTES,
+            "failed recycled scratch must no longer be charged"
+        );
+        finish(platform, allocations, &state);
+        Ok(())
+    }
+
+    #[test]
+    fn controlled_raw_recycling_growth_remaps_the_lease_and_reuses_the_enlarged_backing() -> TestResult {
+        let (mut platform, mut allocations, state) = setup();
+        let mut objects = Blobs::default();
+        let first = objects.insert(payload(b'a', BLOB_BYTES));
+        let protected_bytes = payload(b'b', BLOB_BYTES);
+        let protected = objects.insert(protected_bytes.clone());
+        let larger_bytes = payload(b'c', 4 * BLOB_BYTES);
+        let larger = objects.insert(larger_bytes.clone());
+        let next_bytes = payload(b'd', 4 * BLOB_BYTES);
+        let next = objects.insert(next_bytes.clone());
+        load(
+            &mut platform,
+            &mut allocations,
+            first,
+            ResourceKind::OldOrSource,
+            &objects,
+        )?;
+        load(
+            &mut platform,
+            &mut allocations,
+            protected,
+            ResourceKind::NewOrDestination,
+            &objects,
+        )?;
+        census(&platform, &mut allocations);
+        load(
+            &mut platform,
+            &mut allocations,
+            larger,
+            ResourceKind::OldOrSource,
+            &objects,
+        )?;
+        let (old, new) = platform.controlled_raw_buffers()?;
+        assert_eq!(old, larger_bytes);
+        assert_eq!(new, protected_bytes);
+        let grown_pointer = old.as_ptr();
+        census(&platform, &mut allocations);
+        let live = state.lock().expect("budget mutex").live;
+        assert!(
+            live >= 5 * BLOB_BYTES,
+            "grown and protected capacities must both survive the census"
+        );
+        assert!(
+            live < 6 * BLOB_BYTES,
+            "growth must replace, not duplicate, the victim's old lease"
+        );
+        state.lock().expect("budget mutex").deny_large = true;
+        load(
+            &mut platform,
+            &mut allocations,
+            next,
+            ResourceKind::OldOrSource,
+            &objects,
+        )?;
+        let (old, new) = platform.controlled_raw_buffers()?;
+        assert_eq!(old, next_bytes);
+        assert_eq!(new, protected_bytes);
+        assert_eq!(
+            old.as_ptr(),
+            grown_pointer,
+            "the enlarged admitted backing remains reusable"
+        );
+        census(&platform, &mut allocations);
+        assert_eq!(state.lock().expect("budget mutex").denials, 0);
+        finish(platform, allocations, &state);
+        Ok(())
+    }
+
+    #[test]
+    fn controlled_raw_recycling_stop_and_panic_release_scratch_before_registry_cleanup() -> TestResult {
+        for panic in [false, true] {
+            let (mut platform, mut allocations, state) = setup();
+            let mut objects = Blobs::default();
+            let first = objects.insert(payload(b'a', BLOB_BYTES));
+            let protected_bytes = payload(b'b', BLOB_BYTES);
+            let protected = objects.insert(protected_bytes.clone());
+            let replacement = objects.insert(payload(b'c', BLOB_BYTES));
+            load(
+                &mut platform,
+                &mut allocations,
+                first,
+                ResourceKind::OldOrSource,
+                &objects,
+            )?;
+            load(
+                &mut platform,
+                &mut allocations,
+                protected,
+                ResourceKind::NewOrDestination,
+                &objects,
+            )?;
+            census(&platform, &mut allocations);
+            let mut reached = false;
+            let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                platform.set_resource_controlled_raw(
+                    replacement,
+                    EntryKind::Blob,
+                    "f".into(),
+                    ResourceKind::OldOrSource,
+                    &objects,
+                    &mut |event| {
+                        route(&mut allocations, event)?;
+                        if event.stage == Stage::Preprocess {
+                            reached = true;
+                            assert!(!panic, "callback panic after the recycled input has been filled");
+                            return Err(Cancelled);
+                        }
+                        Ok(())
+                    },
+                )
+            }));
+            assert!(reached, "must reach a filled replacement, not fail during setup");
+            if panic {
+                assert!(attempt.is_err(), "callback panic must unwind");
+            } else {
+                assert!(
+                    attempt.expect("ordinary stop does not panic").is_err(),
+                    "stop cannot publish an input"
+                );
+            }
+            assert!(platform.controlled_raw_buffers().is_err());
+            load(
+                &mut platform,
+                &mut allocations,
+                protected,
+                ResourceKind::OldOrSource,
+                &gix_object::find::Never,
+            )?;
+            let (old, new) = platform.controlled_raw_buffers()?;
+            assert_eq!(old, protected_bytes);
+            assert_eq!(new, protected_bytes);
+            census(&platform, &mut allocations);
+            let live = state.lock().expect("budget mutex").live;
+            assert!(
+                live >= BLOB_BYTES,
+                "protected bytes cannot lose their live lease during unwind"
+            );
+            assert!(
+                live < 2 * BLOB_BYTES,
+                "cancelled scratch lease must be refunded after destruction"
+            );
+            finish(platform, allocations, &state);
+        }
+        Ok(())
+    }
+}

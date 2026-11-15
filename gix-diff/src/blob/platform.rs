@@ -515,6 +515,7 @@ impl Platform {
             ResourceKind::NewOrDestination => &mut self.new,
         } = None;
         if !self.diff_cache.contains_key(&key) {
+            let mut recycled = None;
             // At most two entries: removing a victim cannot hide a cache-sized
             // retain/rehash/cleanup loop. The keys compare fixed-size IDs only.
             if self.diff_cache.len() >= 2 {
@@ -529,10 +530,13 @@ impl Platform {
                     .map(|k| k.try_clone_controlled(check))
                     .transpose()?;
                 if let Some(victim) = victim {
-                    self.diff_cache.remove(&victim);
+                    // Moving the Vec keeps its admitted backing and pointer live.
+                    // Growth below still uses the ordinary controlled relocation;
+                    // only the other selected resource must remain untouched.
+                    recycled = self.diff_cache.remove(&victim).map(|value| value.buffer);
                 }
             }
-            let mut buffer = self.free_list.pop().unwrap_or_default();
+            let mut buffer = recycled.or_else(|| self.free_list.pop()).unwrap_or_default();
             buffer.clear();
             let data = if id.is_null() {
                 None
