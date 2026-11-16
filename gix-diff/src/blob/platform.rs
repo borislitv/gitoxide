@@ -20,14 +20,37 @@ pub(crate) struct CacheKey {
 }
 
 /// A stored value representing a diffable resource.
-#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Debug)]
+#[derive(Clone)]
 pub(crate) struct CacheValue {
     /// The outcome of converting a resource into a diffable format using [Pipeline::convert_to_diffable()].
     conversion: pipeline::Outcome,
     /// The kind of the resource we are looking at. Only possible values are `Blob`, `BlobExecutable` and `Link`.
     mode: gix_object::tree::EntryKind,
     /// A possibly empty buffer, depending on `conversion.data` which may indicate the data is considered binary.
-    buffer: Vec<u8>,
+    buffer: ResourceBacking,
+}
+
+#[derive(Clone)]
+enum ResourceBacking {
+    Buffer(Vec<u8>),
+    Raw(crate::blob::raw::RawBlob),
+}
+
+impl ResourceBacking {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Buffer(buffer) => buffer,
+            Self::Raw(owner) => owner.as_slice(),
+        }
+    }
+
+    /// Only arena-admitted mutable buffers participate in buffer recycling.
+    fn into_buffer(self) -> Option<Vec<u8>> {
+        match self {
+            Self::Buffer(buffer) => Some(buffer),
+            Self::Raw(_) => None,
+        }
+    }
 }
 
 impl std::hash::Hash for CacheKey {
@@ -170,7 +193,7 @@ pub mod resource {
                 driver_index: value.conversion.driver_index,
                 data: value.conversion.data.map_or(Data::Missing, |data| match data {
                     pipeline::Data::Buffer { is_derived } => Data::Buffer {
-                        buf: &value.buffer,
+                        buf: value.buffer.as_slice(),
                         is_derived,
                     },
                     pipeline::Data::Binary { size } => Data::Binary { size },
@@ -481,6 +504,45 @@ impl Platform {
         objects: &impl gix_object::FindObjectOrHeader,
         check: &mut crate::blob::control::Check<'_>,
     ) -> Result {
+        self.set_resource_controlled_raw_inner(id, mode, path, kind, objects, None, check)
+    }
+
+    /// Like [`Self::set_resource_controlled_raw`], but retain a caller-verified,
+    /// self-admitted immutable owner instead of filling a scratch `Vec`.
+    ///
+    /// The header is obtained independently from `objects`. The owner must match
+    /// the requested OID, blob kind and exact header length. Missing/error results
+    /// are terminal: this method never falls back to `Find`. Existing raw cache
+    /// hits retain their owner without reacquiring it. Clear the cache between
+    /// source/job scopes; OID-only cache keys do not authorize source access.
+    /// A non-null hit backed by a legacy `Vec` is rejected, without replacing
+    /// it: call [`Self::clear_controlled_raw`] before switching acquisition modes.
+    /// See [`crate::blob::raw::RawBlob`] for backing and metadata admission duties.
+    #[expect(clippy::too_many_arguments)]
+    pub fn set_resource_controlled_raw_with_owner(
+        &mut self,
+        id: gix_hash::ObjectId,
+        mode: gix_object::tree::EntryKind,
+        path: &BStr,
+        kind: ResourceKind,
+        objects: &impl gix_object::FindObjectOrHeader,
+        lookup: &mut crate::blob::raw::Lookup<'_>,
+        check: &mut crate::blob::control::Check<'_>,
+    ) -> Result {
+        self.set_resource_controlled_raw_inner(id, mode, path, kind, objects, Some(lookup), check)
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn set_resource_controlled_raw_inner(
+        &mut self,
+        id: gix_hash::ObjectId,
+        mode: gix_object::tree::EntryKind,
+        path: &BStr,
+        kind: ResourceKind,
+        objects: &impl gix_object::FindObjectOrHeader,
+        lookup: Option<&mut crate::blob::raw::Lookup<'_>>,
+        check: &mut crate::blob::control::Check<'_>,
+    ) -> Result {
         use crate::blob::control::{BYTE_CHUNK, Checkpoint, Stage, try_reserve};
         self.validate_controlled_raw()?;
         if !matches!(
@@ -494,6 +556,10 @@ impl Platform {
         if path.len() > 65536 {
             return Err(message("controlled diff path exceeds 64 KiB metadata limit").into());
         }
+        *match kind {
+            ResourceKind::OldOrSource => &mut self.old,
+            ResourceKind::NewOrDestination => &mut self.new,
+        } = None;
         let mut location = Vec::new();
         try_reserve(&mut location, path.len(), check).map_err(|e| e.raise())?;
         for chunk in path.chunks(BYTE_CHUNK) {
@@ -510,10 +576,11 @@ impl Platform {
             use_id: true,
             is_link: mode == gix_object::tree::EntryKind::Link,
         };
-        *match kind {
-            ResourceKind::OldOrSource => &mut self.old,
-            ResourceKind::NewOrDestination => &mut self.new,
-        } = None;
+        check(Checkpoint {
+            stage: Stage::Graph,
+            processed: 0,
+        })
+        .map_err(|e| e.raise())?;
         if !self.diff_cache.contains_key(&key) {
             let mut recycled = None;
             // At most two entries: removing a victim cannot hide a cache-sized
@@ -533,13 +600,16 @@ impl Platform {
                     // Moving the Vec keeps its admitted backing and pointer live.
                     // Growth below still uses the ordinary controlled relocation;
                     // only the other selected resource must remain untouched.
-                    recycled = self.diff_cache.remove(&victim).map(|value| value.buffer);
+                    recycled = self
+                        .diff_cache
+                        .remove(&victim)
+                        .and_then(|value| value.buffer.into_buffer());
                 }
             }
-            let mut buffer = recycled.or_else(|| self.free_list.pop()).unwrap_or_default();
-            buffer.clear();
-            let data = if id.is_null() {
-                None
+            let buffer = if id.is_null() {
+                let mut buffer = recycled.or_else(|| self.free_list.pop()).unwrap_or_default();
+                buffer.clear();
+                ResourceBacking::Buffer(buffer)
             } else {
                 let header = objects
                     .try_header(&id)?
@@ -548,17 +618,72 @@ impl Platform {
                     return Err(message("controlled diff blob kind or 128 MiB size limit violated").into());
                 }
                 let size = usize::try_from(header.size).map_err(|_| message("blob size overflow").raise())?;
-                try_reserve(&mut buffer, size, check).map_err(|e| e.raise())?;
-                let reserved_pointer = buffer.as_ptr();
-                let found = objects
-                    .try_find(&id, &mut buffer)?
-                    .ok_or_else(|| message("controlled diff object is missing").raise())?;
-                if found.kind != gix_object::Kind::Blob || found.data.len() != size {
-                    return Err(message("controlled diff object disagrees with its header").into());
+                check(Checkpoint {
+                    stage: Stage::Graph,
+                    processed: 0,
+                })
+                .map_err(|e| e.raise())?;
+                if let Some(lookup) = lookup {
+                    // Recycled Vec storage is not needed on the owner path.
+                    // Drop it before acquisition; its registry is reconciled by
+                    // the next complete backing census, never by raw byte address.
+                    drop(recycled);
+                    let owner = lookup(&id)?.ok_or_else(|| message("controlled diff object is missing").raise())?;
+                    check(Checkpoint {
+                        stage: Stage::Graph,
+                        processed: 0,
+                    })
+                    .map_err(|e| e.raise())?;
+                    if owner.id() != id.as_ref()
+                        || owner.kind() != gix_object::Kind::Blob
+                        || owner.as_slice().len() != size
+                    {
+                        return Err(message("controlled diff owner disagrees with its identity or header").into());
+                    }
+                    ResourceBacking::Raw(owner)
+                } else {
+                    let mut buffer = recycled.or_else(|| self.free_list.pop()).unwrap_or_default();
+                    buffer.clear();
+                    try_reserve(&mut buffer, size, check).map_err(|e| e.raise())?;
+                    let reserved_pointer = buffer.as_ptr();
+                    let found = objects
+                        .try_find(&id, &mut buffer)?
+                        .ok_or_else(|| message("controlled diff object is missing").raise())?;
+                    if found.kind != gix_object::Kind::Blob || found.data.len() != size {
+                        return Err(message("controlled diff object disagrees with its header").into());
+                    }
+                    // Find may return bytes borrowed from its own cache instead of
+                    // filling the supplied scratch. Preserve those bytes explicitly.
+                    let replacement = if found.data.as_ptr() != reserved_pointer {
+                        let mut owned = Vec::new();
+                        try_reserve(&mut owned, size, check).map_err(|e| e.raise())?;
+                        for chunk in found.data.chunks(BYTE_CHUNK) {
+                            owned.extend_from_slice(chunk);
+                            check(Checkpoint {
+                                stage: Stage::Copy,
+                                processed: owned.len(),
+                            })
+                            .map_err(|e| e.raise())?;
+                        }
+                        Some(owned)
+                    } else {
+                        None
+                    };
+                    if let Some(owned) = replacement {
+                        buffer = owned;
+                    }
+                    buffer.truncate(size);
+                    ResourceBacking::Buffer(buffer)
                 }
+            };
+            let data = if id.is_null() {
+                None
+            } else {
+                let bytes = buffer.as_slice();
+                let size = bytes.len();
                 let mut binary = self.filter.options.large_file_threshold_bytes != 0
                     && size as u64 > self.filter.options.large_file_threshold_bytes;
-                for (n, chunk) in found.data[..size.min(8000)].chunks(BYTE_CHUNK).enumerate() {
+                for (n, chunk) in bytes[..size.min(8000)].chunks(BYTE_CHUNK).enumerate() {
                     binary |= chunk.contains(&0);
                     check(Checkpoint {
                         stage: Stage::Preprocess,
@@ -566,27 +691,6 @@ impl Platform {
                     })
                     .map_err(|e| e.raise())?;
                 }
-                // Find may return bytes borrowed from its own cache instead of
-                // filling the supplied scratch. Preserve those bytes explicitly.
-                let replacement = if found.data.as_ptr() != reserved_pointer {
-                    let mut owned = Vec::new();
-                    try_reserve(&mut owned, size, check).map_err(|e| e.raise())?;
-                    for chunk in found.data.chunks(BYTE_CHUNK) {
-                        owned.extend_from_slice(chunk);
-                        check(Checkpoint {
-                            stage: Stage::Copy,
-                            processed: owned.len(),
-                        })
-                        .map_err(|e| e.raise())?;
-                    }
-                    Some(owned)
-                } else {
-                    None
-                };
-                if let Some(owned) = replacement {
-                    buffer = owned;
-                }
-                buffer.truncate(size);
                 Some(if binary {
                     pipeline::Data::Binary { size: size as u64 }
                 } else {
@@ -605,9 +709,15 @@ impl Platform {
                 check,
             )
             .map_err(|e| e.raise())?;
+            let stored_key = key.try_clone_controlled(check)?;
+            check(Checkpoint {
+                stage: Stage::Graph,
+                processed: 0,
+            })
+            .map_err(|e| e.raise())?;
             self.controlled_raw = true;
             self.diff_cache.insert(
-                key.try_clone_controlled(check)?,
+                stored_key,
                 CacheValue {
                     mode,
                     buffer,
@@ -617,6 +727,23 @@ impl Platform {
                     },
                 },
             );
+        } else {
+            check(Checkpoint {
+                stage: Stage::Graph,
+                processed: 0,
+            })
+            .map_err(|e| e.raise())?;
+            if lookup.is_some()
+                && !id.is_null()
+                && self
+                    .diff_cache
+                    .get(&key)
+                    .is_some_and(|value| matches!(&value.buffer, ResourceBacking::Buffer(_)))
+            {
+                return Err(message(
+                    "controlled diff owner lookup cannot reuse a Vec-backed resource; clear_controlled_raw before switching acquisition modes",
+                ).into());
+            }
         }
         *match kind {
             ResourceKind::OldOrSource => &mut self.old,
@@ -688,7 +815,11 @@ impl Platform {
                 },
                 processed: 0,
             })?;
-            retain_vec(&value.buffer, check)?;
+            // Raw owners carry their own capacity leases and pins. Reporting
+            // their byte addresses to this arena would double-charge them.
+            if let ResourceBacking::Buffer(buffer) = &value.buffer {
+                retain_vec(buffer, check)?;
+            }
         }
         retain_vec(&self.free_list, check)?;
         for buffer in &self.free_list {
@@ -982,8 +1113,12 @@ impl Platform {
         match self.free_list.len().cmp(&diff_cache.len()) {
             Ordering::Less => {
                 let to_take = diff_cache.len() - self.free_list.len();
-                self.free_list
-                    .extend(diff_cache.into_values().map(|v| v.buffer).take(to_take));
+                self.free_list.extend(
+                    diff_cache
+                        .into_values()
+                        .filter_map(|v| v.buffer.into_buffer())
+                        .take(to_take),
+                );
             }
             Ordering::Equal => {}
             Ordering::Greater => {
@@ -1004,8 +1139,11 @@ impl Platform {
         free_list.truncate(2);
         self.diff_cache.retain(|key, value| {
             let keep = Some(key) == old || Some(key) == new;
-            if !keep && free_list.len() < 2 {
-                free_list.push(std::mem::take(&mut value.buffer));
+            if !keep
+                && free_list.len() < 2
+                && let ResourceBacking::Buffer(buffer) = &mut value.buffer
+            {
+                free_list.push(std::mem::take(buffer));
             }
             keep
         });
@@ -1075,7 +1213,7 @@ impl Platform {
                     CacheValue {
                         conversion: out,
                         mode,
-                        buffer: buf,
+                        buffer: ResourceBacking::Buffer(buf),
                     },
                 )
                 .is_none(),

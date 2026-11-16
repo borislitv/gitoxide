@@ -961,6 +961,617 @@ mod raw_recycling {
         assert_eq!(state.lock().expect("budget mutex").live, 0);
     }
 
+    // The operation owns metadata admission outside all Arc payloads. Each body
+    // frees its Vec before releasing its own capacity charge. These tests keep
+    // the operation lease until every platform clone and owner has been dropped.
+    fn charge(state: &Arc<Mutex<BudgetState>>, bytes: usize) -> Charge {
+        let mut charge = Charge {
+            state: state.clone(),
+            bytes: 0,
+        };
+        charge.resize(bytes).expect("admit fixture ownership");
+        charge
+    }
+
+    struct OwnedBytes {
+        bytes: Vec<u8>,
+        _charge: Charge,
+    }
+
+    impl AsRef<[u8]> for OwnedBytes {
+        fn as_ref(&self) -> &[u8] {
+            &self.bytes
+        }
+    }
+
+    fn raw_owner(
+        state: &Arc<Mutex<BudgetState>>,
+        blob_id: gix_hash::ObjectId,
+        kind: Kind,
+        bytes: &[u8],
+    ) -> (gix_diff::blob::raw::RawBlob, std::sync::Weak<OwnedBytes>) {
+        let mut capacity = charge(state, bytes.len());
+        let data = bytes.to_vec();
+        capacity
+            .resize(data.capacity())
+            .expect("reconcile admitted fixture backing");
+        let backing = Arc::new(OwnedBytes {
+            bytes: data,
+            _charge: capacity,
+        });
+        let weak = Arc::downgrade(&backing);
+        (gix_diff::blob::raw::RawBlob::new(blob_id, kind, backing), weak)
+    }
+
+    struct Headers(HashMap<gix_hash::ObjectId, Header>);
+    impl gix_object::FindHeader for Headers {
+        fn try_header(&self, id: &gix_hash::oid) -> gix_error::Result<Option<Header>> {
+            Ok(self.0.get(id).copied())
+        }
+    }
+    impl gix_object::Find for Headers {
+        fn try_find<'a>(&self, _: &gix_hash::oid, _: &'a mut Vec<u8>) -> gix_error::Result<Option<Data<'a>>> {
+            panic!("owner acquisition must never fall back to Find")
+        }
+    }
+
+    #[test]
+    fn raw_owner_setter_rejects_legacy_hits_without_replacing_the_protected_side() -> TestResult {
+        struct NoReads;
+        impl gix_object::FindHeader for NoReads {
+            fn try_header(&self, _: &gix_hash::oid) -> gix_error::Result<Option<Header>> {
+                panic!("mixed-mode cache rejection must precede source acquisition")
+            }
+        }
+        impl gix_object::Find for NoReads {
+            fn try_find<'a>(&self, _: &gix_hash::oid, _: &'a mut Vec<u8>) -> gix_error::Result<Option<Data<'a>>> {
+                panic!("mixed-mode rejection must not fall back to Find")
+            }
+        }
+        let (mut platform, mut allocations, arena) = setup();
+        let mut legacy = Blobs::default();
+        let protected_bytes = vec![b'p'; BLOB_BYTES];
+        let old_bytes = vec![b'o'; BLOB_BYTES];
+        let protected_id = legacy.insert(protected_bytes.clone());
+        let old_id = legacy.insert(old_bytes.clone());
+        load(
+            &mut platform,
+            &mut allocations,
+            protected_id,
+            ResourceKind::NewOrDestination,
+            &legacy,
+        )?;
+        load(
+            &mut platform,
+            &mut allocations,
+            old_id,
+            ResourceKind::OldOrSource,
+            &legacy,
+        )?;
+        census(&platform, &mut allocations);
+        let (old, protected) = platform.controlled_raw_buffers()?;
+        let pointers = (old.as_ptr(), protected.as_ptr());
+        arena.lock().expect("budget mutex").deny_large = true;
+        let mut acquisitions = 0;
+        let error = platform
+            .set_resource_controlled_raw_with_owner(
+                protected_id,
+                EntryKind::Blob,
+                "f".into(),
+                ResourceKind::OldOrSource,
+                &NoReads,
+                &mut |_| {
+                    acquisitions += 1;
+                    Ok(None)
+                },
+                &mut |event| route(&mut allocations, event),
+            )
+            .expect_err("owner setter cannot accept a Vec-backed cache hit");
+        assert!(
+            error
+                .to_string()
+                .contains("clear_controlled_raw before switching acquisition modes")
+        );
+        assert_eq!(acquisitions, 0, "fail closed instead of reacquiring a protected entry");
+        assert!(
+            platform.resource(ResourceKind::OldOrSource).is_none(),
+            "failed side remains unset"
+        );
+        let protected = platform
+            .resource(ResourceKind::NewOrDestination)
+            .expect("opposite selected side survives");
+        assert_eq!(protected.data.as_slice(), Some(protected_bytes.as_slice()));
+        assert_eq!(protected.data.as_slice().expect("protected bytes").as_ptr(), pointers.1);
+        // The rejection must not evict either cached allocation. The ordinary
+        // setter can still reselect the old entry without consulting a provider.
+        load(
+            &mut platform,
+            &mut allocations,
+            old_id,
+            ResourceKind::OldOrSource,
+            &NoReads,
+        )?;
+        let (old, protected) = platform.controlled_raw_buffers()?;
+        assert_eq!(old, old_bytes);
+        assert_eq!((old.as_ptr(), protected.as_ptr()), pointers);
+        census(&platform, &mut allocations);
+        assert!(
+            arena.lock().expect("budget mutex").live >= 2 * BLOB_BYTES,
+            "both original byte leases remain live"
+        );
+        assert_eq!(
+            arena.lock().expect("budget mutex").denials,
+            0,
+            "rejection and reselection do not reacquire blob backing"
+        );
+        // Switching is explicit: clear first, then the owner setter may acquire.
+        platform.clear_controlled_raw(&mut |event| route(&mut allocations, event));
+        census(&platform, &mut allocations);
+        let external = Arc::new(Mutex::new(BudgetState::default()));
+        let metadata = charge(&external, 16 * 1024);
+        let (owner, pin) = raw_owner(&external, protected_id, Kind::Blob, &protected_bytes);
+        let mut owner = Some(owner);
+        platform.set_resource_controlled_raw_with_owner(
+            protected_id,
+            EntryKind::Blob,
+            "f".into(),
+            ResourceKind::NewOrDestination,
+            &legacy,
+            &mut |_| {
+                acquisitions += 1;
+                Ok(owner.take())
+            },
+            &mut |event| route(&mut allocations, event),
+        )?;
+        assert_eq!(acquisitions, 1, "clearing allows explicit owner acquisition");
+        finish(platform, allocations, &arena);
+        assert!(pin.upgrade().is_none());
+        drop(pin);
+        drop(metadata);
+        assert_eq!(external.lock().expect("budget mutex").live, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn raw_owner_header_failures_precede_lookup_and_preserve_the_opposite_side() -> TestResult {
+        #[derive(Debug)]
+        struct HeaderFailure;
+        impl std::fmt::Display for HeaderFailure {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("physical header acquisition failed")
+            }
+        }
+        impl std::error::Error for HeaderFailure {}
+        struct HeaderGate(u8);
+        impl gix_object::FindHeader for HeaderGate {
+            fn try_header(&self, _: &gix_hash::oid) -> gix_error::Result<Option<Header>> {
+                match self.0 {
+                    0 => Ok(None),
+                    1 => Err(gix_error::Error::from_boxed(Box::new(HeaderFailure))),
+                    2 => Ok(Some(Header {
+                        kind: Kind::Tree,
+                        size: 4,
+                    })),
+                    _ => Ok(Some(Header {
+                        kind: Kind::Blob,
+                        size: 128 * 1024 * 1024 + 1,
+                    })),
+                }
+            }
+        }
+        impl gix_object::Find for HeaderGate {
+            fn try_find<'a>(&self, _: &gix_hash::oid, _: &'a mut Vec<u8>) -> gix_error::Result<Option<Data<'a>>> {
+                panic!("header rejection cannot fall back to Find")
+            }
+        }
+        let (mut platform, mut allocations, arena) = setup();
+        let mut legacy = Blobs::default();
+        let protected_bytes = vec![b'p'; BLOB_BYTES];
+        let protected_id = legacy.insert(protected_bytes.clone());
+        load(
+            &mut platform,
+            &mut allocations,
+            protected_id,
+            ResourceKind::NewOrDestination,
+            &legacy,
+        )?;
+        let pointer = platform
+            .resource(ResourceKind::NewOrDestination)
+            .expect("protected resource")
+            .data
+            .as_slice()
+            .expect("protected bytes")
+            .as_ptr();
+        let requested_id = gix_object::compute_hash(crate::fixture_hash_kind(), Kind::Blob, b"next")?;
+        for failure in 0..4 {
+            let mut lookups = 0;
+            let error = platform
+                .set_resource_controlled_raw_with_owner(
+                    requested_id,
+                    EntryKind::Blob,
+                    "f".into(),
+                    ResourceKind::OldOrSource,
+                    &HeaderGate(failure),
+                    &mut |_| {
+                        lookups += 1;
+                        Ok(None)
+                    },
+                    &mut |event| route(&mut allocations, event),
+                )
+                .expect_err("invalid physical header must fail before owner lookup");
+            assert_eq!(lookups, 0, "header gate precedes lookup: {failure}");
+            match failure {
+                0 => assert!(error.to_string().contains("object is missing")),
+                1 => assert!(
+                    error.downcast_any_ref::<HeaderFailure>().is_some(),
+                    "typed header errors survive"
+                ),
+                _ => assert!(error.to_string().contains("blob kind or 128 MiB size limit")),
+            }
+            assert!(platform.resource(ResourceKind::OldOrSource).is_none());
+            let protected = platform
+                .resource(ResourceKind::NewOrDestination)
+                .expect("protected side survives header failure");
+            assert_eq!(protected.data.as_slice(), Some(protected_bytes.as_slice()));
+            assert_eq!(protected.data.as_slice().expect("protected bytes").as_ptr(), pointer);
+            census(&platform, &mut allocations);
+        }
+        finish(platform, allocations, &arena);
+        Ok(())
+    }
+
+    #[test]
+    fn raw_owners_keep_pointers_without_double_admission_and_outlive_platform_clones() -> TestResult {
+        let (mut platform, mut allocations, arena) = setup();
+        let external = Arc::new(Mutex::new(BudgetState::default()));
+        let metadata = charge(&external, 16 * 1024);
+        // Empty, binary and over-threshold text remain complete raw inputs.
+        platform.filter.options.large_file_threshold_bytes = 1;
+        for bytes in [Vec::new(), payload(b'b', BLOB_BYTES), vec![b't'; BLOB_BYTES]] {
+            let blob_id = gix_object::compute_hash(crate::fixture_hash_kind(), Kind::Blob, &bytes)?;
+            let headers = Headers(
+                [(
+                    blob_id,
+                    Header {
+                        kind: Kind::Blob,
+                        size: bytes.len() as u64,
+                    },
+                )]
+                .into(),
+            );
+            let (owner, weak) = raw_owner(&external, blob_id, Kind::Blob, &bytes);
+            let pointer = owner.as_slice().as_ptr();
+            let owned_charge = external.lock().expect("budget mutex").live;
+            assert!(owned_charge >= 16 * 1024 + bytes.len());
+            let mut remaining = Some(owner);
+            let mut reads = 0;
+            let mut lookup = |requested: &gix_hash::oid| {
+                assert_eq!(requested, blob_id.as_ref());
+                reads += 1;
+                Ok(remaining.take())
+            };
+            arena.lock().expect("budget mutex").deny_large = true;
+            for side in [ResourceKind::NewOrDestination, ResourceKind::OldOrSource] {
+                platform.set_resource_controlled_raw_with_owner(
+                    blob_id,
+                    EntryKind::Blob,
+                    "f".into(),
+                    side,
+                    &headers,
+                    &mut lookup,
+                    &mut |event| route(&mut allocations, event),
+                )?;
+            }
+            assert_eq!(reads, 1, "the second side reuses the retained immutable owner");
+            let (old, new) = platform.controlled_raw_buffers()?;
+            assert_eq!(old, bytes);
+            assert_eq!(new, bytes);
+            assert_eq!(old.as_ptr(), pointer, "raw preparation must not copy backing");
+            assert_eq!(new.as_ptr(), pointer);
+            census(&platform, &mut allocations);
+            assert_eq!(
+                arena.lock().expect("budget mutex").denials,
+                0,
+                "raw backing is not admitted twice"
+            );
+            let mut cloned = platform.clone();
+            platform.clear_controlled_raw(&mut |_| Err(Cancelled));
+            assert!(
+                weak.upgrade().is_some(),
+                "clone retains backing and its capacity charge"
+            );
+            assert_eq!(
+                external.lock().expect("budget mutex").live,
+                owned_charge,
+                "clearing one clone cannot refund live backing"
+            );
+            assert_eq!(cloned.controlled_raw_buffers()?.0.as_ptr(), pointer);
+            // The general cache-clearing/recycling API must drop raw owners,
+            // never turn them into recyclable uncharged Vecs.
+            assert_eq!(cloned.clear_resource_cache_keep_allocation(), 0);
+            assert!(weak.upgrade().is_none(), "last owner destruction frees backing");
+            assert_eq!(
+                external.lock().expect("budget mutex").live,
+                16 * 1024,
+                "final backing destruction releases only its byte charge"
+            );
+            drop(cloned);
+            census(&platform, &mut allocations);
+        }
+        finish(platform, allocations, &arena);
+        assert_eq!(external.lock().expect("budget mutex").live, 16 * 1024);
+        drop(metadata);
+        assert_eq!(external.lock().expect("budget mutex").live, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn raw_owner_replacement_evicts_only_the_unprotected_side_and_only_recycles_vecs() -> TestResult {
+        let (mut platform, mut allocations, arena) = setup();
+        let external = Arc::new(Mutex::new(BudgetState::default()));
+        let metadata = charge(&external, 16 * 1024);
+        let mut headers = Headers(HashMap::new());
+        let mut owners = HashMap::new();
+        let mut ids = Vec::new();
+        let mut weak = Vec::new();
+        for byte in b'a'..=b'c' {
+            let bytes = vec![byte; BLOB_BYTES];
+            let blob_id = gix_object::compute_hash(crate::fixture_hash_kind(), Kind::Blob, &bytes)?;
+            let (owner, pin) = raw_owner(&external, blob_id, Kind::Blob, &bytes);
+            headers.0.insert(
+                blob_id,
+                Header {
+                    kind: Kind::Blob,
+                    size: BLOB_BYTES as u64,
+                },
+            );
+            owners.insert(blob_id, owner);
+            ids.push(blob_id);
+            weak.push(pin);
+        }
+        let mut lookup = |id: &gix_hash::oid| Ok(owners.remove(id));
+        for (blob_id, side) in [
+            (ids[0], ResourceKind::NewOrDestination),
+            (ids[1], ResourceKind::OldOrSource),
+        ] {
+            platform.set_resource_controlled_raw_with_owner(
+                blob_id,
+                EntryKind::Blob,
+                "f".into(),
+                side,
+                &headers,
+                &mut lookup,
+                &mut |event| route(&mut allocations, event),
+            )?;
+        }
+        let protected_pointer = platform.controlled_raw_buffers()?.1.as_ptr();
+        platform.set_resource_controlled_raw_with_owner(
+            ids[2],
+            EntryKind::Blob,
+            "f".into(),
+            ResourceKind::OldOrSource,
+            &headers,
+            &mut lookup,
+            &mut |event| route(&mut allocations, event),
+        )?;
+        assert!(weak[1].upgrade().is_none(), "replaced source is evicted");
+        assert!(weak[0].upgrade().is_some(), "other selected side is protected");
+        let (old, new) = platform.controlled_raw_buffers()?;
+        assert_eq!(old, vec![b'c'; BLOB_BYTES]);
+        assert_eq!(new, vec![b'a'; BLOB_BYTES]);
+        assert_eq!(new.as_ptr(), protected_pointer);
+        let mut legacy = Blobs::default();
+        let legacy_id = legacy.insert(vec![b'd'; BLOB_BYTES]);
+        arena.lock().expect("budget mutex").deny_large = true;
+        assert!(
+            load(
+                &mut platform,
+                &mut allocations,
+                legacy_id,
+                ResourceKind::OldOrSource,
+                &legacy,
+            )
+            .is_err(),
+            "evicted raw backing cannot become a recyclable Vec"
+        );
+        assert_eq!(arena.lock().expect("budget mutex").denials, 1);
+        assert!(
+            weak[2].upgrade().is_none(),
+            "evicted raw owner is destroyed, not recycled"
+        );
+        assert_eq!(
+            platform
+                .resource(ResourceKind::NewOrDestination)
+                .expect("protected side")
+                .data
+                .as_slice()
+                .expect("raw bytes")
+                .as_ptr(),
+            protected_pointer
+        );
+        platform.retain_current_resources();
+        census(&platform, &mut allocations);
+        drop(platform);
+        assert!(
+            weak.iter().all(|pin| pin.upgrade().is_none()),
+            "drop frees every raw owner"
+        );
+        drop(allocations);
+        assert_eq!(arena.lock().expect("budget mutex").live, 0);
+        assert_eq!(external.lock().expect("budget mutex").live, 16 * 1024);
+        drop(weak);
+        drop(metadata);
+        assert_eq!(external.lock().expect("budget mutex").live, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn raw_owner_missing_errors_and_wrong_witnesses_do_not_publish_or_fall_back() -> TestResult {
+        let (mut platform, mut allocations, arena) = setup();
+        let external = Arc::new(Mutex::new(BudgetState::default()));
+        let metadata = charge(&external, 16 * 1024);
+        let protected_bytes = vec![b'p'; BLOB_BYTES];
+        let protected_id = gix_object::compute_hash(crate::fixture_hash_kind(), Kind::Blob, &protected_bytes)?;
+        let requested_id = gix_object::compute_hash(crate::fixture_hash_kind(), Kind::Blob, b"next")?;
+        let headers = Headers(
+            [
+                (
+                    protected_id,
+                    Header {
+                        kind: Kind::Blob,
+                        size: BLOB_BYTES as u64,
+                    },
+                ),
+                (
+                    requested_id,
+                    Header {
+                        kind: Kind::Blob,
+                        size: 4,
+                    },
+                ),
+            ]
+            .into(),
+        );
+        let (protected, pin) = raw_owner(&external, protected_id, Kind::Blob, &protected_bytes);
+        let pointer = protected.as_slice().as_ptr();
+        let mut protected = Some(protected);
+        platform.set_resource_controlled_raw_with_owner(
+            protected_id,
+            EntryKind::Blob,
+            "f".into(),
+            ResourceKind::NewOrDestination,
+            &headers,
+            &mut |_| Ok(protected.take()),
+            &mut |event| route(&mut allocations, event),
+        )?;
+        for failure in 0..6 {
+            let mut calls = 0;
+            let mut failed_pin = None;
+            let mut lookup = |_: &gix_hash::oid| {
+                calls += 1;
+                match failure {
+                    0 => Ok(None),
+                    1 => Err(gix_error::message("injected physical acquisition failure").into()),
+                    _ => {
+                        let (id, kind, bytes) = match failure {
+                            2 => (protected_id, Kind::Blob, b"next".to_vec()),
+                            3 => (requested_id, Kind::Tree, b"next".to_vec()),
+                            _ => (requested_id, Kind::Blob, b"short".to_vec()),
+                        };
+                        let (owner, weak) = raw_owner(&external, id, kind, &bytes);
+                        failed_pin = Some(weak);
+                        if failure == 5 {
+                            drop(owner);
+                            Err(gix_error::message("failure after partial physical acquisition").into())
+                        } else {
+                            Ok(Some(owner))
+                        }
+                    }
+                }
+            };
+            let result = platform.set_resource_controlled_raw_with_owner(
+                requested_id,
+                EntryKind::Blob,
+                "f".into(),
+                ResourceKind::OldOrSource,
+                &headers,
+                &mut lookup,
+                &mut |event| route(&mut allocations, event),
+            );
+            assert!(result.is_err(), "missing/error/wrong owner must fail: {failure}");
+            assert_eq!(calls, 1, "no fallback or second acquisition");
+            assert!(platform.resource(ResourceKind::OldOrSource).is_none());
+            assert_eq!(
+                platform
+                    .resource(ResourceKind::NewOrDestination)
+                    .expect("protected resource")
+                    .data
+                    .as_slice()
+                    .expect("raw bytes")
+                    .as_ptr(),
+                pointer
+            );
+            assert!(pin.upgrade().is_some());
+            assert!(
+                failed_pin.as_ref().is_none_or(|weak| weak.upgrade().is_none()),
+                "failed owner is destroyed"
+            );
+            census(&platform, &mut allocations);
+        }
+        finish(platform, allocations, &arena);
+        assert!(pin.upgrade().is_none());
+        drop(pin);
+        drop(metadata);
+        assert_eq!(external.lock().expect("budget mutex").live, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn raw_owner_stop_and_panic_after_partial_acquisition_destroy_unpublished_owner() -> TestResult {
+        for (failure_stage, fail_at) in [(Stage::Graph, 1), (Stage::Graph, 2), (Stage::Preprocess, 1)] {
+            for panic in [false, true] {
+                let (mut platform, mut allocations, arena) = setup();
+                let external = Arc::new(Mutex::new(BudgetState::default()));
+                let metadata = charge(&external, 16 * 1024);
+                let bytes = vec![b'x'; BLOB_BYTES];
+                let blob_id = gix_object::compute_hash(crate::fixture_hash_kind(), Kind::Blob, &bytes)?;
+                let headers = Headers(
+                    [(
+                        blob_id,
+                        Header {
+                            kind: Kind::Blob,
+                            size: BLOB_BYTES as u64,
+                        },
+                    )]
+                    .into(),
+                );
+                let (owner, pin) = raw_owner(&external, blob_id, Kind::Blob, &bytes);
+                let mut owner = Some(owner);
+                let acquired = std::cell::Cell::new(false);
+                let mut reached = false;
+                let mut matching_checks = 0;
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    platform.set_resource_controlled_raw_with_owner(
+                        blob_id,
+                        EntryKind::Blob,
+                        "f".into(),
+                        ResourceKind::OldOrSource,
+                        &headers,
+                        &mut |_| {
+                            acquired.set(true);
+                            Ok(owner.take())
+                        },
+                        &mut |event| {
+                            route(&mut allocations, event)?;
+                            if acquired.get() && event.stage == failure_stage {
+                                matching_checks += 1;
+                                if matching_checks == fail_at {
+                                    reached = true;
+                                    assert!(!panic, "panic while consuming acquired raw owner");
+                                    return Err(Cancelled);
+                                }
+                            }
+                            Ok(())
+                        },
+                    )
+                }));
+                assert!(reached, "failure occurs after owner acquisition, not during setup");
+                if panic {
+                    assert!(result.is_err());
+                } else {
+                    assert!(result.expect("stop is not a panic").is_err());
+                }
+                assert!(pin.upgrade().is_none(), "unpublished owner drops during error/unwind");
+                assert!(platform.resource(ResourceKind::OldOrSource).is_none());
+                finish(platform, allocations, &arena);
+                drop(pin);
+                drop(metadata);
+                assert_eq!(external.lock().expect("budget mutex").live, 0);
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn controlled_raw_recycles_equal_and_smaller_backings_and_protects_the_other_side() -> TestResult {
         let (mut platform, mut allocations, state) = setup();

@@ -66,6 +66,9 @@ pub mod pipeline;
 ///
 pub mod platform;
 
+/// Owner-carrying input for controlled raw blob comparisons.
+pub mod raw;
+
 /// Information about the diff performed to detect similarity.
 #[derive(Debug, Default, Clone, Copy, PartialEq, PartialOrd)]
 pub struct DiffLineStats {
