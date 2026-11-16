@@ -73,6 +73,263 @@ impl gix_object::Find for History {
     }
 }
 
+fn raw_owner_history() -> (History, gix_hash::ObjectId, gix_hash::ObjectId) {
+    let mut history = History(HashMap::new());
+    let mut parent = None;
+    let mut commits = Vec::new();
+    for (index, bytes) in [b"root\nold\n".as_slice(), b"root\nnew\n".as_slice()]
+        .into_iter()
+        .enumerate()
+    {
+        let blob_id = history.insert(Kind::Blob, bytes.to_vec());
+        let mut tree = b"100644 f\0".to_vec();
+        tree.extend_from_slice(blob_id.as_bytes());
+        let tree_id = history.insert(Kind::Tree, tree);
+        let parent_header = parent.map_or(String::new(), |id| format!("parent {id}\n"));
+        let time = index + 1;
+        let commit_id = history.insert(Kind::Commit, format!(
+            "tree {tree_id}\n{parent_header}author Fixture <fixture@example.invalid> {time} +0000\ncommitter Fixture <fixture@example.invalid> {time} +0000\n\nOwner history\n"
+        ).into_bytes());
+        commits.push(commit_id);
+        parent = Some(commit_id);
+    }
+    (history, commits[0], commits[1])
+}
+
+struct RawBody {
+    bytes: Vec<u8>,
+    _charge: Charge,
+}
+impl AsRef<[u8]> for RawBody {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+fn raw_body(
+    history: &History,
+    id: &gix_hash::oid,
+    state: &Arc<Mutex<(usize, usize)>>,
+) -> gix_error::Result<(gix_diff::blob::raw::RawBlob, std::sync::Weak<RawBody>)> {
+    let (kind, bytes) = history.0.get(id).expect("physical fixture member");
+    assert_eq!(
+        gix_object::compute_hash(super::fixture_hash_kind(), *kind, bytes)?.as_ref(),
+        id
+    );
+    let mut capacity = Charge {
+        state: state.clone(),
+        bytes: 0,
+        limit: 4 * 1024 * 1024,
+    };
+    capacity
+        .resize(bytes.len())
+        .expect("admit immutable fixture bytes before allocation");
+    let data = bytes.clone();
+    capacity.resize(data.capacity()).expect("reconcile backing capacity");
+    let body = Arc::new(RawBody {
+        bytes: data,
+        _charge: capacity,
+    });
+    let weak = Arc::downgrade(&body);
+    Ok((gix_diff::blob::raw::RawBlob::new(id.to_owned(), *kind, body), weak))
+}
+
+#[test]
+fn traced_raw_owners_preserve_complete_attribution_with_and_without_memo() -> gix_testtools::TestResult {
+    struct MissMemo(usize);
+    impl gix_blame::memo::MappingMemo for MissMemo {
+        fn load(&mut self, _: &gix_blame::memo::MappingKey, _: &mut [u8]) -> Result<Option<usize>, Cancelled> {
+            Ok(None)
+        }
+        fn completed(&mut self, _: &gix_blame::memo::MappingKey, _: &[u8]) -> Result<(), Cancelled> {
+            self.0 += 1;
+            Ok(())
+        }
+    }
+    for with_memo in [false, true] {
+        let (history, root, tip) = raw_owner_history();
+        let state = Arc::new(Mutex::new((0, 0)));
+        let external = Arc::new(Mutex::new((0, 0)));
+        // This operation lease covers wrapper/control-block metadata until all
+        // strong AND weak owners have been destroyed, not just their payloads.
+        let metadata = Budget(external.clone(), 4 * 1024 * 1024).reserve(16 * 1024)?;
+        let mut pins = Vec::new();
+        let mut reads = 0;
+        let mut lookup = |id: &gix_hash::oid| {
+            reads += 1;
+            let (owner, pin) = raw_body(&history, id, &external)?;
+            pins.push(pin);
+            Ok(Some(owner))
+        };
+        let mut platform = preparation_platform();
+        let mut memo = MissMemo(0);
+        let request = with_memo.then_some(gix_blame::memo::MappingRequest {
+            options: gix_blame::memo::MappingOptions {
+                reuse: true,
+                producer: [1; 32],
+                options: [2; 32],
+            },
+            memo: &mut memo,
+            boundary: None,
+        });
+        let output = gix_blame::file_with_allocations_trace_and_raw_blobs(
+            &history,
+            gix_blame::Start::Commit(tip),
+            None,
+            &mut platform,
+            "f".into(),
+            gix_blame::Options {
+                diff_algorithm: gix_diff::blob::Algorithm::Myers,
+                rewrites: Some(gix_diff::Rewrites::default()),
+                ..Default::default()
+            },
+            Default::default(),
+            Arc::new(Budget(state.clone(), 8 * 1024 * 1024)),
+            &mut |_| Ok(()),
+            &mut lookup,
+            request,
+        )?;
+        assert_eq!(reads, 2, "both comparison sides use the owner callback");
+        assert_eq!(output.outcome().blob, b"root\nnew\n");
+        let rows: Vec<_> = output
+            .outcome()
+            .entries
+            .iter()
+            .flat_map(|entry| {
+                (0..entry.len.get()).map(move |offset| {
+                    (
+                        entry.commit_id,
+                        entry.start_in_blamed_file + offset,
+                        entry.start_in_source_file + offset,
+                    )
+                })
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            [(root, 0, 0), (tip, 1, 1)],
+            "independent expected complete line attribution"
+        );
+        assert!(
+            output.native_trace().is_some(),
+            "new entrypoint retains native origin trace"
+        );
+        assert_eq!(output.mapping_statistics().computations, 1);
+        assert_eq!(memo.0, usize::from(with_memo));
+        assert!(
+            pins.iter().all(|pin| pin.upgrade().is_none()),
+            "raw cache is cleared before output escapes"
+        );
+        assert!(platform.controlled_raw_buffers().is_err());
+        drop(output);
+        drop(platform);
+        assert_eq!(state.lock().expect("budget mutex").0, 0);
+        assert_eq!(external.lock().expect("budget mutex").0, 16 * 1024);
+        drop(pins);
+        drop(metadata);
+        assert_eq!(external.lock().expect("budget mutex").0, 0);
+    }
+    Ok(())
+}
+
+#[test]
+fn traced_raw_owner_errors_stops_and_panics_clear_published_resources() -> gix_testtools::TestResult {
+    use gix_diff::blob::control::Stage;
+    #[derive(Debug)]
+    struct PhysicalFailure;
+    impl std::fmt::Display for PhysicalFailure {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("physical owner acquisition failed")
+        }
+    }
+    impl std::error::Error for PhysicalFailure {}
+    for failure in 0..4 {
+        let (history, _, tip) = raw_owner_history();
+        let state = Arc::new(Mutex::new((0, 0)));
+        let external = Arc::new(Mutex::new((0, 0)));
+        let metadata = Budget(external.clone(), 4 * 1024 * 1024).reserve(16 * 1024)?;
+        let reads = std::cell::Cell::new(0);
+        let mut pins = Vec::new();
+        let mut lookup = |id: &gix_hash::oid| {
+            reads.set(reads.get() + 1);
+            if reads.get() == 2 && failure < 2 {
+                return if failure == 0 {
+                    Ok(None)
+                } else {
+                    Err(gix_error::Error::from_boxed(Box::new(PhysicalFailure)))
+                };
+            }
+            let (owner, pin) = raw_body(&history, id, &external)?;
+            pins.push(pin);
+            Ok(Some(owner))
+        };
+        let mut platform = preparation_platform();
+        let mut reached_consumption = false;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            gix_blame::file_with_allocations_trace_and_raw_blobs(
+                &history,
+                gix_blame::Start::Commit(tip),
+                None,
+                &mut platform,
+                "f".into(),
+                gix_blame::Options {
+                    diff_algorithm: gix_diff::blob::Algorithm::Myers,
+                    rewrites: Some(gix_diff::Rewrites::default()),
+                    ..Default::default()
+                },
+                Default::default(),
+                Arc::new(Budget(state.clone(), 8 * 1024 * 1024)),
+                &mut |event| {
+                    if reads.get() == 2 && failure >= 2 && event.stage == Stage::Tokenize {
+                        reached_consumption = true;
+                        assert_ne!(failure, 3, "panic after both owner-backed resources are published");
+                        return Err(Cancelled);
+                    }
+                    Ok(())
+                },
+                &mut lookup,
+                None,
+            )
+        }));
+        if failure == 3 {
+            assert!(result.is_err(), "consumer panic unwinds");
+        } else {
+            let error = result
+                .expect("ordinary provider/stop errors do not panic")
+                .err()
+                .expect("missing/provider/stop cannot return completed output");
+            if failure == 1 {
+                assert!(
+                    error.downcast_any_ref::<PhysicalFailure>().is_some(),
+                    "preserve typed physical failure"
+                );
+            }
+            if failure == 2 {
+                assert!(error.downcast_any_ref::<Cancelled>().is_some(), "preserve typed stop");
+            }
+        }
+        assert_eq!(reads.get(), 2, "no callback retry after missing/error/stop/panic");
+        assert_eq!(reached_consumption, failure >= 2);
+        assert!(
+            pins.iter().all(|pin| pin.upgrade().is_none()),
+            "even published owners are cleared on unwind"
+        );
+        let mut roots = 0;
+        platform.retain_controlled_backings(&mut |_| {
+            roots += 1;
+            Ok(())
+        })?;
+        assert_eq!(roots, 0, "external platform cannot retain request data after failure");
+        drop(platform);
+        assert_eq!(state.lock().expect("budget mutex").0, 0);
+        assert_eq!(external.lock().expect("budget mutex").0, 16 * 1024);
+        drop(pins);
+        drop(metadata);
+        assert_eq!(external.lock().expect("budget mutex").0, 0);
+    }
+    Ok(())
+}
+
 #[test]
 fn raw_pair_entry_discards_another_providers_prepopulated_resources() -> gix_testtools::TestResult {
     let mut source_a = History(HashMap::new());

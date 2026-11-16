@@ -32,6 +32,24 @@ extend the controlled APIs without copying the algorithms into an application:
 - Controlled raw diff replacement reuses an evicted non-selected resource's
   admitted backing. Growth, selected-side protection and cleanup retain their
   existing allocation and ownership checks.
+- `gix-diff::blob::raw::RawBlob` carries shared immutable, caller-verified backing
+  into controlled raw comparisons without copying it into `Find` scratch. The
+  opt-in setter checks requested OID, blob kind and exact independent header
+  length; missing/error results never fall back to `Find`. Only ordinary `Vec`
+  backing is recycled, and the other selected resource remains protected.
+  Raw owners retain their own full-capacity leases/cache pins and are not charged
+  a second time by the diff allocation registry. Callers separately admit wrapper
+  and shared control-block metadata before allocation and retain that admission
+  through complete deallocation, including any surviving weak references; an
+  in-payload reservation alone does not cover final control-block destruction.
+- `gix-blame::file_with_allocations_trace_and_raw_blobs` selects this ownership
+  seam for raw comparisons, with optional completed-mapping memoization. Existing
+  entrypoints and graph/initial/output/provenance `Find` reads remain unchanged.
+  Request-boundary clearing, normal error cleanup and callback-free raw cleanup
+  on unwind retain source-scope separation. Sources still own physical membership,
+  complete hash/collision verification, chain limits and actual-job source holds.
+  This targets only the raw-blob subset of Find copying; it is not a measured
+  speedup or a claim that an application or production range provider uses it.
 
 These are cooperative control and backing-accounting contracts, not a hard RSS,
 allocator or wall-clock-preemption guarantee. Callers must supply a verified

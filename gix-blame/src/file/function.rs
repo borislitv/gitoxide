@@ -111,6 +111,7 @@ pub fn file_with_allocations(
         check,
         false,
         None,
+        None,
     )
 }
 
@@ -141,6 +142,7 @@ pub fn file_with_allocations_and_trace(
         allocator,
         check,
         true,
+        None,
         None,
     )
 }
@@ -174,6 +176,52 @@ pub fn file_with_allocations_trace_and_memo(
         check,
         true,
         Some(memo),
+        None,
+    )
+}
+
+/// Traced native-profile blame with self-admitted immutable raw blob owners.
+///
+/// `raw_blobs` replaces only raw comparison acquisition, not graph, initial blob,
+/// output or provenance reads through `odb`. It must resolve the same physical
+/// source and retain verified backing, capacity and cache pins. Missing/error
+/// results are terminal; there is no `Find` fallback. The optional `memo` uses
+/// exactly the same completed-mapping contract as the other traced entrypoint.
+///
+/// Caller-backed bytes are not charged again to `allocator`. The caller must
+/// additionally admit shared wrapper/control-block metadata through complete
+/// destruction, not refund it from inside a still-allocated final `Arc` payload.
+/// See [`gix_diff::blob::raw::RawBlob`]. Source holds belong to actual job lifetime,
+/// not to byte-integrity witnesses or waiting tickets. The platform is cleared
+/// between source scopes, on errors and on unwind, without callback re-entry.
+#[expect(clippy::too_many_arguments)]
+pub fn file_with_allocations_trace_and_raw_blobs(
+    odb: impl gix_object::Find + gix_object::FindHeader,
+    start: Start,
+    cache: Option<gix_commitgraph::Graph>,
+    resource_cache: &mut gix_diff::blob::Platform,
+    file_path: &BStr,
+    options: Options,
+    tuning: crate::Tuning,
+    allocator: std::sync::Arc<dyn gix_diff::blob::control::Allocator>,
+    check: &mut Check<'_>,
+    raw_blobs: &mut gix_diff::blob::raw::Lookup<'_>,
+    memo: Option<crate::memo::MappingRequest<'_>>,
+) -> Result<AdmittedOutcome> {
+    validate_native_profile(&start, &options)?;
+    file_admitted(
+        odb,
+        start,
+        cache,
+        resource_cache,
+        file_path,
+        options,
+        tuning,
+        allocator,
+        check,
+        true,
+        memo,
+        Some(raw_blobs),
     )
 }
 
@@ -205,6 +253,7 @@ fn file_admitted(
     check: &mut Check<'_>,
     trace: bool,
     memo: Option<crate::memo::MappingRequest<'_>>,
+    mut raw_blobs: Option<&mut gix_diff::blob::raw::Lookup<'_>>,
 ) -> Result<AdmittedOutcome> {
     let mut allocations = gix_diff::blob::control::Allocations::new(allocator).map_err(|e| e.raise())?;
     let trace_rewrites = options.rewrites;
@@ -246,6 +295,7 @@ fn file_admitted(
         tuning,
         &mut controlled,
         memo,
+        &mut raw_blobs,
     );
     let mapping_statistics = result.as_ref().map(|(_, stats)| *stats).unwrap_or_default();
     let result = result.map(|(outcome, _)| outcome);
@@ -600,6 +650,7 @@ pub fn file_with_tuning(
         &mut |_| Ok(()),
         false,
         &mut crate::memo::State::new(None, tuning),
+        &mut None,
     )
 }
 
@@ -628,6 +679,7 @@ pub fn file_with_control(
         tuning,
         check,
         None,
+        &mut None,
     )
     .map(|(outcome, _)| outcome)
 }
@@ -643,6 +695,7 @@ fn file_controlled(
     tuning: crate::Tuning,
     check: &mut Check<'_>,
     memo: Option<crate::memo::MappingRequest<'_>>,
+    raw_blobs: &mut Option<&mut gix_diff::blob::raw::Lookup<'_>>,
 ) -> Result<(Outcome, crate::memo::MappingStatistics)> {
     resource_cache.validate_controlled_raw()?;
     if let Start::Contents { contents, .. } = &start
@@ -682,6 +735,7 @@ fn file_controlled(
         &mut |event| (**shared.borrow_mut())(event),
         true,
         &mut memo,
+        raw_blobs,
     );
     resource_owner
         .0
@@ -705,6 +759,7 @@ fn file_impl(
     check: &mut Check<'_>,
     raw: bool,
     memo: &mut crate::memo::State<'_>,
+    raw_blobs: &mut Option<&mut gix_diff::blob::raw::Lookup<'_>>,
 ) -> Result<Outcome> {
     let shared = std::cell::RefCell::new(check);
     let mut forwarding = |event| (**shared.borrow_mut())(event);
@@ -1199,6 +1254,7 @@ fn file_impl(
                             check,
                             raw,
                             memo,
+                            raw_blobs,
                         )?;
                         *hunks_to_blame = attribute_changes(
                             hunks_to_blame.take(),
@@ -1250,6 +1306,7 @@ fn file_impl(
                             check,
                             raw,
                             memo,
+                            raw_blobs,
                         )?;
                         *hunks_to_blame = attribute_changes(
                             hunks_to_blame.take(),
@@ -1870,27 +1927,41 @@ fn blob_changes(
     check: &mut Check<'_>,
     raw: bool,
     memo: &mut crate::memo::State<'_>,
+    raw_blobs: &mut Option<&mut gix_diff::blob::raw::Lookup<'_>>,
 ) -> Result<Vec<Change>> {
     poll(check, Stage::Preprocess, 0)?;
     if raw {
         // In reverse history the previous source is the next target. Select it
         // first so source acquisition protects it instead of the stale target.
-        resource_cache.set_resource_controlled_raw(
-            oid,
-            gix_object::tree::EntryKind::Blob,
-            file_path,
-            gix_diff::blob::ResourceKind::NewOrDestination,
-            &odb,
-            check,
-        )?;
-        resource_cache.set_resource_controlled_raw(
-            previous_oid,
-            gix_object::tree::EntryKind::Blob,
-            previous_file_path,
-            gix_diff::blob::ResourceKind::OldOrSource,
-            &odb,
-            check,
-        )?;
+        for (blob_id, path, side) in [
+            (oid, file_path, gix_diff::blob::ResourceKind::NewOrDestination),
+            (
+                previous_oid,
+                previous_file_path,
+                gix_diff::blob::ResourceKind::OldOrSource,
+            ),
+        ] {
+            if let Some(lookup) = raw_blobs.as_deref_mut() {
+                resource_cache.set_resource_controlled_raw_with_owner(
+                    blob_id,
+                    gix_object::tree::EntryKind::Blob,
+                    path,
+                    side,
+                    &odb,
+                    lookup,
+                    check,
+                )?;
+            } else {
+                resource_cache.set_resource_controlled_raw(
+                    blob_id,
+                    gix_object::tree::EntryKind::Blob,
+                    path,
+                    side,
+                    &odb,
+                    check,
+                )?;
+            }
+        }
     } else {
         resource_cache.set_resource(
             previous_oid,
