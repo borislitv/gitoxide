@@ -306,8 +306,7 @@ impl Diff {
 
     /// Controlled line sliders over explicit views (for example, a shared-tail
     /// trimmed view), while retaining the complete immutable token dictionary.
-    /// The complete admitted indentation table is prepared only if the maintained
-    /// postprocessor actually requests a slider heuristic, then reused locally.
+    /// Only lines actually scored by the slider are scanned for indentation.
     pub fn try_postprocess_lines_with<T: AsRef<[u8]>>(
         self,
         before: &[Token],
@@ -315,36 +314,27 @@ impl Diff {
         interner: &Interner<T>,
         check: &mut control::Check<'_>,
     ) -> Result<Self, control::Cancelled> {
-        let mut indents = Vec::new();
-        let mut prepared = false;
+        // A request-local, fixed-size memo: collisions only repeat a scan, and a
+        // hit always compares the full token from this immutable dictionary.
+        const SLOTS: usize = 256;
+        let mut indents = [None; SLOTS];
         self.try_postprocess_with_fallible_heuristic(
             before,
             after,
             |tokens, hunk, earliest, check| {
-                if !prepared {
-                    control::poll(check, control::Stage::Postprocess, 0)?;
-                    control::try_reserve(&mut indents, interner.num_tokens() as usize, check)?;
-                    let mut work = 0;
-                    let mut items = 0;
-                    for id in 0..interner.num_tokens() {
-                        let line = interner[Token(id)].as_ref();
-                        // Preserve the existing full-table scan and its bounded
-                        // byte/item checks, including empty and CR/FF-only lines.
-                        let cost = line.len().clamp(1, control::BYTE_CHUNK);
-                        if work + cost > control::BYTE_CHUNK || items == 1024 {
-                            control::poll(check, control::Stage::Postprocess, id as usize)?;
-                            work = 0;
-                            items = 0;
-                        }
-                        indents.push(IndentLevel::try_for_ascii_line(line, 8, check)?);
-                        work += cost;
-                        items += 1;
+                control::poll(check, control::Stage::Postprocess, hunk.start as usize)?;
+                slider_heuristic::try_best_slider_end(tokens, hunk, earliest, |token| {
+                    let slot = &mut indents[token.0 as usize % SLOTS];
+                    if let Some((id, level)) = *slot
+                        && id == token
+                    {
+                        return Ok(level);
                     }
-                    control::poll(check, control::Stage::Postprocess, interner.num_tokens() as usize)?;
-                    prepared = true;
-                }
-                Ok(IndentHeuristic::new(|token: Token| indents[token.0 as usize])
-                    .best_slider_end(tokens, hunk, earliest))
+                    control::poll(check, control::Stage::Postprocess, token.0 as usize)?;
+                    let level = IndentLevel::try_for_ascii_line(interner[token].as_ref(), 8, check)?;
+                    *slot = Some((token, level));
+                    Ok(level)
+                })
             },
             check,
         )
