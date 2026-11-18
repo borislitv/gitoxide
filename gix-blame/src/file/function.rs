@@ -12,6 +12,10 @@ use gix_object::{
 use gix_traverse::commit::find as find_commit;
 use smallvec::SmallVec;
 
+use crate::native::{
+    COMPLETED_VERSION, CompletedAttribution, CompletedIdentity, CompletedUse, NativeOrigin, PreviousOrigin,
+};
+
 fn poll(check: &mut Check<'_>, stage: Stage, processed: usize) -> Result {
     check(Checkpoint { stage, processed }).map_err(|err| err.raise())
 }
@@ -41,6 +45,8 @@ pub struct AdmittedOutcome {
     outcome: Outcome,
     native_trace: Option<Vec<crate::native::NativeOrigin>>,
     mapping_statistics: crate::memo::MappingStatistics,
+    completed_identity: Option<CompletedIdentity>,
+    completed_use: CompletedUse,
     _allocations: gix_diff::blob::control::Allocations,
 }
 
@@ -59,6 +65,17 @@ impl AdmittedOutcome {
         self.mapping_statistics
     }
 
+    /// Export identity together with the requested byte path and [`Self::native_trace`].
+    /// Only the completed-attribution entrypoint emits this identity.
+    pub fn completed_identity(&self) -> Option<CompletedIdentity> {
+        self.completed_identity
+    }
+
+    /// Whether attribution (not just a raw comparison) actually used a seed.
+    pub fn completed_use(&self) -> CompletedUse {
+        self.completed_use
+    }
+
     /// Release output's nested ownership in checked batches before an executor
     /// acknowledges stop (including cancellation during serialization). Errors
     /// cannot skip cleanup; capacity charges remain pinned until this owner drops.
@@ -73,6 +90,7 @@ impl AdmittedOutcome {
         if let Some(mut trace) = self.native_trace.take() {
             gix_diff::blob::control::clear_with(&mut trace, check);
         }
+        self.completed_identity = None;
         self._allocations.clear_with_control(check);
     }
 }
@@ -112,6 +130,7 @@ pub fn file_with_allocations(
         false,
         None,
         None,
+        None,
     )
 }
 
@@ -142,6 +161,7 @@ pub fn file_with_allocations_and_trace(
         allocator,
         check,
         true,
+        None,
         None,
         None,
     )
@@ -176,6 +196,7 @@ pub fn file_with_allocations_trace_and_memo(
         check,
         true,
         Some(memo),
+        None,
         None,
     )
 }
@@ -222,7 +243,75 @@ pub fn file_with_allocations_trace_and_raw_blobs(
         true,
         memo,
         Some(raw_blobs),
+        None,
     )
+}
+
+/// Run controlled native-profile blame with an optional completed attribution boundary.
+///
+/// A miss continues the ordinary walk. A hit does not open the base's parents or replay
+/// `previous` resolution for either the suffix or the graft. The new result owns an admitted
+/// native trace; it does not retain the seed borrow. `scope` and the seed must obey the source,
+/// authentication and admission contract of [`CompletedAttribution`]. `raw_blobs` and `memo`
+/// obey the same contracts as in [`file_with_allocations_trace_and_raw_blobs`].
+///
+/// Whole-file immutable Myers/default renames only, with debug path tracking off. To guarantee
+/// no pre-base reads, reuse currently requires a single-parent suffix and a projection-safe base
+/// (or an exact request for the base itself). There is no limit on the number of seed origins or
+/// surviving ranges beyond the ordinary controlled engine's limits and the supplied allocator.
+#[expect(clippy::too_many_arguments)]
+pub fn file_with_allocations_and_completed_attribution(
+    odb: impl gix_object::Find + gix_object::FindHeader,
+    start: Start,
+    cache: Option<gix_commitgraph::Graph>,
+    resource_cache: &mut gix_diff::blob::Platform,
+    file_path: &BStr,
+    options: Options,
+    tuning: crate::Tuning,
+    allocator: std::sync::Arc<dyn gix_diff::blob::control::Allocator>,
+    check: &mut Check<'_>,
+    scope: [u8; 32],
+    seed: Option<CompletedAttribution<'_>>,
+    raw_blobs: Option<&mut gix_diff::blob::raw::Lookup<'_>>,
+    memo: Option<crate::memo::MappingRequest<'_>>,
+) -> Result<AdmittedOutcome> {
+    validate_native_profile(&start, &options)?;
+    if options.debug_track_path {
+        return Err(message("completed attribution does not support debug path tracking").into());
+    }
+    file_admitted(
+        odb,
+        start,
+        cache,
+        resource_cache,
+        file_path,
+        options,
+        tuning,
+        allocator,
+        check,
+        false,
+        memo,
+        raw_blobs,
+        Some(Completion {
+            scope,
+            usage: if seed.is_some() {
+                CompletedUse::Miss
+            } else {
+                CompletedUse::NotRequested
+            },
+            seed,
+            identity: None,
+            links: Vec::new(),
+        }),
+    )
+}
+
+struct Completion<'a> {
+    scope: [u8; 32],
+    seed: Option<CompletedAttribution<'a>>,
+    identity: Option<CompletedIdentity>,
+    usage: CompletedUse,
+    links: Vec<TraceLink<'a>>,
 }
 
 fn validate_native_profile(start: &Start, options: &Options) -> Result {
@@ -254,6 +343,7 @@ fn file_admitted(
     trace: bool,
     memo: Option<crate::memo::MappingRequest<'_>>,
     mut raw_blobs: Option<&mut gix_diff::blob::raw::Lookup<'_>>,
+    mut completion: Option<Completion<'_>>,
 ) -> Result<AdmittedOutcome> {
     let mut allocations = gix_diff::blob::control::Allocations::new(allocator).map_err(|e| e.raise())?;
     let trace_rewrites = options.rewrites;
@@ -296,30 +386,41 @@ fn file_admitted(
         &mut controlled,
         memo,
         &mut raw_blobs,
+        completion.as_mut(),
     );
     let mapping_statistics = result.as_ref().map(|(_, stats)| *stats).unwrap_or_default();
     let result = result.map(|(outcome, _)| outcome);
     let result = result.and_then(|mut outcome| {
-        let native_trace = if trace {
-            match build_native_trace(
+        let trace_result = if trace {
+            build_native_trace(
                 &odb,
                 &outcome,
                 resource_cache,
                 file_path,
                 trace_rewrites,
                 &mut controlled,
-            ) {
-                Ok(rows) => Some(rows),
-                Err(error) => {
-                    gix_diff::blob::control::clear_with(&mut outcome.entries, &mut controlled);
-                    if let Some(path) = outcome.blame_path.as_mut() {
-                        gix_diff::blob::control::clear_with(path, &mut controlled);
-                    }
-                    return Err(error);
-                }
-            }
+            )
+            .map(Some)
+        } else if let Some(completion) = completion.as_mut() {
+            build_completed_trace(
+                &outcome,
+                file_path,
+                std::mem::take(&mut completion.links),
+                &mut controlled,
+            )
+            .map(Some)
         } else {
-            None
+            Ok(None)
+        };
+        let native_trace = match trace_result {
+            Ok(rows) => rows,
+            Err(error) => {
+                gix_diff::blob::control::clear_with(&mut outcome.entries, &mut controlled);
+                if let Some(path) = outcome.blame_path.as_mut() {
+                    gix_diff::blob::control::clear_with(path, &mut controlled);
+                }
+                return Err(error);
+            }
         };
         Ok((outcome, native_trace))
     });
@@ -351,6 +452,8 @@ fn file_admitted(
             outcome,
             native_trace,
             mapping_statistics,
+            completed_identity: completion.as_ref().and_then(|c| c.identity),
+            completed_use: completion.as_ref().map_or(CompletedUse::NotRequested, |c| c.usage),
             _allocations: allocations,
         }),
         Err(error) => {
@@ -551,6 +654,285 @@ fn try_copy_bytes(data: &[u8], check: &mut Check<'_>) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+struct TraceLink<'a> {
+    final_start: u32,
+    previous: TracePrevious<'a>,
+}
+
+enum TracePrevious<'a> {
+    Local(PreviousOrigin),
+    Seed(&'a PreviousOrigin),
+}
+
+fn copy_previous(previous: &PreviousOrigin, check: &mut Check<'_>) -> Result<PreviousOrigin> {
+    Ok(PreviousOrigin {
+        commit_id: previous.commit_id,
+        source_file_name: try_copy_bytes(&previous.source_file_name, check)?.into(),
+    })
+}
+
+fn retain_trace_links(links: &Vec<TraceLink<'_>>, check: &mut Check<'_>) -> Result {
+    gix_diff::blob::control::retain_vec(links, check).map_err(|e| e.raise())?;
+    for chunk in links.chunks(32) {
+        for link in chunk {
+            if let TracePrevious::Local(previous) = &link.previous {
+                poll(
+                    check,
+                    Stage::Retain {
+                        address: previous.source_file_name.as_ptr() as usize,
+                    },
+                    0,
+                )?;
+            }
+        }
+        poll(check, Stage::OriginTrace, chunk.len())?;
+    }
+    Ok(())
+}
+
+// Use the same parent-order selection as native_previous, but consume the
+// traversal's already-discovered origins. Exact transfers cannot finalize rows.
+fn previous_from_changes(
+    changes: &[Option<TreeDiffChange>],
+    parents: &ParentIds,
+    current_path: &BStr,
+    check: &mut Check<'_>,
+) -> Result<std::result::Result<Option<PreviousOrigin>, ()>> {
+    for (change, (parent, _)) in changes.iter().zip(parents) {
+        poll(check, Stage::OriginTrace, 1)?;
+        let path: &[u8] = match change {
+            Some(TreeDiffChange::Modification { .. }) => current_path,
+            Some(TreeDiffChange::Rewrite { source_location, .. }) => source_location,
+            None => return Ok(Err(())),
+            _ => continue,
+        };
+        return Ok(Ok(Some(PreviousOrigin {
+            commit_id: *parent,
+            source_file_name: try_copy_bytes(path, check)?.into(),
+        })));
+    }
+    Ok(Ok(None))
+}
+
+fn build_completed_trace(
+    outcome: &Outcome,
+    file_path: &BStr,
+    links: Vec<TraceLink<'_>>,
+    check: &mut Check<'_>,
+) -> Result<Vec<NativeOrigin>> {
+    let shared = std::cell::RefCell::new(check);
+    let mut forward = |event| (**shared.borrow_mut())(event);
+    let check: &mut Check<'_> = &mut forward;
+    let mut links = VecOwner::new(links, &shared);
+    let mut rows = VecOwner::new(Vec::new(), &shared);
+    // The walk and platform scratch are gone. Keep only the admitted output
+    // and its sidecar; the borrowed seed stays charged to its original owner.
+    poll(check, Stage::RetainBegin, 0)?;
+    retain_outcome(outcome, check)?;
+    retain_trace_links(&links, check)?;
+    poll(check, Stage::RetainEnd, 0)?;
+    gix_diff::blob::control::try_sort_by(&mut links, |a, b, _| Ok(a.final_start.cmp(&b.final_start)), check)
+        .map_err(|e| e.raise())?;
+    let mut links = links.take_iter().peekable();
+    for (index, entry) in outcome.entries.iter().enumerate() {
+        poll(check, Stage::OriginTrace, index)?;
+        let start = entry.start_in_blamed_file;
+        // The normal coalescer can absorb several original fragments. The first
+        // fragment's provenance applies to the whole group (same commit/path).
+        while links.peek().is_some_and(|link| link.final_start < start) {
+            links.next();
+            poll(check, Stage::OriginTrace, index)?;
+        }
+        let previous = if links.peek().is_some_and(|link| link.final_start == start) {
+            Some(match links.next().expect("peeked").previous {
+                TracePrevious::Local(previous) => previous,
+                TracePrevious::Seed(previous) => copy_previous(previous, check)?,
+            })
+        } else {
+            None
+        };
+        let row = NativeOrigin {
+            commit_id: entry.commit_id,
+            source_file_name: try_copy_bytes(
+                entry
+                    .source_file_name
+                    .as_ref()
+                    .map_or(file_path.as_ref(), |path| path.as_slice()),
+                check,
+            )?
+            .into(),
+            previous,
+            boundary: false,
+            source_range: entry.start_in_source_file..entry.start_in_source_file + entry.len.get(),
+            final_range: start..start + entry.len.get(),
+            group_id: index as u32,
+            group_count: entry.len.get(),
+        };
+        gix_diff::blob::control::try_push(&mut rows, row, check).map_err(|e| e.raise())?;
+    }
+    Ok(rows.take())
+}
+
+fn verify_complete_entries(entries: &[BlameEntry], lines: u32, check: &mut Check<'_>) -> Result {
+    let mut end = 0u32;
+    for entry in entries {
+        poll(check, Stage::Output, end as usize)?;
+        if entry.start_in_blamed_file != end || entry.start_in_source_file.checked_add(entry.len.get()).is_none() {
+            return Err(message("invalid completed attribution coverage").into());
+        }
+        end = end
+            .checked_add(entry.len.get())
+            .ok_or_else(|| message("final range overflow").raise())?;
+    }
+    if end != lines {
+        return Err(message("incomplete blame cannot produce completed attribution").into());
+    }
+    Ok(())
+}
+
+fn raw_line_count(bytes: &[u8], check: &mut Check<'_>) -> Result<u32> {
+    let mut count = 0;
+    for chunk in bytes.chunks(BYTE_CHUNK) {
+        count += chunk.iter().filter(|&&byte| byte == b'\n').count() as u32;
+        poll(check, Stage::Attribution, chunk.len())?;
+    }
+    Ok(count + u32::from(bytes.last().is_some_and(|&byte| byte != b'\n')))
+}
+
+fn source_path_valid(path: &[u8], check: &mut Check<'_>) -> Result<bool> {
+    if path.is_empty() || path.len() > super::bounded::METADATA_LIMIT {
+        return Ok(false);
+    }
+    let mut component_empty = true;
+    for chunk in path.chunks(BYTE_CHUNK) {
+        for &byte in chunk {
+            if byte == 0 || (byte == b'/' && component_empty) {
+                return Ok(false);
+            }
+            component_empty = byte == b'/';
+        }
+        poll(check, Stage::OriginTrace, chunk.len())?;
+    }
+    Ok(!component_empty)
+}
+
+fn seed_rows_valid(seed: CompletedAttribution<'_>, check: &mut Check<'_>) -> Result<bool> {
+    if seed.identity.lines as usize > super::bounded::OBJECT_LIMIT
+        || seed.origins.len() > seed.identity.lines as usize
+        || !source_path_valid(seed.path, check)?
+    {
+        return Ok(false);
+    }
+    let kind = seed.identity.commit.kind();
+    let mut end = 0;
+    for (index, row) in seed.origins.iter().enumerate() {
+        poll(check, Stage::OriginTrace, index)?;
+        if row.boundary
+            || row.commit_id.kind() != kind
+            || row.commit_id.is_null()
+            || row.group_id as usize != index
+            || row.group_count == 0
+            || row.final_range.start != end
+            || row.final_range.start.checked_add(row.group_count) != Some(row.final_range.end)
+            || row.source_range.start.checked_add(row.group_count) != Some(row.source_range.end)
+            || row.source_range.end as usize > super::bounded::OBJECT_LIMIT
+            || row.final_range.end > seed.identity.lines
+            || !source_path_valid(&row.source_file_name, check)?
+        {
+            return Ok(false);
+        }
+        if row.commit_id == seed.identity.commit
+            && (row.source_range != row.final_range
+                || !gix_diff::blob::control::try_cmp_bytes(&row.source_file_name, seed.path, check)
+                    .map_err(|e| e.raise())?
+                    .is_eq())
+        {
+            return Ok(false);
+        }
+        if let Some(previous) = &row.previous
+            && (previous.commit_id.kind() != kind
+                || previous.commit_id.is_null()
+                || !source_path_valid(&previous.source_file_name, check)?)
+        {
+            return Ok(false);
+        }
+        end = row.final_range.end;
+    }
+    Ok(end == seed.identity.lines)
+}
+
+fn seed_ranges_valid(hunks: &[UnblamedHunk], lines: u32, check: &mut Check<'_>) -> Result<bool> {
+    for hunk in hunks {
+        poll(check, Stage::Attribution, 1)?;
+        let source = &hunk.suspects[0].1;
+        if source.end > lines || source.is_empty() || source.len() != hunk.range_in_blamed_file.len() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn graft_completed<'a>(
+    seed: CompletedAttribution<'a>,
+    hunks: &[UnblamedHunk],
+    file_path: &BStr,
+    out: &mut Vec<BlameEntry>,
+    links: &mut Vec<TraceLink<'a>>,
+    check: &mut Check<'_>,
+) -> Result<u32> {
+    let mut count = 0;
+    for hunk in hunks {
+        let source = &hunk.suspects[0].1;
+        let mut final_start = hunk.range_in_blamed_file.start;
+        let mut base_start = source.start;
+        let first = seed.origins.partition_point(|row| row.final_range.end <= base_start);
+        for row in &seed.origins[first..] {
+            poll(check, Stage::Attribution, count as usize)?;
+            if base_start == source.end {
+                break;
+            }
+            let end = source.end.min(row.final_range.end);
+            let len = NonZeroU32::new(end - base_start).expect("validated nonempty intersection");
+            let path = if hunk.source_file_name.is_some()
+                || !gix_diff::blob::control::try_cmp_bytes(&row.source_file_name, file_path, check)
+                    .map_err(|e| e.raise())?
+                    .is_eq()
+            {
+                Some(try_copy_bytes(&row.source_file_name, check)?.into())
+            } else {
+                None
+            };
+            gix_diff::blob::control::try_push(
+                out,
+                BlameEntry {
+                    start_in_blamed_file: final_start,
+                    start_in_source_file: row.source_range.start + (base_start - row.final_range.start),
+                    len,
+                    commit_id: row.commit_id,
+                    source_file_name: path,
+                },
+                check,
+            )
+            .map_err(|e| e.raise())?;
+            if let Some(previous) = &row.previous {
+                gix_diff::blob::control::try_push(
+                    links,
+                    TraceLink {
+                        final_start,
+                        previous: TracePrevious::Seed(previous),
+                    },
+                    check,
+                )
+                .map_err(|e| e.raise())?;
+            }
+            final_start += len.get();
+            count += len.get();
+            base_start = end;
+        }
+    }
+    Ok(count)
+}
+
 use super::bounded::{PreparedOwner, VecOwner};
 use super::{Change, UnblamedHunk, prepared::PreparedInput};
 #[cfg(test)]
@@ -651,6 +1033,7 @@ pub fn file_with_tuning(
         false,
         &mut crate::memo::State::new(None, tuning),
         &mut None,
+        None,
     )
 }
 
@@ -680,6 +1063,7 @@ pub fn file_with_control(
         check,
         None,
         &mut None,
+        None,
     )
     .map(|(outcome, _)| outcome)
 }
@@ -696,6 +1080,7 @@ fn file_controlled(
     check: &mut Check<'_>,
     memo: Option<crate::memo::MappingRequest<'_>>,
     raw_blobs: &mut Option<&mut gix_diff::blob::raw::Lookup<'_>>,
+    completion: Option<&mut Completion<'_>>,
 ) -> Result<(Outcome, crate::memo::MappingStatistics)> {
     resource_cache.validate_controlled_raw()?;
     if let Start::Contents { contents, .. } = &start
@@ -736,6 +1121,7 @@ fn file_controlled(
         true,
         &mut memo,
         raw_blobs,
+        completion,
     );
     resource_owner
         .0
@@ -748,7 +1134,7 @@ fn file_controlled(
 }
 
 #[expect(clippy::too_many_arguments)]
-fn file_impl(
+fn file_impl<'seed>(
     odb: impl gix_object::Find + gix_object::FindHeader,
     start: Start,
     cache: Option<gix_commitgraph::Graph>,
@@ -760,6 +1146,7 @@ fn file_impl(
     raw: bool,
     memo: &mut crate::memo::State<'_>,
     raw_blobs: &mut Option<&mut gix_diff::blob::raw::Lookup<'_>>,
+    mut completion: Option<&mut Completion<'seed>>,
 ) -> Result<Outcome> {
     let shared = std::cell::RefCell::new(check);
     let mut forwarding = |event| (**shared.borrow_mut())(event);
@@ -779,6 +1166,7 @@ fn file_impl(
         hunks_to_blame,
         out,
         first_suspect,
+        snapshot,
     } = initial_state(
         &odb,
         start,
@@ -792,6 +1180,21 @@ fn file_impl(
     )?;
     let mut hunks_to_blame = VecOwner::new(hunks_to_blame, &shared);
     let mut out = VecOwner::new(out, &shared);
+    let mut links: VecOwner<'_, '_, '_, TraceLink<'seed>> = VecOwner::new(Vec::new(), &shared);
+    let mut linear_suffix = true;
+    let mut projectable = true;
+    if let Some(completion) = completion.as_mut() {
+        let (commit, blob, lines) = snapshot.expect("completed attribution requires a commit");
+        completion.identity = Some(CompletedIdentity {
+            version: COMPLETED_VERSION,
+            scope: completion.scope,
+            commit,
+            blob,
+            lines,
+            tuning,
+            projectable: true,
+        });
+    }
 
     if hunks_to_blame.is_empty() {
         gix_diff::blob::control::try_sort_by(
@@ -901,6 +1304,7 @@ fn file_impl(
                 }
             }
             retain_entries(&out, check)?;
+            retain_trace_links(&links, check)?;
             gix_diff::blob::control::retain_vec(&blame_path, check).map_err(|e| e.raise())?;
             for path in blame_path.iter() {
                 poll(
@@ -971,6 +1375,53 @@ fn file_impl(
         )?
         .into();
 
+        // A single-parent suffix cannot have observed any side ancestry (even
+        // the commit times of other merge parents). Require a unique origin for
+        // the *entire* live frontier, not merely for the selected hunk.
+        if linear_suffix
+            && all_current
+            && let Some(completion) = completion.as_mut()
+            && let Some(seed) = completion.seed
+            && seed.identity.commit == suspect
+            && seed.identity.version == COMPLETED_VERSION
+            && seed.identity.scope == completion.scope
+            && seed.identity.tuning == tuning
+            && (seed.identity.projectable || first_suspect == Some(suspect))
+            && gix_diff::blob::control::try_cmp_bytes(seed.path, &current_file_path, check)
+                .map_err(|e| e.raise())?
+                .is_eq()
+            && seed_rows_valid(seed, check)?
+        {
+            let base_blob = if first_suspect == Some(suspect) {
+                snapshot.map(|(_, blob, _)| blob)
+            } else {
+                find_path_entry_in_commit(
+                    &odb,
+                    &suspect,
+                    current_file_path.as_ref(),
+                    cache.as_ref(),
+                    &mut buf,
+                    &mut buf2,
+                    &mut stats,
+                    check,
+                )?
+            };
+            if base_blob == Some(seed.identity.blob) {
+                let lines = if first_suspect == Some(suspect) {
+                    snapshot.expect("commit snapshot").2
+                } else {
+                    raw_line_count(odb.find_blob(&seed.identity.blob, &mut buf)?.data, check)?
+                };
+                if lines == seed.identity.lines && seed_ranges_valid(&hunks_to_blame, lines, check)? {
+                    let lines = graft_completed(seed, &hunks_to_blame, file_path, &mut out, &mut links, check)?;
+                    completion.usage = CompletedUse::Hit { lines };
+                    projectable = seed.identity.projectable;
+                    gix_diff::blob::control::clear_with(&mut *hunks_to_blame, check);
+                    break 'outer;
+                }
+            }
+        }
+
         let mut deferred = VecOwner::new(Vec::new(), &shared);
         let mut another_origin = false;
         if !all_current {
@@ -1024,6 +1475,7 @@ fn file_impl(
                 _ => None,
             };
             let parent_ids: ParentIds = collect_parents(commit, &odb, cache.as_ref(), &mut buf2, check, raw)?;
+            linear_suffix &= parent_ids.len() <= 1;
 
             if parent_ids.is_empty() {
                 {
@@ -1177,6 +1629,15 @@ fn file_impl(
                 gix_diff::blob::control::try_push(&mut modifications, changes_for_file_path, check)
                     .map_err(|e| e.raise())?;
             }
+            // Exact transfers above choose a single parent independently of
+            // the requested coordinates. General merge processing below may
+            // create competing suspects or make traversal order significant.
+            projectable &= !more_than_one_parent;
+            let previous = if completion.is_some() {
+                previous_from_changes(&modifications, &parent_ids, current_file_path.as_ref(), check)?
+            } else {
+                Ok(None)
+            };
             for (index, ((parent_id, parent_commit_time), changes_for_file_path)) in
                 parent_ids.iter().zip(modifications.take_iter()).enumerate()
             {
@@ -1356,6 +1817,21 @@ fn file_impl(
                     // that have only `suspect` left in `suspects` have not passed blame to any
                     // parent, and so they can be converted to a `BlameEntry` and moved to
                     // `out`.
+                    if let Some(previous) = previous
+                        .as_ref()
+                        .map_err(|_| message("a completed native origin still has an unchanged parent").raise())?
+                    {
+                        let previous = copy_previous(previous, check)?;
+                        gix_diff::blob::control::try_push(
+                            &mut links,
+                            TraceLink {
+                                final_start: entry.start_in_blamed_file,
+                                previous: TracePrevious::Local(previous),
+                            },
+                            check,
+                        )
+                        .map_err(|e| e.raise())?;
+                    }
                     gix_diff::blob::control::try_push(&mut out, entry, check).map_err(|e| e.raise())?;
                     continue;
                 }
@@ -1384,8 +1860,15 @@ fn file_impl(
         check,
     )
     .map_err(|e| e.raise())?;
+    *out = try_coalesce_blame_entries(out.take(), file_path, check)?;
+    if let Some(completion) = completion {
+        let identity = completion.identity.as_mut().expect("commit snapshot");
+        verify_complete_entries(&out, identity.lines, check)?;
+        identity.projectable = projectable;
+        completion.links = links.take();
+    }
     Ok(Outcome {
-        entries: try_coalesce_blame_entries(out.take(), file_path, check)?,
+        entries: out.take(),
         blob: blamed_file_blob,
         statistics: stats,
         blame_path: options.debug_track_path.then(|| blame_path.take()),
@@ -2282,6 +2765,8 @@ struct InitialState {
     out: Vec<BlameEntry>,
     /// The first commit to traverse, or `None` if no history traversal is needed.
     first_suspect: Option<ObjectId>,
+    /// Physical starting file, present for immutable commit requests.
+    snapshot: Option<(ObjectId, ObjectId, u32)>,
 }
 
 fn initial_hunks(options: &Options, lines: u32, suspect: ObjectId, check: &mut Check<'_>) -> Result<Vec<UnblamedHunk>> {
@@ -2348,6 +2833,7 @@ fn initial_state(
                     hunks_to_blame: Vec::new(),
                     out: Vec::new(),
                     first_suspect: None,
+                    snapshot: Some((suspect, blamed_file_entry_id, num_lines_in_blamed)),
                 });
             }
 
@@ -2358,6 +2844,7 @@ fn initial_state(
                 hunks_to_blame,
                 out: Vec::new(),
                 first_suspect: Some(suspect),
+                snapshot: Some((suspect, blamed_file_entry_id, num_lines_in_blamed)),
             })
         }
         Start::Contents {
@@ -2384,6 +2871,7 @@ fn initial_state(
                     hunks_to_blame: Vec::new(),
                     out: Vec::new(),
                     first_suspect: None,
+                    snapshot: None,
                 });
             }
 
@@ -2411,6 +2899,7 @@ fn initial_state(
                     hunks_to_blame: Vec::new(),
                     out: out.take(),
                     first_suspect: None,
+                    snapshot: None,
                 });
             };
 
@@ -2446,6 +2935,7 @@ fn initial_state(
                 hunks_to_blame: hunks_to_blame.take(),
                 out: out.take(),
                 first_suspect,
+                snapshot: None,
             })
         }
     }

@@ -21,7 +21,7 @@ mod file;
 pub mod memo;
 pub mod native;
 pub use file::function::{
-    AdmittedOutcome, file, file_with_allocations, file_with_allocations_and_trace,
-    file_with_allocations_trace_and_memo, file_with_allocations_trace_and_raw_blobs, file_with_control,
-    file_with_tuning,
+    AdmittedOutcome, file, file_with_allocations, file_with_allocations_and_completed_attribution,
+    file_with_allocations_and_trace, file_with_allocations_trace_and_memo, file_with_allocations_trace_and_raw_blobs,
+    file_with_control, file_with_tuning,
 };

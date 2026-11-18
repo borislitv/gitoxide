@@ -96,6 +96,259 @@ fn raw_owner_history() -> (History, gix_hash::ObjectId, gix_hash::ObjectId) {
     (history, commits[0], commits[1])
 }
 
+fn completion_commit(
+    history: &mut History,
+    path: &[u8],
+    bytes: &[u8],
+    parents: &[gix_hash::ObjectId],
+    time: usize,
+) -> [gix_hash::ObjectId; 3] {
+    use std::fmt::Write;
+    let blob = history.insert(Kind::Blob, bytes.to_vec());
+    let mut tree = b"100644 ".to_vec();
+    tree.extend_from_slice(path);
+    tree.push(0);
+    tree.extend_from_slice(blob.as_bytes());
+    let tree = history.insert(Kind::Tree, tree);
+    let mut body = format!("tree {tree}\n");
+    for parent in parents {
+        writeln!(body, "parent {parent}").unwrap();
+    }
+    write!(
+        body,
+        "author A <a@b> {time} +0000\ncommitter A <a@b> {time} +0000\n\ncompletion\n"
+    )
+    .unwrap();
+    let commit = history.insert(Kind::Commit, body.into_bytes());
+    [commit, tree, blob]
+}
+
+struct GuardedHistory<'a> {
+    history: &'a History,
+    forbidden: &'a [gix_hash::ObjectId],
+}
+
+impl gix_object::FindHeader for GuardedHistory<'_> {
+    fn try_header(&self, id: &gix_hash::oid) -> gix_error::Result<Option<Header>> {
+        assert!(!self.forbidden.contains(&id.to_owned()), "pre-base header read: {id}");
+        gix_object::FindHeader::try_header(self.history, id)
+    }
+}
+
+impl gix_object::Find for GuardedHistory<'_> {
+    fn try_find<'a>(&self, id: &gix_hash::oid, buffer: &'a mut Vec<u8>) -> gix_error::Result<Option<Data<'a>>> {
+        assert!(!self.forbidden.contains(&id.to_owned()), "pre-base object read: {id}");
+        gix_object::Find::try_find(self.history, id, buffer)
+    }
+}
+
+#[test]
+fn completed_attribution_grafts_large_edited_renamed_repeated_lines_without_prebase_reads() -> gix_testtools::TestResult
+{
+    use gix_blame::native::{CompletedAttribution, CompletedUse};
+    let mut history = History(HashMap::new());
+    let old = b"original-\xff";
+    let path = b"current-\xfe";
+    let mut root_bytes = Vec::new();
+    for i in 0..2048 {
+        root_bytes.extend_from_slice(format!("anchor {i:04} separates repeated lines\nsame\nsame\n").as_bytes());
+    }
+    let root = completion_commit(&mut history, old, &root_bytes, &[], 1);
+    let pivot = root_bytes.iter().position(|&b| b == b'\n').unwrap() + 1;
+    let mut base_bytes = root_bytes.clone();
+    base_bytes.splice(pivot..pivot, b"base-insertion\nsame\n".iter().copied());
+    let base = completion_commit(&mut history, old, &base_bytes, &[root[0]], 2);
+    let rename = completion_commit(&mut history, path, &base_bytes, &[base[0]], 3);
+    let mut tip_bytes = base_bytes.clone();
+    let pivot = pivot + b"base-insertion\n".len();
+    tip_bytes.drain(pivot..pivot + b"same\n".len());
+    tip_bytes.splice(0..0, b"new-start\n".iter().copied());
+    tip_bytes.extend_from_slice(b"unterminated new last line");
+    let tip = completion_commit(&mut history, path, &tip_bytes, &[rename[0]], 4);
+    assert!(base_bytes.len() > 16 * 1024);
+
+    for tuning in [
+        gix_blame::Tuning::default(),
+        gix_blame::Tuning {
+            reuse_line_tokens: true,
+            retain_current_input_tokens: true,
+            reuse_unchanged_runs: true,
+            bounded_resource_cache: true,
+            index_changes: true,
+        },
+    ] {
+        let options = || gix_blame::Options {
+            diff_algorithm: gix_diff::blob::Algorithm::Myers,
+            rewrites: Some(gix_diff::Rewrites::default()),
+            ..Default::default()
+        };
+        let budget = Arc::new(Mutex::new((0, 0)));
+        let allocator = || Arc::new(Budget(budget.clone(), 32 * 1024 * 1024));
+        let run = |id,
+                   path: &[u8],
+                   seed: Option<CompletedAttribution<'_>>,
+                   forbidden: &[gix_hash::ObjectId],
+                   check: &mut gix_diff::blob::control::Check<'_>| {
+            gix_blame::file_with_allocations_and_completed_attribution(
+                GuardedHistory {
+                    history: &history,
+                    forbidden,
+                },
+                gix_blame::Start::Commit(id),
+                None,
+                &mut super::Fixture::new().unwrap().resource_cache,
+                path.into(),
+                options(),
+                tuning,
+                allocator(),
+                check,
+                [7; 32],
+                seed,
+                None,
+                None,
+            )
+        };
+        let base_result = run(base[0], old, None, &[], &mut |_| Ok(()))?;
+        let seed = CompletedAttribution {
+            identity: base_result.completed_identity().unwrap(),
+            path: old.as_slice().into(),
+            origins: base_result.native_trace().unwrap(),
+        };
+        assert!(seed.identity.projectable);
+        assert!(seed.origins.iter().any(|row| row.commit_id == root[0]));
+        assert!(seed.origins.iter().any(|row| row.commit_id == base[0]));
+        let full = gix_blame::file_with_allocations_and_trace(
+            &history,
+            gix_blame::Start::Commit(tip[0]),
+            None,
+            &mut super::Fixture::new()?.resource_cache,
+            path.as_slice().into(),
+            options(),
+            tuning,
+            allocator(),
+            &mut |_| Ok(()),
+        )?;
+        let hit = run(tip[0], path, Some(seed), &root, &mut |_| Ok(()))?;
+        assert!(matches!(hit.completed_use(), CompletedUse::Hit { lines } if lines == seed.identity.lines - 1));
+        assert_eq!(hit.outcome().blob, tip_bytes);
+        assert_eq!(hit.outcome().entries, full.outcome().entries);
+        assert_eq!(hit.native_trace(), full.native_trace());
+        assert!(hit.outcome().statistics.commits_traversed < full.outcome().statistics.commits_traversed);
+
+        for invalid in [
+            CompletedAttribution {
+                path: path.as_slice().into(),
+                ..seed
+            },
+            CompletedAttribution {
+                origins: &seed.origins[1..],
+                ..seed
+            },
+            CompletedAttribution {
+                identity: gix_blame::native::CompletedIdentity {
+                    blob: tip[2],
+                    ..seed.identity
+                },
+                ..seed
+            },
+            CompletedAttribution {
+                identity: gix_blame::native::CompletedIdentity {
+                    scope: [8; 32],
+                    ..seed.identity
+                },
+                ..seed
+            },
+        ] {
+            let miss = run(tip[0], path, Some(invalid), &[], &mut |_| Ok(()))?;
+            assert_eq!(miss.completed_use(), CompletedUse::Miss);
+            assert_eq!(miss.native_trace(), full.native_trace());
+        }
+        let used = budget.lock().unwrap().0;
+        let cancelled = run(tip[0], path, Some(seed), &root, &mut |event| {
+            if event.stage == gix_diff::blob::control::Stage::Output {
+                Err(Cancelled)
+            } else {
+                Ok(())
+            }
+        });
+        assert!(cancelled.is_err());
+        assert_eq!(budget.lock().unwrap().0, used);
+        drop((hit, full, base_result));
+        assert_eq!(budget.lock().unwrap().0, 0);
+    }
+    Ok(())
+}
+
+#[test]
+fn completed_attribution_declines_merge_frontier_and_nonprojectable_base() -> gix_testtools::TestResult {
+    use gix_blame::native::{CompletedAttribution, CompletedUse};
+    let mut history = History(HashMap::new());
+    let path = b"f";
+    let root = completion_commit(&mut history, path, b"one\nanchor\ntwo\n", &[], 1);
+    let left = completion_commit(&mut history, path, b"left\nanchor\ntwo\n", &[root[0]], 3);
+    let right = completion_commit(&mut history, path, b"one\nanchor\nright\n", &[root[0]], 2);
+    let merge = completion_commit(&mut history, path, b"left\nanchor\nright\n", &[left[0], right[0]], 4);
+    let tip = completion_commit(&mut history, path, b"left\nright\nnew\n", &[merge[0]], 5);
+    let options = || gix_blame::Options {
+        diff_algorithm: gix_diff::blob::Algorithm::Myers,
+        rewrites: Some(gix_diff::Rewrites::default()),
+        ..Default::default()
+    };
+    let allocator = || Arc::new(Budget(Arc::new(Mutex::new((0, 0))), 4 * 1024 * 1024));
+    let run = |id, seed: Option<CompletedAttribution<'_>>, forbidden: &[gix_hash::ObjectId]| {
+        gix_blame::file_with_allocations_and_completed_attribution(
+            GuardedHistory {
+                history: &history,
+                forbidden,
+            },
+            gix_blame::Start::Commit(id),
+            None,
+            &mut super::Fixture::new().unwrap().resource_cache,
+            path.as_slice().into(),
+            options(),
+            Default::default(),
+            allocator(),
+            &mut |_| Ok(()),
+            [1; 32],
+            seed,
+            None,
+            None,
+        )
+    };
+    let root_result = run(root[0], None, &[])?;
+    let root_seed = CompletedAttribution {
+        identity: root_result.completed_identity().unwrap(),
+        path: path.as_slice().into(),
+        origins: root_result.native_trace().unwrap(),
+    };
+    let merge_result = run(merge[0], Some(root_seed), &[])?;
+    assert_eq!(merge_result.completed_use(), CompletedUse::Miss);
+    let merge_seed = CompletedAttribution {
+        identity: merge_result.completed_identity().unwrap(),
+        path: root_seed.path,
+        origins: merge_result.native_trace().unwrap(),
+    };
+    assert!(!merge_seed.identity.projectable);
+    let replay = run(merge[0], Some(merge_seed), &[root[0], left[0], right[0]])?;
+    assert_eq!(replay.completed_use(), CompletedUse::Hit { lines: 3 });
+    assert_eq!(replay.native_trace(), merge_result.native_trace());
+    let miss = run(tip[0], Some(merge_seed), &[])?;
+    assert_eq!(miss.completed_use(), CompletedUse::Miss);
+    let oracle = gix_blame::file_with_allocations_and_trace(
+        &history,
+        gix_blame::Start::Commit(tip[0]),
+        None,
+        &mut super::Fixture::new()?.resource_cache,
+        root_seed.path,
+        options(),
+        Default::default(),
+        allocator(),
+        &mut |_| Ok(()),
+    )?;
+    assert_eq!(miss.native_trace(), oracle.native_trace());
+    Ok(())
+}
+
 struct RawBody {
     bytes: Vec<u8>,
     _charge: Charge,
