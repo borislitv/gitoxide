@@ -256,6 +256,23 @@ impl Diff {
         let (mut before, mut after) = (0, 0);
         let mut result = Vec::new();
         while before < self.removed.len() || after < self.added.len() {
+            // Skip aligned unchanged flags in bounded numeric chunks, rather
+            // than invoking two hunk-end scans and a check for every equal line.
+            for (left, right) in self.removed[before..]
+                .chunks(1024)
+                .zip(self.added[after..].chunks(1024))
+            {
+                let unchanged = left.iter().zip(right).take_while(|(a, b)| !**a && !**b).count();
+                before += unchanged;
+                after += unchanged;
+                control::poll(check, control::Stage::Output, before + after)?;
+                if unchanged < left.len().min(right.len()) {
+                    break;
+                }
+            }
+            if before == self.removed.len() && after == self.added.len() {
+                break;
+            }
             let end_before = util::try_find_hunk_end(&self.removed, before as u32, check)? as usize;
             let end_after = util::try_find_hunk_end(&self.added, after as u32, check)? as usize;
             if end_before != before || end_after != after {
@@ -272,6 +289,7 @@ impl Diff {
             after = (end_after + 1).min(self.added.len());
             control::poll(check, control::Stage::Output, before + after)?;
         }
+        control::poll(check, control::Stage::Output, before + after)?;
         Ok(result)
     }
 
@@ -288,6 +306,7 @@ impl Diff {
 
     /// Controlled line sliders over explicit views (for example, a shared-tail
     /// trimmed view), while retaining the complete immutable token dictionary.
+    /// Only lines actually scored by the slider are scanned for indentation.
     pub fn try_postprocess_lines_with<T: AsRef<[u8]>>(
         self,
         before: &[Token],
@@ -295,16 +314,28 @@ impl Diff {
         interner: &Interner<T>,
         check: &mut control::Check<'_>,
     ) -> Result<Self, control::Cancelled> {
-        let mut indents = Vec::new();
-        control::try_reserve(&mut indents, interner.num_tokens() as usize, check)?;
-        for id in 0..interner.num_tokens() {
-            indents.push(IndentLevel::try_for_ascii_line(interner[Token(id)].as_ref(), 8, check)?);
-            control::poll(check, control::Stage::Postprocess, id as usize + 1)?;
-        }
-        self.try_postprocess_with(
+        // A request-local, fixed-size memo: collisions only repeat a scan, and a
+        // hit always compares the full token from this immutable dictionary.
+        const SLOTS: usize = 256;
+        let mut indents = [None; SLOTS];
+        self.try_postprocess_with_fallible_heuristic(
             before,
             after,
-            IndentHeuristic::new(|token: Token| indents[token.0 as usize]),
+            |tokens, hunk, earliest, check| {
+                control::poll(check, control::Stage::Postprocess, hunk.start as usize)?;
+                slider_heuristic::try_best_slider_end(tokens, hunk, earliest, |token| {
+                    let slot = &mut indents[token.0 as usize % SLOTS];
+                    if let Some((id, level)) = *slot
+                        && id == token
+                    {
+                        return Ok(level);
+                    }
+                    control::poll(check, control::Stage::Postprocess, token.0 as usize)?;
+                    let level = IndentLevel::try_for_ascii_line(interner[token].as_ref(), 8, check)?;
+                    *slot = Some((token, level));
+                    Ok(level)
+                })
+            },
             check,
         )
     }

@@ -50,7 +50,9 @@ impl data::Entry {
         Ok(data::Entry {
             header: object,
             decompressed_size: size,
-            data_offset: pack_offset + consumed as u64,
+            data_offset: pack_offset
+                .checked_add(consumed as u64)
+                .ok_or_raise(|| corruption("Pack entry data offset overflowed while decoding"))?,
             encoded_header_size: encoded_header_size(consumed)?,
         })
     }
@@ -89,7 +91,9 @@ impl data::Entry {
         Ok(data::Entry {
             header: object,
             decompressed_size: size,
-            data_offset: pack_offset + consumed as u64,
+            data_offset: pack_offset
+                .checked_add(consumed as u64)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "pack entry data offset overflowed"))?,
             encoded_header_size: encoded_header_size(consumed)
                 .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?,
         })
@@ -113,8 +117,7 @@ fn streaming_parse_header_info(read: &mut dyn io::Read) -> std::result::Result<(
         read.read_exact(&mut byte)?;
         c = byte[0];
         i += 1;
-        let component = u64::from(c & 0b0111_1111)
-            .checked_shl(shift)
+        let component = size_component(c, shift)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "pack entry header overflowed"))?;
         size = size
             .checked_add(component)
@@ -139,9 +142,8 @@ fn parse_header_info(data: &[u8]) -> Result<(u8, u64, usize)> {
             .get(i)
             .ok_or_raise(|| corrupt("pack entry header continuation byte"))?;
         i += 1;
-        let component = u64::from(c & 0b0111_1111)
-            .checked_shl(shift)
-            .ok_or_raise(|| corruption("Pack entry header value overflowed while decoding"))?;
+        let component =
+            size_component(c, shift).ok_or_raise(|| corruption("Pack entry header value overflowed while decoding"))?;
         size = size
             .checked_add(component)
             .ok_or_raise(|| corruption("Pack entry header value overflowed while decoding"))?;
@@ -150,20 +152,31 @@ fn parse_header_info(data: &[u8]) -> Result<(u8, u64, usize)> {
     Ok((type_id, size, i))
 }
 
+// checked_shl checks the shift amount, not discarded high bits. In the tenth
+// size-header byte (4 + 8*7 = 60 preceding bits), only four payload bits fit.
+fn size_component(byte: u8, shift: u32) -> Option<u64> {
+    1u64.checked_shl(shift)?.checked_mul(u64::from(byte & 0x7f))
+}
+
 fn parse_leb64(data: &[u8]) -> Result<(u64, usize)> {
     let mut i = 0;
     let mut c = *data.first().ok_or_raise(|| corrupt("an ofs-delta base distance"))?;
     i += 1;
     let mut value = u64::from(c) & 0x7f;
     while c & 0x80 != 0 {
+        // Biased base-128 grows even for zero payloads: n bytes encode at least
+        // sum(128^i, i=1..n-1). Ten can fit u64; eleven cannot. Check before
+        // accessing the next byte, bounding work even on an enormous suffix.
+        let high = value
+            .checked_add(1)
+            .and_then(|value| value.checked_mul(128))
+            .ok_or_raise(|| corruption("Pack entry header value overflowed while decoding"))?;
         c = *data
             .get(i)
             .ok_or_raise(|| corrupt("an ofs-delta base distance continuation byte"))?;
         i += 1;
-        value = value
-            .checked_add(1)
-            .and_then(|value| value.checked_shl(7))
-            .and_then(|value| value.checked_add(u64::from(c) & 0x7f))
+        value = high
+            .checked_add(u64::from(c) & 0x7f)
             .ok_or_raise(|| corruption("Pack entry header value overflowed while decoding"))?;
     }
     Ok((value, i))

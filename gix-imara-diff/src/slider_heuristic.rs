@@ -71,33 +71,41 @@ impl<IndentOfToken> IndentHeuristic<IndentOfToken> {
 
 impl<IndentOfToken: Fn(Token) -> IndentLevel> SliderHeuristic for IndentHeuristic<IndentOfToken> {
     fn best_slider_end(&mut self, tokens: &[Token], hunk: Range<u32>, earliest_end: u32) -> u32 {
-        const MAX_SLIDING: u32 = 100;
-        // This is a pure insertion that can be moved freely up and down.
-        // To get more intuitive results, apply a heuristic.
-        let mut top_slider_end = earliest_end;
-        // TODO: why is this needed
-        if top_slider_end < hunk.start - 1 {
-            top_slider_end = hunk.start - 1;
-        }
-        if hunk.end > top_slider_end + MAX_SLIDING {
-            top_slider_end = hunk.end - MAX_SLIDING;
-        }
-        let group_size = hunk.end - hunk.start;
-        let mut best_score = Score::for_range(
-            top_slider_end - group_size..top_slider_end,
-            tokens,
-            &self.indent_of_token,
-        );
-        let mut best_slider_end = top_slider_end;
-        for slider_end in (top_slider_end + 1)..=hunk.end {
-            let score = Score::for_range(slider_end - group_size..slider_end, tokens, &self.indent_of_token);
-            if score.is_improvement_over(best_score) {
-                best_score = score;
-                best_slider_end = slider_end;
-            }
-        }
-        best_slider_end
+        let Ok(end) = try_best_slider_end(tokens, hunk, earliest_end, |token| {
+            Ok::<_, std::convert::Infallible>((self.indent_of_token)(token))
+        });
+        end
     }
+}
+
+pub(crate) fn try_best_slider_end<E>(
+    tokens: &[Token],
+    hunk: Range<u32>,
+    earliest_end: u32,
+    mut indent: impl FnMut(Token) -> Result<IndentLevel, E>,
+) -> Result<u32, E> {
+    const MAX_SLIDING: u32 = 100;
+    // This is a pure insertion that can be moved freely up and down.
+    // To get more intuitive results, apply a heuristic.
+    let mut top_slider_end = earliest_end;
+    // TODO: why is this needed
+    if top_slider_end < hunk.start - 1 {
+        top_slider_end = hunk.start - 1;
+    }
+    if hunk.end > top_slider_end + MAX_SLIDING {
+        top_slider_end = hunk.end - MAX_SLIDING;
+    }
+    let group_size = hunk.end - hunk.start;
+    let mut best_score = Score::try_for_range(top_slider_end - group_size..top_slider_end, tokens, &mut indent)?;
+    let mut best_slider_end = top_slider_end;
+    for slider_end in (top_slider_end + 1)..=hunk.end {
+        let score = Score::try_for_range(slider_end - group_size..slider_end, tokens, &mut indent)?;
+        if score.is_improvement_over(best_score) {
+            best_score = score;
+            best_slider_end = slider_end;
+        }
+    }
+    Ok(best_slider_end)
 }
 
 /// Represents the indentation level of a line.
@@ -232,56 +240,45 @@ pub struct Indents {
 const MAX_BLANKS: usize = 20;
 
 impl Indents {
-    fn at_token(tokens: &[Token], token_idx: usize, indent_of_token: impl Fn(Token) -> IndentLevel) -> Indents {
-        let (leading_blank_lines, indent_previous_line) = tokens[..token_idx]
-            .iter()
-            .rev()
-            .enumerate()
-            .find_map(|(i, &token)| {
+    fn try_at_token<E>(
+        tokens: &[Token],
+        token_idx: usize,
+        indent_of_token: &mut impl FnMut(Token) -> Result<IndentLevel, E>,
+    ) -> Result<Indents, E> {
+        fn context<'a, E>(
+            tokens: impl Iterator<Item = &'a Token>,
+            len: usize,
+            indent: &mut impl FnMut(Token) -> Result<IndentLevel, E>,
+        ) -> Result<(usize, IndentLevel), E> {
+            for (i, &token) in tokens.enumerate() {
                 if i == MAX_BLANKS {
-                    Some((i, IndentLevel(0)))
-                } else {
-                    let level = indent_of_token(token);
-                    if level == IndentLevel::BLANK {
-                        None
-                    } else {
-                        Some((i, level))
-                    }
+                    return Ok((i, IndentLevel(0)));
                 }
-            })
-            .unwrap_or((token_idx, IndentLevel::BLANK));
-        let at_eof = token_idx == tokens.len();
-        let (trailing_blank_lines, indent_next_line) = if at_eof {
-            (0, IndentLevel::BLANK)
-        } else {
-            tokens[token_idx + 1..]
-                .iter()
-                .enumerate()
-                .find_map(|(i, &token)| {
-                    if i == MAX_BLANKS {
-                        Some((i, IndentLevel(0)))
-                    } else {
-                        let level = indent_of_token(token);
-                        if level == IndentLevel::BLANK {
-                            None
-                        } else {
-                            Some((i, level))
-                        }
-                    }
-                })
-                .unwrap_or((tokens.len() - token_idx - 1, IndentLevel::BLANK))
-        };
+                let level = indent(token)?;
+                if level != IndentLevel::BLANK {
+                    return Ok((i, level));
+                }
+            }
+            Ok((len, IndentLevel::BLANK))
+        }
+        let leading = &tokens[..token_idx];
+        let trailing = tokens.get(token_idx + 1..).unwrap_or_default();
+        let (leading_blank_lines, indent_previous_line) =
+            context(leading.iter().rev(), leading.len(), indent_of_token)?;
+        let (trailing_blank_lines, indent_next_line) = context(trailing.iter(), trailing.len(), indent_of_token)?;
         let indent = tokens
             .get(token_idx)
-            .map_or(IndentLevel::BLANK, |&token| indent_of_token(token));
-        Indents {
+            .map(|&token| indent_of_token(token))
+            .transpose()?
+            .unwrap_or(IndentLevel::BLANK);
+        Ok(Indents {
             indent,
             prev_indent: indent_previous_line,
             next_indent: indent_next_line,
             leading_blanks: leading_blank_lines as u8,
             trailing_blanks: trailing_blank_lines as u8,
-            at_eof,
-        }
+            at_eof: token_idx == tokens.len(),
+        })
     }
 
     fn score(&self) -> Score {
@@ -376,9 +373,15 @@ struct Score {
 }
 
 impl Score {
-    fn for_range(range: Range<u32>, tokens: &[Token], indent_of_token: impl Fn(Token) -> IndentLevel) -> Score {
-        Indents::at_token(tokens, range.start as usize, &indent_of_token).score()
-            + Indents::at_token(tokens, range.end as usize, &indent_of_token).score()
+    fn try_for_range<E>(
+        range: Range<u32>,
+        tokens: &[Token],
+        indent_of_token: &mut impl FnMut(Token) -> Result<IndentLevel, E>,
+    ) -> Result<Score, E> {
+        Ok(
+            Indents::try_at_token(tokens, range.start as usize, indent_of_token)?.score()
+                + Indents::try_at_token(tokens, range.end as usize, indent_of_token)?.score(),
+        )
     }
 }
 
@@ -429,7 +432,9 @@ mod tests {
         let mut tokens = vec![CODE; 300];
         tokens.extend([BLANK; 3]);
         let split = tokens.len() - 4;
-        let indents = Indents::at_token(&tokens, split, indent);
+        let Ok(indents) = Indents::try_at_token(&tokens, split, &mut |token| {
+            Ok::<_, std::convert::Infallible>(indent(token))
+        });
         assert_eq!(indents.trailing_blanks, 3);
     }
 

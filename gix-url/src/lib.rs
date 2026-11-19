@@ -54,6 +54,9 @@ pub mod parse;
 /// Minimal URL parser to replace the `url` crate dependency
 mod simple_url;
 
+mod fsck;
+pub use fsck::{Error as FsckSubmoduleUrlError, validate_fsck_submodule_url};
+
 /// Parse a Git remote location from `input`.
 ///
 /// This accepts standard URLs, SCP-like SSH locations, remote-helper locations and local paths. URL and SCP-like

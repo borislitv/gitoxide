@@ -211,7 +211,7 @@ where
         resolve: &dyn Fn(&gix_hash::oid, &mut Vec<u8>) -> Result<Option<ResolvedBase>>,
         delta_cache: &mut dyn cache::DecodeEntry,
     ) -> Result<Outcome> {
-        self.decode_entry_impl(entry, out, inflate, resolve, delta_cache, None, None)
+        self.decode_entry_impl(entry, out, inflate, resolve, delta_cache, None, None, None)
     }
 
     /// Decode with request-local cancellation and bounded inflate, delta and cache
@@ -231,13 +231,85 @@ where
         check: &dyn Fn() -> Result,
     ) -> Result<Outcome> {
         let result = self
-            .decode_entry_impl(entry, out, inflate, resolve, delta_cache, Some(check), Some(limits))
+            .decode_entry_impl(
+                entry,
+                out,
+                inflate,
+                resolve,
+                delta_cache,
+                Some(check),
+                Some(limits),
+                None,
+            )
             .and_then(|outcome| {
                 check()?;
                 Ok(outcome)
             });
         if result.is_err() {
             out.clear();
+        }
+        result
+    }
+
+    /// Decode into admitted fixed-capacity workspace with no cache. The resolver
+    /// receives a bounded slice, never a growable Vec; return base and written length
+    /// (zero for an in-pack base). Output and delta-chain metadata use the same budget.
+    /// Its own storage and I/O remain caller-owned. Native inflate workspace must
+    /// already be admitted by the owner of `inflate` (see admitted ingestion).
+    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::type_complexity)]
+    pub fn decode_entry_admitted(
+        &self,
+        entry: data::Entry,
+        out: &mut crate::memory::Buffer<'_, u8>,
+        inflate: &mut gix_zlib::Inflate,
+        resolve: &dyn Fn(&gix_hash::oid, &mut [u8]) -> Result<Option<(ResolvedBase, usize)>>,
+        limits: super::Limits,
+        check: &dyn Fn() -> Result,
+    ) -> Result<Outcome> {
+        check()?;
+        let budget = out.budget();
+        let limit = self
+            .alloc_limit_bytes
+            .ok_or_else(|| gix_error::Error::from(validation("Admitted decoding requires an allocation limit")))?;
+        out.reserve(limit)?;
+        let resolver = |id: &gix_hash::oid, bytes: &mut Vec<u8>| {
+            // Capacity was admitted before entry decoding. Never grow it here.
+            bytes.truncate(limit);
+            while bytes.len() < limit {
+                check()?;
+                bytes.resize(limit.min(bytes.len() + 32 * 1024), 0);
+            }
+            let result = resolve(id, bytes.as_mut_slice())?;
+            match result {
+                Some((base, len)) if len <= limit => {
+                    bytes.truncate(len);
+                    Ok(Some(base))
+                }
+                Some(_) => Err(validation("Resolved base exceeds admitted workspace").into()),
+                None => {
+                    bytes.clear();
+                    Ok(None)
+                }
+            }
+        };
+        let result = self
+            .decode_entry_impl(
+                entry,
+                &mut out.data,
+                inflate,
+                &resolver,
+                &mut cache::Never,
+                Some(check),
+                Some(limits),
+                Some(budget),
+            )
+            .and_then(|outcome| {
+                check()?;
+                Ok(outcome)
+            });
+        if result.is_err() {
+            out.data.clear();
         }
         result
     }
@@ -253,6 +325,7 @@ where
         delta_cache: &mut dyn cache::DecodeEntry,
         control: Option<&dyn Fn() -> Result>,
         limits: Option<super::Limits>,
+        budget: Option<&dyn crate::memory::Budget>,
     ) -> Result<Outcome> {
         let check = control.unwrap_or(&|| Ok(()));
         check()?;
@@ -276,7 +349,7 @@ where
                     })
             }
             OfsDelta { .. } | RefDelta { .. } => {
-                self.resolve_deltas(entry, resolve, inflate, out, delta_cache, control, limits)
+                self.resolve_deltas(entry, resolve, inflate, out, delta_cache, control, limits, budget)
             }
         }
     }
@@ -295,10 +368,29 @@ where
         cache: &mut dyn cache::DecodeEntry,
         control: Option<&dyn Fn() -> Result>,
         limits: Option<super::Limits>,
+        budget: Option<&dyn crate::memory::Budget>,
     ) -> Result<Outcome> {
         let check = control.unwrap_or(&|| Ok(()));
         // all deltas, from the one that produces the desired object (first) to the oldest at the end of the chain
-        let mut chain = SmallVec::<[Delta; 10]>::default();
+        // Keep the reservation declared before the chain: spilled storage is freed
+        // first on all return/unwind paths. With admission, depth is reserved once
+        // and the existing depth check below prevents any subsequent growth.
+        let _chain_reservation;
+        let mut chain = if let Some(budget) = budget {
+            let mut storage = crate::memory::Buffer::new(budget);
+            let depth = limits.expect("admitted decoding has limits").max_delta_depth.min(
+                self.alloc_limit_bytes.expect("admitted decoding has allocation limit") / std::mem::size_of::<Delta>(),
+            );
+            if depth > 10 {
+                storage.reserve(depth)?;
+            }
+            let (storage, reservation) = storage.into_parts();
+            _chain_reservation = Some(reservation);
+            SmallVec::<[Delta; 10]>::from_vec(storage)
+        } else {
+            _chain_reservation = None;
+            SmallVec::<[Delta; 10]>::default()
+        };
         let first_entry = last.clone();
         let mut cursor = last;
         let mut cycle = super::DeltaCycle::new(cursor.data_offset);

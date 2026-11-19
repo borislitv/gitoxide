@@ -7,6 +7,10 @@ use gix_object::bstr;
 
 #[path = "blame/controlled.rs"]
 mod controlled;
+#[path = "blame/deep.rs"]
+mod deep;
+#[path = "blame/native.rs"]
+mod native;
 
 fn fixture_hash_kind() -> gix_hash::Kind {
     gix_testtools::object_hash()

@@ -25,6 +25,10 @@ pub use types::{Options, Outcome};
 mod controlled;
 #[cfg(feature = "generate")]
 pub use controlled::{Options as ControlledOptions, Outcome as ControlledOutcome};
+#[cfg(feature = "generate")]
+mod admitted;
+#[cfg(feature = "generate")]
+pub use admitted::Outcome as AdmittedOutcome;
 
 use crate::bundle::write::types::SharedTempFile;
 

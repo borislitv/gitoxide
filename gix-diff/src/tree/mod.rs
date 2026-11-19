@@ -96,6 +96,10 @@ pub struct State {
 type TreeInfoTuple = (Option<ObjectId>, Option<ObjectId>, Option<Relation>);
 
 impl State {
+    /// Free temporary queue backing at a controlled quiescent ownership boundary.
+    pub fn release_traversal_queue(&mut self) {
+        drop(std::mem::take(&mut self.trees));
+    }
     fn clear(&mut self) {
         self.trees.clear();
         self.buf1.clear();

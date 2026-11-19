@@ -69,6 +69,7 @@ fn assert_hash_agnostic_patch_eq(actual: &str, expected: &str) {
 
 mod blob;
 mod index;
+mod raw_pair;
 mod rewrites;
 mod tree;
 mod tree_with_rewrites;

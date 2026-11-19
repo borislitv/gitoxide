@@ -107,6 +107,25 @@ mod function {
         )
     }
 
+    #[cfg(feature = "generate")]
+    pub(crate) fn write_to_admitted(
+        out: &mut dyn io::Write,
+        entries: &[(gix_hash::ObjectId, u32, u64, usize)],
+        pack_hash: &gix_hash::ObjectId,
+        object_hash: gix_hash::Kind,
+        check: &dyn Fn() -> Result,
+    ) -> Result<gix_hash::ObjectId> {
+        write_impl(
+            out,
+            entries,
+            pack_hash,
+            crate::index::Version::V2,
+            object_hash,
+            &mut progress::Discard,
+            Some(check),
+        )
+    }
+
     trait IndexEntry {
         fn id(&self) -> &gix_hash::ObjectId;
         fn crc32(&self) -> u32;
@@ -126,6 +145,18 @@ mod function {
     }
 
     impl IndexEntry for (gix_hash::ObjectId, u32, u64) {
+        fn id(&self) -> &gix_hash::ObjectId {
+            &self.0
+        }
+        fn crc32(&self) -> u32 {
+            self.1
+        }
+        fn offset(&self) -> u64 {
+            self.2
+        }
+    }
+
+    impl IndexEntry for (gix_hash::ObjectId, u32, u64, usize) {
         fn id(&self) -> &gix_hash::ObjectId {
             &self.0
         }
@@ -157,16 +188,20 @@ mod function {
 
         // Write header
         let mut out = Count::new(std::io::BufWriter::with_capacity(
-            8 * 4096,
+            if control.is_some() { 0 } else { 8 * 4096 },
             gix_hash::io::Write::new(gix_zlib::stream::ControlledWrite::new(out, check), object_hash),
         ));
         out.write_all(V2_SIGNATURE).map_err(gix_hash::io::from_std_io)?;
         out.write_all(&(kind as u32).to_be_bytes())
             .map_err(gix_hash::io::from_std_io)?;
 
-        progress.init(Some(4), progress::steps());
+        if control.is_none() {
+            progress.init(Some(4), progress::steps());
+        }
         let start = std::time::Instant::now();
-        let _info = progress.add_child_with_id("writing fan-out table".into(), gix_utils::progress::UNKNOWN);
+        let _info = control
+            .is_none()
+            .then(|| progress.add_child_with_id("writing fan-out table".into(), gix_utils::progress::UNKNOWN));
         let fan_out = if control.is_some() {
             let mut counts = [0u32; 256];
             for entry in entries_sorted_by_oid {
@@ -186,7 +221,9 @@ mod function {
         }
 
         progress.inc();
-        let _info = progress.add_child_with_id("writing ids".into(), gix_utils::progress::UNKNOWN);
+        let _info = control
+            .is_none()
+            .then(|| progress.add_child_with_id("writing ids".into(), gix_utils::progress::UNKNOWN));
         for entry in entries_sorted_by_oid {
             check()?;
             out.write_all(entry.id().as_slice())
@@ -194,7 +231,9 @@ mod function {
         }
 
         progress.inc();
-        let _info = progress.add_child_with_id("writing crc32".into(), gix_utils::progress::UNKNOWN);
+        let _info = control
+            .is_none()
+            .then(|| progress.add_child_with_id("writing crc32".into(), gix_utils::progress::UNKNOWN));
         for entry in entries_sorted_by_oid {
             check()?;
             out.write_all(&entry.crc32().to_be_bytes())
@@ -202,7 +241,9 @@ mod function {
         }
 
         progress.inc();
-        let _info = progress.add_child_with_id("writing offsets".into(), gix_utils::progress::UNKNOWN);
+        let _info = control
+            .is_none()
+            .then(|| progress.add_child_with_id("writing offsets".into(), gix_utils::progress::UNKNOWN));
         {
             let mut num_offsets64 = 0u32;
             for entry in entries_sorted_by_oid {
@@ -245,17 +286,21 @@ mod function {
         check()?;
 
         progress.inc();
-        progress.show_throughput_with(
-            start,
-            (bytes_written_without_trailer + object_hash.len_in_bytes() as u64) as usize,
-            progress::bytes().expect("unit always set"),
-            progress::MessageLevel::Success,
-        );
+        if control.is_none() {
+            progress.show_throughput_with(
+                start,
+                (bytes_written_without_trailer + object_hash.len_in_bytes() as u64) as usize,
+                progress::bytes().expect("unit always set"),
+                progress::MessageLevel::Success,
+            );
+        }
 
         Ok(index_hash)
     }
 }
 #[cfg(feature = "streaming-input")]
 pub(crate) use function::write_to;
+#[cfg(all(feature = "streaming-input", feature = "generate"))]
+pub(crate) use function::write_to_admitted;
 #[cfg(all(feature = "streaming-input", feature = "generate"))]
 pub(crate) use function::write_to_controlled;

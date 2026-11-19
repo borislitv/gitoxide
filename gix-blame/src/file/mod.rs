@@ -516,18 +516,24 @@ impl UnblamedHunk {
 
                 let split_at_from_start = line_number_in_destination - range_in_suspect.start;
                 if split_at_from_start > 0 {
-                    gix_diff::blob::control::admit_bytes(
-                        2 * self.suspects.len() * std::mem::size_of::<(ObjectId, Range<u32>)>(),
-                        check,
-                    )?;
                     let mut new_suspects_before = smallvec::SmallVec::<[(ObjectId, Range<u32>); 1]>::new();
                     let mut new_suspects_after = smallvec::SmallVec::<[(ObjectId, Range<u32>); 1]>::new();
+                    gix_diff::blob::control::admit_bytes(
+                        self.suspects.len() * std::mem::size_of::<(ObjectId, Range<u32>)>(),
+                        check,
+                    )?;
                     new_suspects_before
                         .try_reserve_exact(self.suspects.len())
                         .map_err(|_| Cancelled)?;
+                    bounded::allocated_smallvec(0, &new_suspects_before, check)?;
+                    gix_diff::blob::control::admit_bytes(
+                        self.suspects.len() * std::mem::size_of::<(ObjectId, Range<u32>)>(),
+                        check,
+                    )?;
                     new_suspects_after
                         .try_reserve_exact(self.suspects.len())
                         .map_err(|_| Cancelled)?;
+                    bounded::allocated_smallvec(0, &new_suspects_after, check)?;
                     for (suspect, range) in &self.suspects {
                         new_suspects_before.push((*suspect, range.start..(range.start + split_at_from_start)));
                         new_suspects_after.push((*suspect, (range.start + split_at_from_start)..range.end));
