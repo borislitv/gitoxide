@@ -16,6 +16,9 @@ use crate::native::{
     COMPLETED_VERSION, CompletedAttribution, CompletedIdentity, CompletedUse, NativeOrigin, PreviousOrigin,
 };
 
+#[path = "segments.rs"]
+pub mod segments;
+
 fn poll(check: &mut Check<'_>, stage: Stage, processed: usize) -> Result {
     check(Checkpoint { stage, processed }).map_err(|err| err.raise())
 }
@@ -47,6 +50,7 @@ pub struct AdmittedOutcome {
     mapping_statistics: crate::memo::MappingStatistics,
     completed_identity: Option<CompletedIdentity>,
     completed_use: CompletedUse,
+    segment_lines: Option<u32>,
     _allocations: gix_diff::blob::control::Allocations,
 }
 
@@ -302,6 +306,7 @@ pub fn file_with_allocations_and_completed_attribution(
             seed,
             identity: None,
             links: Vec::new(),
+            segment: None,
         }),
     )
 }
@@ -312,6 +317,7 @@ struct Completion<'a> {
     identity: Option<CompletedIdentity>,
     usage: CompletedUse,
     links: Vec<TraceLink<'a>>,
+    segment: Option<segments::Stop>,
 }
 
 fn validate_native_profile(start: &Start, options: &Options) -> Result {
@@ -391,6 +397,13 @@ fn file_admitted(
     let mapping_statistics = result.as_ref().map(|(_, stats)| *stats).unwrap_or_default();
     let result = result.map(|(outcome, _)| outcome);
     let result = result.and_then(|mut outcome| {
+        if completion
+            .as_ref()
+            .and_then(|c| c.segment.as_ref())
+            .is_some_and(|stop| !stop.reached)
+        {
+            return Err(segments::declined());
+        }
         let trace_result = if trace {
             build_native_trace(
                 &odb,
@@ -454,6 +467,7 @@ fn file_admitted(
             mapping_statistics,
             completed_identity: completion.as_ref().and_then(|c| c.identity),
             completed_use: completion.as_ref().map_or(CompletedUse::NotRequested, |c| c.usage),
+            segment_lines: completion.as_ref().and_then(|c| c.segment.as_ref().map(|s| s.lines)),
             _allocations: allocations,
         }),
         Err(error) => {
@@ -1375,6 +1389,30 @@ fn file_impl<'seed>(
         )?
         .into();
 
+        if let Some(stop) = completion.as_mut().and_then(|c| c.segment.as_mut()) {
+            if !all_current || first_hunk_for_suspect.source_file_name.is_some() {
+                return Err(segments::declined());
+            }
+            if suspect == stop.endpoint.commit {
+                let entry = find_path_entry_and_mode_in_commit(
+                    &odb, &suspect, file_path, None, &mut buf, &mut buf2, &mut stats, check,
+                )?;
+                if !entry.is_some_and(|(id, mode)| id == stop.endpoint.blob && mode.is_blob()) {
+                    return Err(segments::declined());
+                }
+                let lines = raw_line_count(odb.find_blob(&stop.endpoint.blob, &mut buf)?.data, check)?;
+                if !seed_ranges_valid(&hunks_to_blame, lines, check)? {
+                    return Err(segments::declined());
+                }
+                stop.reached = true;
+                stop.lines = lines;
+                // Internal placeholder only. The segment API never exposes this
+                // as a native origin or lets it enter a completed outcome.
+                try_unblamed_to_out_is_done(&mut hunks_to_blame, &mut out, suspect, check)?;
+                break 'outer;
+            }
+        }
+
         // A single-parent suffix cannot have observed any side ancestry (even
         // the commit times of other merge parents). Require a unique origin for
         // the *entire* live frontier, not merely for the selected hunk.
@@ -1475,6 +1513,10 @@ fn file_impl<'seed>(
                 _ => None,
             };
             let parent_ids: ParentIds = collect_parents(commit, &odb, cache.as_ref(), &mut buf2, check, raw)?;
+            let bounded_segment = completion.as_ref().is_some_and(|c| c.segment.is_some());
+            if bounded_segment && parent_ids.len() != 1 {
+                return Err(segments::declined());
+            }
             linear_suffix &= parent_ids.len() <= 1;
 
             if parent_ids.is_empty() {
@@ -1561,9 +1603,12 @@ fn file_impl<'seed>(
                 check,
             )?
             .map(|(_, mode)| mode);
+            if bounded_segment && !current_mode.is_some_and(|mode| mode.is_blob()) {
+                return Err(segments::declined());
+            }
             for (pid, (parent_id, parent_commit_time)) in parent_ids.iter().enumerate() {
                 poll(check, Stage::Graph, pid)?;
-                if let Some((parent_entry_id, parent_mode)) = find_path_entry_and_mode_in_commit(
+                let parent_entry = find_path_entry_and_mode_in_commit(
                     &odb,
                     parent_id,
                     current_file_path.as_ref(),
@@ -1572,7 +1617,11 @@ fn file_impl<'seed>(
                     &mut buf2,
                     &mut stats,
                     check,
-                )? {
+                )?;
+                if bounded_segment && !parent_entry.is_some_and(|(_, mode)| mode.is_blob()) {
+                    return Err(segments::declined());
+                }
+                if let Some((parent_entry_id, parent_mode)) = parent_entry {
                     let no_change_in_entry = entry_id == parent_entry_id
                         && current_mode.is_some_and(|mode| {
                             mode.is_link() == parent_mode.is_link() && mode.is_blob() == parent_mode.is_blob()
