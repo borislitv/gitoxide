@@ -124,16 +124,17 @@ fn no_ambiguous_slider_needs_no_dictionary_views_or_admission() {
 }
 
 #[test]
-fn two_ambiguous_ties_prepare_once_and_keep_independent_hunk_positions() {
+fn two_ambiguous_ties_share_scored_tokens_and_keep_independent_hunk_positions() {
     let views = Rc::new(Cell::new(0));
     let mut input = fixture(
         &[b"head\n", b"x\n", b"middle\n", b"y\n", b"tail\n"],
         &[b"head\n", b"x\n", b"x\n", b"middle\n", b"y\n", b"y\n", b"tail\n"],
         &views,
     );
+    let historical_views = Rc::new(Cell::new(0));
     input.interner.intern(Line {
         bytes: b"\r\x0chistorical-context\n".to_vec(),
-        views: views.clone(),
+        views: historical_views.clone(),
     });
     let expected = vec![
         Hunk {
@@ -173,12 +174,13 @@ fn two_ambiguous_ties_prepare_once_and_keep_independent_hunk_positions() {
             })
             .unwrap();
         assert_eq!(result.try_hunks(&mut |_| Ok(())).unwrap(), expected);
+        assert_eq!(views.get(), 5, "scan shared scored tokens only once");
         assert_eq!(
-            views.get(),
-            input.interner.num_tokens() as usize,
-            "prepare the complete table once, not per slider"
+            historical_views.get(),
+            0,
+            "unused dictionary entries must not be scanned"
         );
-        assert_eq!(allocations, 1);
+        assert_eq!(allocations, 0, "indentation scoring needs no heap table");
         eprintln!(
             "LAZY_INDENT {algorithm:?} heuristic_requests={calls} table_views={} table_allocations={allocations}",
             views.get()
@@ -217,13 +219,13 @@ fn account(arena: &mut Allocations, event: Checkpoint) -> Result<(), Cancelled> 
 }
 
 #[test]
-fn needed_cr_formfeed_context_has_inner_stop_and_full_table_admission() {
+fn needed_cr_formfeed_context_polls_inside_long_lines_without_heap_admission() {
     let mut long = vec![b'\r'; 3 * BYTE_CHUNK];
     for byte in long.iter_mut().skip(1).step_by(2) {
         *byte = b'\x0c';
     }
     long.extend_from_slice(b"context\n");
-    for stop in ["none", "scan", "table-final", "admission"] {
+    for stop_after in [None, Some(BYTE_CHUNK), Some(2 * BYTE_CHUNK)] {
         let views = Rc::new(Cell::new(0));
         let input = fixture(
             &[b"head\n", &long, b"same\n", b"tail\n"],
@@ -234,28 +236,16 @@ fn needed_cr_formfeed_context_has_inner_stop_and_full_table_admission() {
         let mut arena = Allocations::new(Arc::new(budget.clone())).unwrap();
         let mut reached = false;
         let result = compute(&input, Algorithm::Myers).try_postprocess_lines(&input, &mut |event| {
-            if stop == "admission" && event.stage == Stage::Allocate {
-                reached = true;
-                return Err(Cancelled);
-            }
+            assert_ne!(event.stage, Stage::Allocate, "scoring must not allocate a heap table");
             account(&mut arena, event)?;
-            let scan_stop = stop == "scan" && event.processed == BYTE_CHUNK;
-            let final_stop = stop == "table-final"
-                && views.get() == input.interner.num_tokens() as usize
-                && event.processed == input.interner.num_tokens() as usize;
-            if !reached && event.stage == Stage::Postprocess && (scan_stop || final_stop) {
+            if !reached && event.stage == Stage::Postprocess && stop_after == Some(event.processed) {
                 reached = true;
                 assert!(views.get() > 0);
-                let table_bytes = input.interner.num_tokens() as usize * std::mem::size_of::<IndentLevel>();
-                assert!(
-                    budget.0.lock().unwrap().contains(&table_bytes),
-                    "live full table must remain charged"
-                );
                 return Err(Cancelled);
             }
             Ok(())
         });
-        if stop == "none" {
+        if stop_after.is_none() {
             assert_eq!(
                 result.unwrap().try_hunks(&mut |_| Ok(())).unwrap(),
                 vec![Hunk {
@@ -263,18 +253,15 @@ fn needed_cr_formfeed_context_has_inner_stop_and_full_table_admission() {
                     after: 3..4
                 }]
             );
-            assert_eq!(views.get(), input.interner.num_tokens() as usize);
+            assert_eq!(views.get(), 3, "only the long line and its scored neighbors");
         } else {
-            assert!(reached, "must reach actual lazy {stop}");
+            assert!(reached, "must reach requested inner scan stop {stop_after:?}");
             assert!(
                 matches!(result, Err(Cancelled)),
                 "a failed heuristic cannot return a partial diff"
             );
-            if stop == "admission" {
-                assert_eq!(views.get(), 0, "admission precedes every byte view");
-            }
         }
-        // The temporary table was physically dropped by the consumed call.
+        // No heap-scoring state may survive success or cancellation.
         arena.begin_retention().unwrap();
         arena.end_retention(&mut |_| Ok(())).unwrap();
         arena.clear_with_control(&mut |_| Err(Cancelled));
@@ -334,13 +321,13 @@ fn next_heuristic_and_no_heuristic_final_boundary_propagate_stop() {
 }
 
 #[test]
-fn lazy_scan_or_admission_failure_still_finishes_owned_byte_cleanup() {
+fn lazy_scan_failure_still_finishes_owned_byte_cleanup() {
     let mut before = b"head\n".to_vec();
     before.extend(std::iter::repeat_n(b'\r', 2 * BYTE_CHUNK));
     before.extend_from_slice(b"context\nsame\ntail\n");
     let mut after = before[..before.len() - b"tail\n".len()].to_vec();
     after.extend_from_slice(b"same\ntail\n");
-    for deny in [false, true] {
+    for stop_after in [BYTE_CHUNK, 2 * BYTE_CHUNK] {
         let phase = Cell::new(false);
         let stopped = Cell::new(false);
         let cleanup = Cell::new(false);
@@ -350,11 +337,7 @@ fn lazy_scan_or_admission_failure_still_finishes_owned_byte_cleanup() {
             &before,
             &after,
             &mut |event| {
-                if phase.get()
-                    && !stopped.get()
-                    && ((deny && event.stage == Stage::Allocate)
-                        || (!deny && event.stage == Stage::Postprocess && event.processed == BYTE_CHUNK))
-                {
+                if phase.get() && !stopped.get() && event.stage == Stage::Postprocess && event.processed == stop_after {
                     stopped.set(true);
                     return Err(Cancelled);
                 }
